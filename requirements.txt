@@ -1,4 +1,6 @@
 streamlit>=1.30
 pandas>=2.0
 numpy>=1.26
-matplotlib>=3.8
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+plotly>=5.22
