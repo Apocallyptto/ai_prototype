@@ -1,13 +1,21 @@
-import streamlit as st, pandas as pd, numpy as np
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import date, timedelta
 from sqlalchemy import text
 from lib.db import get_engine
 
 st.title("📈 Portfolio PnL")
 
+# ---- Sidebar filters
 with st.sidebar:
     st.header("Filters")
     pid = st.number_input("Portfolio ID", 1, step=1, value=1)
-    d1, d2 = st.date_input("Date range", [])
+
+    # Default 30-day range to avoid ValueError
+    default_start = date.today() - timedelta(days=30)
+    default_end = date.today()
+    d1, d2 = st.date_input("Date range", (default_start, default_end))
 
 @st.cache_data(ttl=300)
 def load_pnl(pid, d1, d2):
@@ -20,26 +28,33 @@ def load_pnl(pid, d1, d2):
           AND (:d2::date IS NULL OR date <= :d2)
         ORDER BY date
     """)
-    params = {"pid": pid, "d1": d1 if d1 else None, "d2": d2 if d2 else None}
+    params = {"pid": pid, "d1": d1 or None, "d2": d2 or None}
     with get_engine().connect() as conn:
         return pd.read_sql(q, conn, params=params)
 
-df = load_pnl(pid, d1 if d1 else None, d2 if d2 else None)
+df = load_pnl(pid, d1, d2)
 
 if df.empty:
     st.info("No PnL rows yet.")
     st.stop()
 
+# ---- KPIs
 df["ret"] = df["equity"].pct_change()
 df["dd"] = df["equity"] / df["equity"].cummax() - 1
 rets = df["ret"].dropna()
 
-c1,c2,c3,c4 = st.columns(4)
-c1.metric("Win rate", f"{(rets>0).mean()*100:.1f}%")
-c2.metric("Sharpe (ann.)", f"{(rets.mean()/rets.std()*np.sqrt(252)) if rets.std() else 0:.2f}")
-c3.metric("Total return", f"{(df.equity.iloc[-1]/df.equity.iloc[0]-1)*100:+.1f}%")
-c4.metric("Max drawdown", f"{df['dd'].min()*100:.1f}%")
+if len(rets) > 1 and rets.std(ddof=1) > 0:
+    sharpe = (rets.mean() / rets.std(ddof=1)) * np.sqrt(252)
+else:
+    sharpe = 0.0
 
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Win rate", f"{(rets > 0).mean() * 100:.1f}%")
+c2.metric("Sharpe (ann.)", f"{sharpe:.2f}")
+c3.metric("Total return", f"{(df.equity.iloc[-1] / df.equity.iloc[0] - 1) * 100:+.1f}%")
+c4.metric("Max drawdown", f"{df['dd'].min() * 100:.1f}%")
+
+# ---- Charts
 st.subheader("Equity")
 st.line_chart(df.set_index("date")[["equity"]])
 
