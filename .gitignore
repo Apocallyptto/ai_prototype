@@ -3,3 +3,6 @@ __pycache__/
 .venv/ venv/
 .streamlit/secrets.toml
 .DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
