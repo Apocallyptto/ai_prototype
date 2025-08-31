@@ -20,17 +20,16 @@ with st.sidebar:
 @st.cache_data(ttl=300)
 def load_pnl(pid, d1, d2):
     q = text("""
-        SELECT date::date AS date,
+        SELECT "date" AS date,
                (realized + unrealized - fees) AS equity
         FROM daily_pnl
         WHERE portfolio_id = :pid
-          AND (:d1::date IS NULL OR date >= :d1)
-          AND (:d2::date IS NULL OR date <= :d2)
-        ORDER BY date
+          AND (:d1 IS NULL OR "date" >= :d1)
+          AND (:d2 IS NULL OR "date" <= :d2)
+        ORDER BY "date"
     """)
-    params = {"pid": pid, "d1": d1 or None, "d2": d2 or None}
     with get_engine().connect() as conn:
-        return pd.read_sql(q, conn, params=params)
+        return pd.read_sql(q, conn, params={"pid": pid, "d1": d1, "d2": d2})
 
 df = load_pnl(pid, d1, d2)
 
