@@ -7,6 +7,8 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+print("ALEMBIC USING env.py:", __file__)  # debug so we see which file is used
+
 def _url_from_env():
     db_url = os.getenv("DATABASE_URL")
     if db_url:
@@ -33,7 +35,7 @@ def run_migrations_offline():
 
 def run_migrations_online():
     connectable = engine_from_config(
-        {"sqlalchemy.url": _url_from_env()},  # <<< DO NOT read from alembic.ini
+        {"url": _url_from_env()},      # <-- change key to "url"
         prefix="",
         poolclass=pool.NullPool,
     )
@@ -41,6 +43,7 @@ def run_migrations_online():
         context.configure(connection=connection, target_metadata=None, compare_type=True)
         with context.begin_transaction():
             context.run_migrations()
+
 
 if context.is_offline_mode():
     run_migrations_offline()
