@@ -8,7 +8,6 @@ import math
 import argparse
 import numpy as np
 import pandas as pd
-from datetime import datetime, date
 from sqlalchemy import create_engine, text
 
 # ---------- DB engine (CLI-friendly; reads ENV like your migrations/scripts) ----------
@@ -63,24 +62,90 @@ def rsi(series, period=14):
     return 100 - 100 / (1 + rs)
 
 # ---------- Data ----------
-def load_candles(ticker: str, timeframe: str, start: str|None, end: str|None, eng):
-    """
-    Try DB first: candles(ticker, timeframe, ts, o, h, l, c, v).
-    Fallback to yfinance (won't write to DB).
-    """
-    q = text("""
-        SELECT ts, o, h, l, c, v
-        FROM candles
-        WHERE ticker = :t AND timeframe = :tf
-          AND (:start IS NULL OR ts >= :start)
-          AND (:end   IS NULL OR ts <= :end)
-        ORDER BY ts
-    """)
+def _rename_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize to ts,o,h,l,c,v (+ optional symbol/timeframe) regardless of source casing."""
+    mapping = {}
+
+    def first_present(names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    # timestamp
+    t_src = first_present(["ts", "time", "timestamp", "datetime", "date", "Date"])
+    if t_src:
+        mapping[t_src] = "ts"
+
+    # OHLCV
+    o_src = first_present(["o", "open", "Open", "OPEN"])
+    h_src = first_present(["h", "high", "High", "HIGH"])
+    l_src = first_present(["l", "low", "Low", "LOW"])
+    c_src = first_present(["c", "close", "Close", "CLOSE", "adj_close", "Adj Close", "Adj_Close"])
+    v_src = first_present(["v", "volume", "Volume", "VOLUME"])
+    if o_src: mapping[o_src] = "o"
+    if h_src: mapping[h_src] = "h"
+    if l_src: mapping[l_src] = "l"
+    if c_src: mapping[c_src] = "c"
+    if v_src: mapping[v_src] = "v"
+
+    # symbol/ticker + timeframe
+    s_src = first_present(["symbol", "ticker", "s"])
+    tf_src = first_present(["timeframe", "tf", "interval"])
+    if s_src: mapping[s_src] = "symbol"
+    if tf_src: mapping[tf_src] = "timeframe"
+
+    return df.rename(columns=mapping)
+
+def _try_read(eng, sql, params):
     try:
         with eng.connect() as c:
-            df = pd.read_sql(q, c, params={"t": ticker, "tf": timeframe, "start": start, "end": end})
+            return pd.read_sql(text(sql), c, params=params)
     except Exception:
-        df = pd.DataFrame()
+        return pd.DataFrame()
+
+def load_candles(ticker: str, timeframe: str, start: str | None, end: str | None, eng):
+    """
+    Try DB first with several schema variants, then fallback to yfinance.
+    Normalizes columns to: ts,o,h,l,c,v
+    """
+    # try a few WHERE variants depending on column names
+    attempts = [
+        "SELECT * FROM candles WHERE symbol=:t AND timeframe=:tf AND (:start IS NULL OR ts>=:start) AND (:end IS NULL OR ts<=:end) ORDER BY ts",
+        "SELECT * FROM candles WHERE ticker=:t AND timeframe=:tf AND (:start IS NULL OR ts>=:start) AND (:end IS NULL OR ts<=:end) ORDER BY ts",
+        "SELECT * FROM candles WHERE symbol=:t AND tf=:tf        AND (:start IS NULL OR ts>=:start) AND (:end IS NULL OR ts<=:end) ORDER BY ts",
+        "SELECT * FROM candles WHERE ticker=:t AND tf=:tf        AND (:start IS NULL OR ts>=:start) AND (:end IS NULL OR ts<=:end) ORDER BY ts",
+        # absolute fallback: read all and filter in pandas (avoid if table is huge)
+        "SELECT * FROM candles ORDER BY ts",
+    ]
+    params = {"t": ticker, "tf": timeframe, "start": start, "end": end}
+
+    df = pd.DataFrame()
+    for sql in attempts:
+        df = _try_read(eng, sql, params)
+        if not df.empty:
+            break
+
+    if not df.empty:
+        df = _rename_columns(df)
+
+        # if the WHERE didn't filter (e.g., last attempt), filter here if those cols exist
+        if "symbol" in df.columns:
+            df = df[df["symbol"] == ticker]
+        if "timeframe" in df.columns:
+            df = df[df["timeframe"] == timeframe]
+
+        # keep only what we need
+        required = {"ts", "o", "h", "l", "c", "v"}
+        missing = required.difference(df.columns)
+        if missing:
+            # Sometimes the table stores Open/High/... with original names; map again after reading
+            df = _rename_columns(df)
+            missing = required.difference(df.columns)
+        if missing:
+            # give a clear message before falling back
+            print(f"[warn] DB candles missing {missing}. Columns available: {list(df.columns)}")
+            df = pd.DataFrame()
 
     if df.empty:
         # fallback to yfinance (daily only)
@@ -89,9 +154,16 @@ def load_candles(ticker: str, timeframe: str, start: str|None, end: str|None, en
         yf_df = yf.download(ticker, start=start, end=end, interval=yf_tf, auto_adjust=False, progress=False)
         if yf_df.empty:
             raise RuntimeError(f"No candles for {ticker} in DB and yfinance fallback is empty.")
-        yf_df = yf_df.rename(columns={"Open":"o","High":"h","Low":"l","Close":"c","Volume":"v"})
-        yf_df["ts"] = yf_df.index.tz_localize(None)  # make naive (UTC-like)
-        df = yf_df[["ts","o","h","l","c","v"]].reset_index(drop=True)
+        yf_df = yf_df.rename(columns={"Open": "o", "High": "h", "Low": "l", "Close": "c", "Volume": "v"})
+        yf_df["ts"] = yf_df.index.tz_localize(None)
+        df = yf_df.reset_index(drop=True)
+
+    # final normalization & sorting
+    df = _rename_columns(df)
+    required = {"ts", "o", "h", "l", "c", "v"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Candles missing required columns {missing}. Got: {list(df.columns)}")
 
     df = df.dropna(subset=["c"]).copy()
     df["ts"] = pd.to_datetime(df["ts"])
