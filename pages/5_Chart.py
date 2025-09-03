@@ -1,48 +1,55 @@
-import streamlit as st, pandas as pd, plotly.graph_objects as go
+import yfinance as yf
+import pandas as pd
+import streamlit as st
 from sqlalchemy import text
 from lib.db import get_engine
 
-st.title("📊 Chart + Signals")
+@st.cache_data(ttl=600)
+def load_candles(ticker: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Fetch last `limit` candles from yfinance and return standardized columns."""
+    # map timeframe -> yfinance interval
+    interval = {
+        "1m": "1m", "5m": "5m", "15m": "15m",
+        "1h": "60m", "4h": "240m",
+        "1d": "1d", "1wk": "1wk", "1mo": "1mo",
+    }.get(timeframe, "1d")
 
-sym = st.text_input("Ticker", "AAPL")
-tf = st.selectbox("Timeframe", ["1d"])
-limit = st.slider("Bars", 50, 500, 200)
+    # pick a period big enough to guarantee `limit` bars
+    if interval.endswith("m"):
+        # intraday needs days; be generous
+        period = f"{max(1, limit // 300 + 1)}d"
+    elif interval in ("1d", "1wk", "1mo"):
+        period = f"{max(30, int(limit * 2))}d"
+    else:
+        period = "60d"
 
-@st.cache_data(ttl=120)
-def load_candles(ticker, timeframe, limit):
+    df = yf.download(
+        ticker, interval=interval, period=period,
+        auto_adjust=False, progress=False, prepost=False
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["ts", "o", "h", "l", "c", "v"])
+
+    df = df.tail(limit).reset_index()
+    ts_col = "Datetime" if "Datetime" in df.columns else "Date"
+    df = df.rename(columns={
+        ts_col: "ts", "Open": "o", "High": "h", "Low": "l", "Close": "c", "Volume": "v"
+    })
+    return df[["ts", "o", "h", "l", "c", "v"]]
+
+@st.cache_data(ttl=300)
+def load_signals(ticker: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Fetch signals for overlay from Postgres."""
     q = text("""
-      SELECT c.ts, c.o, c.h, c.l, c.c
-      FROM candles c
-      JOIN symbols s ON s.id=c.symbol_id
-      WHERE s.ticker=:t AND c.timeframe=:tf
-      ORDER BY c.ts DESC LIMIT :lim
+        SELECT s.ts,
+               (s.signal->>'side')          AS side,
+               ((s.signal->>'strength')::float) AS strength
+        FROM signals s
+        JOIN symbols sym ON sym.id = s.symbol_id
+        WHERE sym.ticker = :t
+          AND s.timeframe = :tf
+        ORDER BY s.ts DESC
+        LIMIT :lim
     """)
     with get_engine().connect() as c:
-        df = pd.read_sql(q, c, params={"t": ticker, "tf": timeframe, "lim": limit})
-    return df.sort_values("ts")
-
-@st.cache_data(ttl=120)
-def load_signals(ticker, limit):
-    q = text("""
-      SELECT s.ts, s.signal->>'side' AS side
-      FROM signals s JOIN symbols sym ON sym.id=s.symbol_id
-      WHERE sym.ticker=:t
-      ORDER BY s.ts DESC LIMIT :lim
-    """)
-    with get_engine().connect() as c:
-        df = pd.read_sql(q, c, params={"t": ticker, "lim": limit})
-    return df
-
-cdl = load_candles(sym, tf, limit)
-sigs = load_signals(sym, 500)
-
-if cdl.empty:
-    st.info("No candles yet. Load candles via ETL.")
-else:
-    fig = go.Figure(data=[go.Candlestick(x=cdl["ts"], open=cdl["o"], high=cdl["h"], low=cdl["l"], close=cdl["c"])])
-    if not sigs.empty:
-        buys = sigs[sigs.side=="buy"]
-        sells = sigs[sigs.side=="sell"]
-        fig.add_scatter(x=buys["ts"], y=cdl.set_index("ts").reindex(buys["ts"])["c"], mode="markers", name="buy", marker_symbol="triangle-up")
-        fig.add_scatter(x=sells["ts"], y=cdl.set_index("ts").reindex(sells["ts"])["c"], mode="markers", name="sell", marker_symbol="triangle-down")
-    st.plotly_chart(fig, use_container_width=True)
+        return pd.read_sql(q, c, params={"t": ticker, "tf": timeframe, "lim": limit})
