@@ -1,8 +1,8 @@
-uliweb-alembic
 streamlit>=1.30
 pandas>=2.0
 numpy>=1.26
 sqlalchemy>=2.0
 psycopg2-binary>=2.9.9
-plotly>=5.22
-yfinance>=0.2
+alembic>=1.13
+yfinance>=0.2.40
+plotly>=5.22            # optional, used by charts
