@@ -1,99 +1,65 @@
-# services/executor.py
-from __future__ import annotations
-import os, json
-import sqlalchemy as sa
+import os, math, pandas as pd
 from datetime import datetime, timezone
+from sqlalchemy import create_engine, text
 
-DB_URL = (
-    f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
-    f"@{os.environ['DB_HOST']}:{os.environ.get('DB_PORT','5432')}/{os.environ['DB_NAME']}"
-    f"?sslmode=require&channel_binding=require"
-)
-ENGINE = sa.create_engine(DB_URL, pool_pre_ping=True)
+def eng():
+    url = (f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
+           f"@{os.environ['DB_HOST']}:{os.environ.get('DB_PORT','5432')}/{os.environ['DB_NAME']}"
+           "?sslmode=require&channel_binding=require")
+    return create_engine(url, pool_pre_ping=True)
 
-MODEL = "ma_cross_v1"
-TIMEFRAME = "1d"
-
-MAX_OPEN_POSITIONS = 10   # naive portfolio cap
-QTY_PER_TRADE = 1         # 1 share per trade for now
-
-def _net_position(conn, symbol_id: int) -> int:
-    # +qty for buys, -qty for sells on filled orders
-    q = sa.text("""
-        select coalesce(sum(case when side='buy' then qty else -qty end),0) as pos
-        from orders where symbol_id=:sid and status='filled'
+def fetch_new_signals(e):
+    q = text("""
+      SELECT s.id, sy.ticker, s.ts, s.signal
+      FROM signals s
+      JOIN symbols sy ON sy.id = s.symbol_id
+      WHERE s.ts >= now() - interval '2 days'
+      ORDER BY s.ts DESC
     """)
-    return int(conn.execute(q, {"sid": symbol_id}).scalar_one())
+    with e.connect() as c:
+        return pd.read_sql(q, c)
 
-def _open_positions_count(conn) -> int:
-    # count symbols with net position > 0
-    q = sa.text("""
-        with p as (
-          select symbol_id,
-                 sum(case when side='buy' then qty else -qty end) as pos
-          from orders where status='filled'
-          group by symbol_id
-        )
-        select count(*) from p where pos <> 0
+def decide_qty(equity, price, risk_frac=0.05):
+    notional = equity * risk_frac
+    return max(0, math.floor(notional / max(price, 1e-6)))
+
+def last_equity(e):
+    q = text("""SELECT (realized+unrealized-fees) AS eq
+                FROM daily_pnl WHERE portfolio_id=1
+                ORDER BY date DESC LIMIT 1""")
+    with e.connect() as c:
+        row = c.execute(q).fetchone()
+    return float(row[0]) if row else 100_000.0
+
+def place_order(e, ticker, side, qty, price, meta):
+    ins = text("""
+      INSERT INTO orders(ts, symbol_id, side, qty, type, limit_price, status, meta)
+      SELECT now(), id, :side, :qty, 'market', NULL, 'new', :meta::jsonb
+      FROM symbols WHERE ticker=:t
+      RETURNING id
     """)
-    return int(conn.execute(q).scalar_one())
+    with e.begin() as c:
+        oid = c.execute(ins, {"t": ticker, "side": side, "qty": qty, "meta": meta}).scalar()
+    return oid
 
-def main():
-    with ENGINE.begin() as conn:
-        # latest signal per symbol for our model/timeframe
-        latest = conn.execute(sa.text(f"""
-            select distinct on (s.symbol_id)
-                   s.symbol_id, sym.ticker, s.ts, s.signal
-            from signals s
-            join symbols sym on sym.id = s.symbol_id
-            where s.model = :model and s.timeframe = :tf
-            order by s.symbol_id, s.ts desc
-        """), {"model": MODEL, "tf": TIMEFRAME}).fetchall()
-
-        open_count = _open_positions_count(conn)
-
-        ins_order = sa.text("""
-            insert into orders(ts, symbol_id, side, qty, type, status, meta, filled_at)
-            values (:ts, :sid, :side, :qty, 'market', 'filled', :meta::jsonb, :filled_at)
-        """)
-
-        placed = 0
-        for sid, ticker, ts, payload in latest:
-            sig = payload if isinstance(payload, dict) else json.loads(payload)
-            side = sig.get("side")
-            if side not in ("buy", "sell"):
-                continue
-
-            pos = _net_position(conn, sid)
-
-            # very simple policy:
-            # - buy only if pos <= 0 and we have capacity
-            # - sell only if pos >= 0 (flip or flatten)
-            do_buy = side == "buy" and pos <= 0 and open_count < MAX_OPEN_POSITIONS
-            do_sell = side == "sell" and pos >= 0 and open_count > -MAX_OPEN_POSITIONS  # symmetric
-
-            if not (do_buy or do_sell):
-                continue
-
-            qty = QTY_PER_TRADE
-            meta = {"source": "paper", "model": MODEL, "signal": sig}
-            conn.execute(ins_order, {
-                "ts": datetime.now(timezone.utc),
-                "sid": sid,
-                "side": "buy" if do_buy else "sell",
-                "qty": qty,
-                "meta": json.dumps(meta),
-                "filled_at": datetime.now(timezone.utc),
-            })
-            # update open_count if we opened a new long
-            if do_buy and pos == 0:
-                open_count += 1
-            if do_sell and pos > 0 and pos - qty <= 0:
-                open_count -= 1
-            placed += 1
-
-        print(f"Placed {placed} paper orders.")
+def run():
+    e = eng()
+    eq = last_equity(e)
+    sigs = fetch_new_signals(e)
+    if sigs.empty:
+        return
+    # very naive: buy when signal["action"] == "buy", sell when "sell"
+    for _, r in sigs.iterrows():
+        s = r["signal"]
+        # assume your signal json looks like {"action":"buy","price":123.45}
+        action = s.get("action")
+        px = float(s.get("price", 0.0))
+        if action not in ("buy", "sell") or px <= 0:
+            continue
+        qty = decide_qty(eq, px, risk_frac=0.05)
+        if qty == 0: 
+            continue
+        place_order(e, r["ticker"], action, qty, px, meta=s)
 
 if __name__ == "__main__":
-    main()
-d
+    run()
