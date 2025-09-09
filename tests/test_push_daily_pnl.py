@@ -1,13 +1,29 @@
 from datetime import date
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import text, Integer, Date as SA_Date, Float
 
 from etl.push_daily_pnl import (
     build_daily_pnl_rows,
     upsert_daily_pnl,
     make_engine,
 )
+
+
+def _typed_select_all():
+    """
+    Make the SELECT typed so SQLite returns a real Python date.
+    """
+    return text("""
+        SELECT portfolio_id, date, realized, unrealized, fees
+        FROM daily_pnl
+    """).columns(
+        portfolio_id=Integer(),
+        date=SA_Date(),
+        realized=Float(),
+        unrealized=Float(),
+        fees=Float(),
+    )
 
 
 def test_upsert_inserts_then_updates(engine):
@@ -25,10 +41,7 @@ def test_upsert_inserts_then_updates(engine):
     assert n1 == 1
 
     with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT portfolio_id, date, realized, unrealized, fees
-            FROM daily_pnl
-        """)).mappings().one()
+        row = conn.execute(_typed_select_all()).mappings().one()
 
     assert row["portfolio_id"] == 1
     assert row["date"] == date(2025, 9, 9)
@@ -36,7 +49,7 @@ def test_upsert_inserts_then_updates(engine):
     assert row["unrealized"] == 5.0
     assert row["fees"] == 1.0
 
-    # UPSERT same PK -> values should update (still 1 row total)
+    # UPSERT -> update values, still 1 row total
     df2 = pd.DataFrame(
         [{
             "portfolio_id": 1,
@@ -52,10 +65,7 @@ def test_upsert_inserts_then_updates(engine):
     with engine.connect() as conn:
         cnt = conn.execute(text("SELECT COUNT(*) FROM daily_pnl")).scalar_one()
         assert cnt == 1
-        row = conn.execute(text("""
-            SELECT portfolio_id, date, realized, unrealized, fees
-            FROM daily_pnl
-        """)).mappings().one()
+        row = conn.execute(_typed_select_all()).mappings().one()
 
     assert row["realized"] == 20.0
     assert row["unrealized"] == 7.5
