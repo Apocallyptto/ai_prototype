@@ -1,54 +1,52 @@
-# Upserts a daily PnL row (per portfolio_id, date) so repeated runs are safe.
-
+# etl/push_daily_pnl.py
 import os
-from datetime import datetime, timezone, date
-import sqlalchemy as sa
+import datetime as dt
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, Date, Numeric
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 def engine_from_env():
     url = (
         f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
-        f"@{os.environ['DB_HOST']}:{os.environ.get('DB_PORT','5432')}/{os.environ['DB_NAME']}?sslmode=require"
+        f"@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}"
     )
-    return sa.create_engine(url, pool_pre_ping=True)
+    return create_engine(url, pool_pre_ping=True)
 
-def upsert_daily_pnl(conn, row: dict):
-    """
-    row = {
-      'portfolio_id': int,
-      'date': datetime.date,
-      'realized': float,
-      'unrealized': float,
-      'fees': float,
-    }
-    """
-    stmt = sa.text("""
-        INSERT INTO daily_pnl (portfolio_id, date, realized, unrealized, fees)
-        VALUES (:portfolio_id, :date, :realized, :unrealized, :fees)
-        ON CONFLICT (portfolio_id, date)
-        DO UPDATE SET
-            realized   = EXCLUDED.realized,
-            unrealized = EXCLUDED.unrealized,
-            fees       = EXCLUDED.fees
-    """)
-    conn.execute(stmt, row)
-
-def main():
-    eng = engine_from_env()
-
-    # You can replace these with your real PnL numbers
-    today_utc = datetime.now(timezone.utc).date()
-    row = {
+def compute_daily_row():
+    # TODO: keep your existing logic that computes realized/unrealized/fees
+    # For now, this matches the row you were inserting:
+    return {
         "portfolio_id": 1,
-        "date": today_utc,
-        "realized": 0.0,
-        "unrealized": 0.0,
-        "fees": 0.0,
+        "date": dt.date.today(),
+        "realized": 0,
+        "unrealized": 0,
+        "fees": 0,
     }
 
-    with eng.begin() as conn:
-        upsert_daily_pnl(conn, row)
-
-    print(f"✅ Upserted daily_pnl for portfolio_id={row['portfolio_id']} on {row['date']}")
+def upsert_daily_pnl(engine, row: dict):
+    meta = MetaData()
+    daily_pnl = Table(
+        "daily_pnl",
+        meta,
+        Column("portfolio_id", Integer, primary_key=True),
+        Column("date", Date, primary_key=True),
+        Column("realized", Numeric),
+        Column("unrealized", Numeric),
+        Column("fees", Numeric),
+    )
+    stmt = pg_insert(daily_pnl).values(row)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["portfolio_id", "date"],
+        set_={
+            "realized": stmt.excluded.realized,
+            "unrealized": stmt.excluded.unrealized,
+            "fees": stmt.excluded.fees,
+        },
+    )
+    with engine.begin() as conn:
+        conn.execute(stmt)
 
 if __name__ == "__main__":
-    main()
+    eng = engine_from_env()
+    row = compute_daily_row()
+    upsert_daily_pnl(eng, row)
+    print("✅ upserted daily_pnl:", row)
