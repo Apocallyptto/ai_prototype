@@ -1,137 +1,152 @@
-#!/usr/bin/env python3
-"""
-etl/push_daily_pnl.py
-
-Writes today's daily PnL into the `daily_pnl` table using an idempotent UPSERT.
-Primary key: (portfolio_id, date)
-
-Env vars required (same as your smoke test):
-  DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
-
-Optional env vars:
-  PORTFOLIO_ID      -> default: 1
-  PNL_REALIZED      -> default: 0
-  PNL_UNREALIZED    -> default: 0
-  PNL_FEES          -> default: 0
-  PNL_DATE          -> default: today's UTC date (YYYY-MM-DD)
-
-If a row already exists for (portfolio_id, date), its values are updated.
-"""
-
 from __future__ import annotations
 
 import os
 import sys
 from datetime import date, datetime
-from typing import Dict, Any, List
+from typing import Iterable
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, MetaData, Table
+from sqlalchemy.engine import Engine
 
 
-def _require_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        print(f"❌ Missing required environment variable: {name}", file=sys.stderr)
+def _require_env(var: str) -> str:
+    val = os.getenv(var)
+    if not val:
+        print(f"❌ Missing required env var: {var}", file=sys.stderr)
         sys.exit(1)
-    return v
+    return val
 
 
-def make_engine():
-    user = _require_env("DB_USER")
-    pwd = _require_env("DB_PASSWORD")
+def make_engine() -> Engine:
+    """
+    Build a SQLAlchemy engine from DB_* env vars.
+    Exits with code 1 if any are missing.
+    """
     host = _require_env("DB_HOST")
     port = _require_env("DB_PORT")
-    db   = _require_env("DB_NAME")
+    name = _require_env("DB_NAME")
+    user = _require_env("DB_USER")
+    pwd = _require_env("DB_PASSWORD")
 
-    # Use sslmode=require as in your smoke test
-    url = f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}?sslmode=require"
+    url = f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{name}"
     return create_engine(url, pool_pre_ping=True, future=True)
 
 
-def _parse_date_yyyy_mm_dd(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
+def _parse_float(env_name: str, default: float) -> float:
+    raw = os.getenv(env_name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise SystemExit(f"Invalid float for {env_name}: {raw!r}")
+
+
+def _parse_int(env_name: str, default: int) -> int:
+    raw = os.getenv(env_name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"Invalid int for {env_name}: {raw!r}")
+
+
+def _parse_date(env_name: str, default: date) -> date:
+    raw = os.getenv(env_name)
+    if not raw:
+        return default
+    try:
+        # allow YYYY-MM-DD or full ISO
+        return datetime.fromisoformat(raw).date()
+    except Exception:
+        raise SystemExit(f"Invalid date for {env_name}: {raw!r} (expected YYYY-MM-DD)")
 
 
 def build_daily_pnl_rows() -> pd.DataFrame:
     """
-    Build a DataFrame with columns:
-    [portfolio_id, date, realized, unrealized, fees]
-
-    Replace or extend this with your actual PnL computation if needed.
-    For now it uses env overrides or zeros, which matches your previous run.
+    Build a one-row DataFrame from env overrides (or sensible defaults).
+    PORTFOLIO_ID, PNL_DATE, PNL_REALIZED, PNL_UNREALIZED, PNL_FEES
     """
-    portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
-
-    # date: allow override, else UTC today
-    d = os.getenv("PNL_DATE")
-    pnl_date = _parse_date_yyyy_mm_dd(d) if d else datetime.utcnow().date()
-
-    realized = float(os.getenv("PNL_REALIZED", "0"))
-    unrealized = float(os.getenv("PNL_UNREALIZED", "0"))
-    fees = float(os.getenv("PNL_FEES", "0"))
-
-    df = pd.DataFrame(
-        [{
-            "portfolio_id": portfolio_id,
-            "date": pnl_date,
-            "realized": realized,
-            "unrealized": unrealized,
-            "fees": fees,
-        }]
-    )
-
-    # Ensure 'date' is a Python date (not Timestamp) for psycopg2
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    return df
+    row = {
+        "portfolio_id": _parse_int("PORTFOLIO_ID", 1),
+        "date": _parse_date("PNL_DATE", date.today()),
+        "realized": _parse_float("PNL_REALIZED", 0.0),
+        "unrealized": _parse_float("PNL_UNREALIZED", 0.0),
+        "fees": _parse_float("PNL_FEES", 0.0),
+    }
+    return pd.DataFrame([row], columns=["portfolio_id", "date", "realized", "unrealized", "fees"])
 
 
-def upsert_daily_pnl(engine, df: pd.DataFrame) -> int:
+def upsert_daily_pnl(engine: Engine, df: pd.DataFrame) -> int:
     """
-    Perform an UPSERT into daily_pnl for all rows in df.
-    Returns number of rows processed.
+    Dialect-aware UPSERT into daily_pnl on (portfolio_id, date).
+    Returns the number of rows attempted (len(df)).
     """
-    required_cols = {"portfolio_id", "date", "realized", "unrealized", "fees"}
-    if not required_cols.issubset(df.columns):
-        missing = required_cols.difference(df.columns)
-        raise ValueError(f"DataFrame missing required columns: {missing}")
+    if df.empty:
+        return 0
 
-    records: List[Dict[str, Any]] = df.to_dict(orient="records")
+    meta = MetaData()
+    # reflect if present; if not present this will still allow insert using the explicit columns
+    tbl = Table("daily_pnl", meta, autoload_with=engine, extend_existing=True)
 
-    # Postgres UPSERT via text() with executemany
-    stmt = text("""
+    dialect = engine.dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = pg_insert(tbl).values(df.to_dict(orient="records"))
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["portfolio_id", "date"],
+            set_={
+                "realized": stmt.excluded.realized,
+                "unrealized": stmt.excluded.unrealized,
+                "fees": stmt.excluded.fees,
+            },
+        )
+        with engine.begin() as conn:
+            conn.execute(stmt)
+        return len(df)
+
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        stmt = sqlite_insert(tbl).values(df.to_dict(orient="records"))
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["portfolio_id", "date"],
+            set_={
+                "realized": stmt.excluded.realized,
+                "unrealized": stmt.excluded.unrealized,
+                "fees": stmt.excluded.fees,
+            },
+        )
+        with engine.begin() as conn:
+            conn.execute(stmt)
+        return len(df)
+
+    # Generic fallback: try raw SQL with ON CONFLICT (works on PG & modern SQLite)
+    rows = df.to_dict(orient="records")
+    sql = """
         INSERT INTO daily_pnl (portfolio_id, date, realized, unrealized, fees)
         VALUES (:portfolio_id, :date, :realized, :unrealized, :fees)
-        ON CONFLICT (portfolio_id, date) DO UPDATE
-        SET realized   = EXCLUDED.realized,
-            unrealized = EXCLUDED.unrealized,
-            fees       = EXCLUDED.fees
-    """)
-
+        ON CONFLICT (portfolio_id, date)
+        DO UPDATE SET
+          realized = excluded.realized,
+          unrealized = excluded.unrealized,
+          fees = excluded.fees;
+    """
     with engine.begin() as conn:
-        conn.execute(stmt, records)
+        conn.execute(text(sql), rows)
+    return len(df)
 
-    return len(records)
 
-
-def main() -> None:
+def main(argv: Iterable[str] | None = None) -> int:
     engine = make_engine()
     df = build_daily_pnl_rows()
     n = upsert_daily_pnl(engine, df)
-
-    # Friendly log output for Actions
-    row = df.iloc[0].to_dict()
-    print(
-        "✅ daily_pnl upserted",
-        f"(portfolio_id={row['portfolio_id']}, date={row['date']}, "
-        f"realized={row['realized']}, unrealized={row['unrealized']}, fees={row['fees']})"
-    )
-    print(f"Rows processed: {n}")
+    print(f"✔ upserted {n} daily_pnl row(s)")
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"❌ ETL failed: {e}", file=sys.stderr)
-        sys.exit(1)
+    raise SystemExit(main())
