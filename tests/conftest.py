@@ -5,16 +5,14 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, text
 
-# Ensure repo root is on sys.path so `etl` package resolves
+
+# Ensure repo root is importable (so `etl` package resolves)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-TEST_DB_URL_ENV = "TEST_DB_URL"
-
 
 def _ensure_schema(engine):
-    # Minimal schema for daily_pnl used by the ETL
     ddl = """
     CREATE TABLE IF NOT EXISTS daily_pnl (
         portfolio_id INTEGER NOT NULL,
@@ -30,41 +28,24 @@ def _ensure_schema(engine):
 
 
 @pytest.fixture(scope="session")
-def db_url():
+def engine():
     """
-    Returns a SQLAlchemy URL for a running Postgres.
-    Priority:
-      1) $TEST_DB_URL (e.g., postgresql+psycopg2://user:pass@host:port/dbname)
-      2) Spin up ephemeral Postgres via testcontainers
+    Prefer TEST_DB_URL if set; else fall back to an in-memory SQLite DB.
+    (No Docker required.)
     """
-    env_url = os.getenv(TEST_DB_URL_ENV)
-    if env_url:
-        yield env_url
-        return
-
-    try:
-        from testcontainers.postgres import PostgresContainer
-    except Exception as e:
-        pytest.skip(f"testcontainers not available and {TEST_DB_URL_ENV} not set: {e}")
-
-    # Pin a common image
-    with PostgresContainer("postgres:16-alpine") as pg:
-        # testcontainers gives a SQLAlchemy-compatible URL
-        url = pg.get_connection_url()
-        yield url
-
-
-@pytest.fixture(scope="session")
-def engine(db_url):
-    engine = create_engine(db_url, pool_pre_ping=True, future=True)
-    _ensure_schema(engine)
-    return engine
+    url = os.getenv("TEST_DB_URL")
+    if not url:
+        # No Postgres provided; use SQLite for unit tests
+        url = "sqlite+pysqlite:///:memory:"
+    eng = create_engine(url, future=True)
+    _ensure_schema(eng)
+    return eng
 
 
 @pytest.fixture(autouse=True)
 def _clean_daily_pnl(engine):
-    # Truncate daily_pnl before each test for isolation
+    # Truncate / delete before each test for isolation
+    cleanup_sql = "DELETE FROM daily_pnl" if engine.dialect.name == "sqlite" else "TRUNCATE TABLE daily_pnl"
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE daily_pnl;"))
+        conn.execute(text(cleanup_sql))
     yield
-    # nothing to do post-test
