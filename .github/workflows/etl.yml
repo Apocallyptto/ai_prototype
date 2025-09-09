@@ -1,21 +1,39 @@
-# .github/workflows/etl.yml
 name: ETL
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 1 * * *"     # every day 01:00 UTC
-  workflow_dispatch: {}     # allow manual runs
+    - cron: '15 2 * * *'   # daily @ 02:15 UTC
+  push:
+    paths:
+      - 'etl/**.py'
+      - 'backtests/**.py'
+      - 'lib/**.py'
+      - '.github/workflows/etl.yml'
+      - 'requirements.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: etl-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  db_smoke:
+  db-smoke:
     name: DB smoke test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - name: Install DB client
-        run: pip install psycopg2-binary
-      - name: Check secrets + DB
+        with:
+          python-version: '3.12'
+
+      - name: Install client
+        run: |
+          python -m pip install --upgrade pip
+          pip install psycopg2-binary
+
+      - name: Test connection
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_PORT: ${{ secrets.DB_PORT }}
@@ -24,36 +42,161 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           python - <<'PY'
-          import os,sys,psycopg2
+          import os, sys, psycopg2
           try:
               conn = psycopg2.connect(
-                  host=os.environ["DB_HOST"], port=os.environ["DB_PORT"],
-                  dbname=os.environ["DB_NAME"], user=os.environ["DB_USER"],
-                  password=os.environ["DB_PASSWORD"], sslmode="require")
+                  host=os.environ["DB_HOST"],
+                  port=os.environ["DB_PORT"],
+                  dbname=os.environ["DB_NAME"],
+                  user=os.environ["DB_USER"],
+                  password=os.environ["DB_PASSWORD"],
+                  sslmode="require",
+              )
               with conn, conn.cursor() as cur:
-                  cur.execute("select 1"); assert cur.fetchone()[0]==1
+                  cur.execute("select 1")
+                  assert cur.fetchone()[0] == 1
               print("✅ Secrets/DB OK")
           except Exception as e:
-              print("❌ Secrets/DB check failed:", e); sys.exit(1)
+              print("❌ Secrets/DB check failed:", e)
+              sys.exit(1)
           PY
 
-  run_etl:
+      # Optional Slack on DB failure
+      - name: Notify Slack (DB smoke failed)
+        if: ${{ failure() && secrets.SLACK_WEBHOOK != '' }}
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+               --data "{\"text\":\"❌ DB smoke test FAILED on ${REF} • run ${RUN_ID}\"}" \
+               "${SLACK_WEBHOOK}"
+
+  run-etl:
     name: Run ETL
-    needs: db_smoke
+    needs: db-smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with:
+          python-version: '3.12'
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt yfinance
-      - name: Execute ETL
+          pip install -r requirements.txt
+
+      - name: Run ETL (push_daily_pnl.py)
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_PORT: ${{ secrets.DB_PORT }}
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-        run: python etl/push_daily_pnl.py
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          python etl/push_daily_pnl.py
+
+      - name: Notify Slack (ETL success)
+        if: ${{ success() && secrets.SLACK_WEBHOOK != '' }}
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+               --data "{\"text\":\"✅ ETL succeeded on ${REF} • run ${RUN_ID}\"}" \
+               "${SLACK_WEBHOOK}"
+
+      - name: Notify Slack (ETL failure)
+        if: ${{ failure() && secrets.SLACK_WEBHOOK != '' }}
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+               --data "{\"text\":\"❌ ETL FAILED on ${REF} • run ${RUN_ID}\"}" \
+               "${SLACK_WEBHOOK}"
+
+  backtest-crossover:
+    name: Backtest crossover
+    needs: run-etl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt yfinance
+
+      - name: Run crossover backtest
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          python backtests/crossover.py \
+            --ticker AAPL \
+            --tf 1d \
+            --start 2018-01-01 \
+            --sma-fast 50 \
+            --sma-slow 200 \
+            --commission-bps 1
+
+      - name: Verify daily_pnl has recent rows
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os, sys, pandas as pd, sqlalchemy as sa
+          url = (f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
+                 f"@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}?sslmode=require")
+          eng = sa.create_engine(url, pool_pre_ping=True)
+          with eng.connect() as c:
+              df = pd.read_sql(sa.text(
+                  "select count(*) as n from daily_pnl where portfolio_id=1 and date >= current_date - interval '30 days'"),
+                  c)
+              n = int(df.loc[0, 'n'])
+              print("Recent PnL rows (last 30d):", n)
+              if n == 0:
+                  print("❌ No recent PnL rows written")
+                  sys.exit(1)
+          print("✅ PnL write verified")
+          PY
+
+      - name: Notify Slack (backtest success)
+        if: ${{ success() && secrets.SLACK_WEBHOOK != '' }}
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+               --data "{\"text\":\"✅ Backtest wrote equity to daily_pnl on ${REF} • run ${RUN_ID}\"}" \
+               "${SLACK_WEBHOOK}"
+
+      - name: Notify Slack (backtest failure)
+        if: ${{ failure() && secrets.SLACK_WEBHOOK != '' }}
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          REF: ${{ github.ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+               --data "{\"text\":\"❌ Backtest FAILED on ${REF} • run ${RUN_ID}\"}" \
+               "${SLACK_WEBHOOK}"
