@@ -5,8 +5,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, text
 
-
-# Ensure repo root is importable (so `etl` package resolves)
+# Make repo root importable (so `etl` resolves)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -30,13 +29,10 @@ def _ensure_schema(engine):
 @pytest.fixture(scope="session")
 def engine():
     """
-    Prefer TEST_DB_URL if set; else fall back to an in-memory SQLite DB.
+    Use TEST_DB_URL if set; otherwise use in-memory SQLite.
     (No Docker required.)
     """
-    url = os.getenv("TEST_DB_URL")
-    if not url:
-        # No Postgres provided; use SQLite for unit tests
-        url = "sqlite+pysqlite:///:memory:"
+    url = os.getenv("TEST_DB_URL") or "sqlite+pysqlite:///:memory:"
     eng = create_engine(url, future=True)
     _ensure_schema(eng)
     return eng
@@ -44,7 +40,6 @@ def engine():
 
 @pytest.fixture(autouse=True)
 def _clean_daily_pnl(engine):
-    # Truncate / delete before each test for isolation
     cleanup_sql = "DELETE FROM daily_pnl" if engine.dialect.name == "sqlite" else "TRUNCATE TABLE daily_pnl"
     with engine.begin() as conn:
         conn.execute(text(cleanup_sql))
