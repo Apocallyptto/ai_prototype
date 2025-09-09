@@ -1,4 +1,3 @@
-import os
 from datetime import date
 
 import pandas as pd
@@ -7,12 +6,12 @@ from sqlalchemy import text
 from etl.push_daily_pnl import (
     build_daily_pnl_rows,
     upsert_daily_pnl,
-    make_engine,  # used only to test missing env handling
+    make_engine,
 )
 
 
 def test_upsert_inserts_then_updates(engine):
-    # Insert
+    # INSERT
     df1 = pd.DataFrame(
         [{
             "portfolio_id": 1,
@@ -25,7 +24,6 @@ def test_upsert_inserts_then_updates(engine):
     n1 = upsert_daily_pnl(engine, df1)
     assert n1 == 1
 
-    # Verify insert
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT portfolio_id, date, realized, unrealized, fees
@@ -38,7 +36,7 @@ def test_upsert_inserts_then_updates(engine):
     assert row["unrealized"] == 5.0
     assert row["fees"] == 1.0
 
-    # Update same PK via UPSERT
+    # UPSERT same PK -> values should update (still 1 row total)
     df2 = pd.DataFrame(
         [{
             "portfolio_id": 1,
@@ -51,11 +49,9 @@ def test_upsert_inserts_then_updates(engine):
     n2 = upsert_daily_pnl(engine, df2)
     assert n2 == 1
 
-    # Still one row, but values updated
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT count(*) AS c FROM daily_pnl")).one()
-        assert rows[0] == 1
-
+        cnt = conn.execute(text("SELECT COUNT(*) FROM daily_pnl")).scalar_one()
+        assert cnt == 1
         row = conn.execute(text("""
             SELECT portfolio_id, date, realized, unrealized, fees
             FROM daily_pnl
@@ -77,7 +73,7 @@ def test_upsert_multiple_rows(engine):
     assert n == 2
 
     with engine.connect() as conn:
-        count = conn.execute(text("SELECT count(*) FROM daily_pnl")).scalar_one()
+        count = conn.execute(text("SELECT COUNT(*) FROM daily_pnl")).scalar_one()
         assert count == 2
 
 
@@ -100,7 +96,6 @@ def test_build_daily_pnl_rows_env_overrides(monkeypatch):
 
 
 def test_make_engine_missing_env_exits(monkeypatch):
-    # Remove required DB_* env vars to ensure make_engine fails fast
     for var in ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]:
         monkeypatch.delenv(var, raising=False)
 
