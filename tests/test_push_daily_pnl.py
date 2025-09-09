@@ -1,4 +1,4 @@
-from datetime import date
+﻿from datetime import date
 
 import pandas as pd
 from sqlalchemy import text, Integer, Date as SA_Date, Float
@@ -11,9 +11,7 @@ from etl.push_daily_pnl import (
 
 
 def _typed_select_all():
-    """
-    Make the SELECT typed so SQLite returns a real Python date.
-    """
+    # Make the SELECT typed so SQLite returns a real Python date.
     return text("""
         SELECT portfolio_id, date, realized, unrealized, fees
         FROM daily_pnl
@@ -28,15 +26,13 @@ def _typed_select_all():
 
 def test_upsert_inserts_then_updates(engine):
     # INSERT
-    df1 = pd.DataFrame(
-        [{
-            "portfolio_id": 1,
-            "date": date(2025, 9, 9),
-            "realized": 10.0,
-            "unrealized": 5.0,
-            "fees": 1.0,
-        }]
-    )
+    df1 = pd.DataFrame([{
+        "portfolio_id": 1,
+        "date": date(2025, 9, 9),
+        "realized": 10.0,
+        "unrealized": 5.0,
+        "fees": 1.0,
+    }])
     n1 = upsert_daily_pnl(engine, df1)
     assert n1 == 1
 
@@ -49,16 +45,14 @@ def test_upsert_inserts_then_updates(engine):
     assert row["unrealized"] == 5.0
     assert row["fees"] == 1.0
 
-    # UPSERT -> update values, still 1 row total
-    df2 = pd.DataFrame(
-        [{
-            "portfolio_id": 1,
-            "date": date(2025, 9, 9),
-            "realized": 20.0,
-            "unrealized": 7.5,
-            "fees": 2.0,
-        }]
-    )
+    # UPSERT (update same row)
+    df2 = pd.DataFrame([{
+        "portfolio_id": 1,
+        "date": date(2025, 9, 9),
+        "realized": 20.0,
+        "unrealized": 7.5,
+        "fees": 2.0,
+    }])
     n2 = upsert_daily_pnl(engine, df2)
     assert n2 == 1
 
@@ -73,12 +67,10 @@ def test_upsert_inserts_then_updates(engine):
 
 
 def test_upsert_multiple_rows(engine):
-    df = pd.DataFrame(
-        [
-            {"portfolio_id": 1, "date": date(2025, 9, 10), "realized": 1.0, "unrealized": 2.0, "fees": 0.1},
-            {"portfolio_id": 2, "date": date(2025, 9, 10), "realized": 3.0, "unrealized": 4.0, "fees": 0.2},
-        ]
-    )
+    df = pd.DataFrame([
+        {"portfolio_id": 1, "date": date(2025, 9, 10), "realized": 1.0, "unrealized": 2.0, "fees": 0.1},
+        {"portfolio_id": 2, "date": date(2025, 9, 10), "realized": 3.0, "unrealized": 4.0, "fees": 0.2},
+    ])
     n = upsert_daily_pnl(engine, df)
     assert n == 2
 
