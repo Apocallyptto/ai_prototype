@@ -6,3 +6,5 @@ psycopg2-binary>=2.9.9
 alembic>=1.13
 yfinance>=0.2.40
 plotly>=5.22            # optional, used by charts
+pytest>=7.4
+testcontainers>=4.6,<5
