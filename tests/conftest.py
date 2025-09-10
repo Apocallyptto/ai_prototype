@@ -10,7 +10,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-
 def _ensure_schema(engine):
     ddl = """
     CREATE TABLE IF NOT EXISTS daily_pnl (
@@ -25,18 +24,13 @@ def _ensure_schema(engine):
     with engine.begin() as conn:
         conn.execute(text(ddl))
 
-
 @pytest.fixture(scope="session")
 def engine():
-    """
-    Use TEST_DB_URL if set; otherwise use in-memory SQLite.
-    (No Docker required.)
-    """
+    # No Docker. Use TEST_DB_URL if provided, else in-memory SQLite.
     url = os.getenv("TEST_DB_URL") or "sqlite+pysqlite:///:memory:"
     eng = create_engine(url, future=True)
     _ensure_schema(eng)
     return eng
-
 
 @pytest.fixture(autouse=True)
 def _clean_daily_pnl(engine):
