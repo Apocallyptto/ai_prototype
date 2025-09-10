@@ -7,34 +7,26 @@ import pandas as pd
 import sqlalchemy as sa
 import streamlit as st
 
-
-# ---------- Page chrome ----------
 st.set_page_config(page_title="Admin / Import", page_icon="🛠️", layout="wide")
 st.title("🛠️ Admin / Import")
 st.caption("Create/Update tables, reset demo data, and seed examples.")
 
-
-# ---------- DB utilities ----------
+# ---------------- DB helpers ----------------
 def _require(value, name: str):
     if value in (None, "", "None"):
         st.error(f"Missing database setting: `{name}`")
         st.stop()
     return value
 
-
 @st.cache_resource(show_spinner=False)
 def get_engine():
-    """
-    Prefer .streamlit/secrets.toml -> [db]; fall back to env vars.
-    """
     cfg = st.secrets.get("db", {})
-
     host = cfg.get("host") or os.getenv("DB_HOST")
     port = cfg.get("port") or os.getenv("DB_PORT", 5432)
     db   = cfg.get("dbname") or cfg.get("name") or os.getenv("DB_NAME")
     user = cfg.get("user") or os.getenv("DB_USER")
     pw   = cfg.get("password") or os.getenv("DB_PASSWORD")
-    ssl  = cfg.get("sslmode") or os.getenv("DB_SSLMODE")  # e.g. "require" for Neon
+    ssl  = cfg.get("sslmode") or os.getenv("DB_SSLMODE")  # e.g., "require" for Neon
 
     host = _require(host, "host")
     db   = _require(db, "dbname")
@@ -57,12 +49,7 @@ def get_engine():
     )
     return sa.create_engine(url, pool_pre_ping=True)
 
-
 def create_or_update_tables(engine):
-    """
-    Minimal, compatible schemas for the Streamlit pages you have.
-    Uses IF NOT EXISTS so it won't clobber existing tables.
-    """
     ddl = """
     CREATE TABLE IF NOT EXISTS daily_pnl (
         portfolio_id INTEGER NOT NULL,
@@ -79,7 +66,7 @@ def create_or_update_tables(engine):
         ticker TEXT NOT NULL,
         timeframe TEXT NOT NULL,
         model TEXT NOT NULL,
-        side TEXT NOT NULL,              -- e.g., 'buy' / 'sell'
+        side TEXT NOT NULL,
         strength DOUBLE PRECISION
     );
 
@@ -87,55 +74,78 @@ def create_or_update_tables(engine):
         id BIGSERIAL PRIMARY KEY,
         ts TIMESTAMPTZ NOT NULL DEFAULT now(),
         ticker TEXT NOT NULL,
-        side TEXT NOT NULL,              -- 'buy'/'sell'
+        side TEXT NOT NULL,
         qty DOUBLE PRECISION NOT NULL,
-        order_type TEXT,                 -- 'market'/'limit'
+        order_type TEXT,
         limit_price DOUBLE PRECISION,
         status TEXT NOT NULL DEFAULT 'new',
         filled_at TIMESTAMPTZ
     );
 
+    -- Symbols may already exist without `name`; create minimally then add name if missing
     CREATE TABLE IF NOT EXISTS symbols (
-        ticker TEXT PRIMARY KEY,
-        name TEXT
+        ticker TEXT PRIMARY KEY
     );
     """
     with engine.begin() as conn:
         conn.execute(sa.text(ddl))
-
+        # Add name column if it doesn't exist
+        try:
+            conn.execute(sa.text("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS name TEXT;"))
+        except Exception:
+            # Some managed DBs might block ALTER; that's okay — seeding will adapt.
+            pass
 
 def reset_tables(conn):
-    """
-    Try fast TRUNCATE; if permissions block it (e.g., in some managed Postgres),
-    fall back to DELETE.
-    """
     try:
-        conn.execute(sa.text("""
-            TRUNCATE TABLE orders, signals, daily_pnl RESTART IDENTITY;
-        """))
+        conn.execute(sa.text("TRUNCATE TABLE orders, signals, daily_pnl RESTART IDENTITY;"))
     except Exception:
         conn.execute(sa.text("DELETE FROM orders;"))
         conn.execute(sa.text("DELETE FROM signals;"))
         conn.execute(sa.text("DELETE FROM daily_pnl;"))
 
+def table_has_column(conn, table: str, column: str) -> bool:
+    sql = sa.text("""
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = :t
+            AND column_name = :c
+        )
+    """)
+    return bool(conn.execute(sql, {"t": table, "c": column}).scalar_one())
 
-# ---------- Demo data ----------
+def upsert_symbols(conn, rows):
+    """
+    Insert demo symbols. If `name` column is present, upsert (update name on conflict).
+    If not present, insert only ticker and ignore conflicts.
+    """
+    has_name = table_has_column(conn, "symbols", "name")
+    if has_name:
+        stmt = sa.text("""
+            INSERT INTO symbols (ticker, name)
+            VALUES (:ticker, :name)
+            ON CONFLICT (ticker) DO UPDATE SET name = EXCLUDED.name;
+        """)
+        conn.execute(stmt, rows)
+    else:
+        stmt = sa.text("""
+            INSERT INTO symbols (ticker)
+            VALUES (:ticker)
+            ON CONFLICT (ticker) DO NOTHING;
+        """)
+        conn.execute(stmt, [{"ticker": r["ticker"]} for r in rows])
+
+# ---------------- Demo data builders ----------------
 def make_demo_pnl(portfolio_id=1, days=120, seed=7):
-    """
-    Generate semi-realistic daily PnL for the last `days` business days.
-    """
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range(end=pd.Timestamp.utcnow().date(), periods=days)
 
-    # Random daily returns around 0 with small variance
-    # Build a simple equity curve, then decompose into realized/unrealized
-    daily_ret = rng.normal(loc=0.0005, scale=0.01, size=len(idx))  # ~0.05% avg daily
+    daily_ret = rng.normal(loc=0.0005, scale=0.01, size=len(idx))
     equity = 100_000 * (1 + pd.Series(daily_ret, index=idx)).cumprod()
-
-    # Daily pnl ≈ equity change
     pnl_total = equity.diff().fillna(0.0)
 
-    # Split into realized/unrealized (arbitrary but stable)
     realized = pnl_total * 0.6 + rng.normal(0, 10, size=len(idx))
     unrealized = pnl_total - realized
     fees = np.clip(rng.normal(2.0, 1.0, size=len(idx)), 0.0, None)
@@ -149,26 +159,19 @@ def make_demo_pnl(portfolio_id=1, days=120, seed=7):
     })
     return df
 
-
 def make_demo_signals(ticker="AAPL", n=12, timeframe="1d", model="baseline", seed=11):
     rng = np.random.default_rng(seed)
     base_ts = datetime.now(timezone.utc).replace(hour=17, minute=0, second=0, microsecond=0)
-
     rows = []
     for i in range(n):
         ts = base_ts - timedelta(days=(n - i))
         side = "buy" if i % 2 == 0 else "sell"
         strength = float(rng.uniform(0.51, 0.85)) if side == "buy" else float(rng.uniform(0.15, 0.49))
         rows.append({
-            "ts": ts,
-            "ticker": ticker,
-            "timeframe": timeframe,
-            "model": model,
-            "side": side,
-            "strength": strength,
+            "ts": ts, "ticker": ticker, "timeframe": timeframe, "model": model,
+            "side": side, "strength": strength,
         })
     return pd.DataFrame(rows)
-
 
 def make_demo_orders(ticker="AAPL", n=6):
     base_ts = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -179,53 +182,39 @@ def make_demo_orders(ticker="AAPL", n=6):
         order_type = "limit" if i % 3 == 0 else "market"
         limit_price = 230 + (i * 0.75) if order_type == "limit" else None
         rows.append({
-            "ts": ts,
-            "ticker": ticker,
-            "side": side,
-            "qty": 10 + i,
-            "order_type": order_type,
-            "limit_price": limit_price,
+            "ts": ts, "ticker": ticker, "side": side, "qty": 10 + i,
+            "order_type": order_type, "limit_price": limit_price,
             "status": "filled" if i < n - 1 else "new",
             "filled_at": (ts + timedelta(minutes=5)) if i < n - 1 else None,
         })
     return pd.DataFrame(rows)
 
-
+# ---------------- Seeding workflow ----------------
 def seed_demo(engine):
-    """
-    Reset (truncate/delete) tables, then insert a fresh set of demo rows.
-    """
     with engine.begin() as conn:
         reset_tables(conn)
 
-        # Ensure symbols exist (optional)
-        symbols = pd.DataFrame([
+        # Symbols (robust to missing 'name' column)
+        demo_symbols = [
             {"ticker": "AAPL", "name": "Apple Inc."},
             {"ticker": "MSFT", "name": "Microsoft Corp."},
             {"ticker": "SPY",  "name": "SPDR S&P 500 ETF"},
-        ])
-        symbols.to_sql("symbols", conn, if_exists="append", index=False)
+        ]
+        upsert_symbols(conn, demo_symbols)
 
-        # Insert demo PnL, Signals, Orders
+        # PnL, Signals, Orders
         make_demo_pnl().to_sql("daily_pnl", conn, if_exists="append", index=False)
         make_demo_signals().to_sql("signals", conn, if_exists="append", index=False)
         make_demo_orders().to_sql("orders", conn, if_exists="append", index=False)
 
-
 def count_rows(engine):
     with engine.connect() as c:
-        q = lambda t: c.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
-        return {
-            "daily_pnl": q("daily_pnl"),
-            "signals": q("signals"),
-            "orders": q("orders"),
-            "symbols": q("symbols"),
-        }
+        def q(t): return c.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
+        return {"daily_pnl": q("daily_pnl"), "signals": q("signals"), "orders": q("orders"),
+                "symbols": q("symbols")}
 
-
-# ---------- UI actions ----------
+# ---------------- UI ----------------
 eng = get_engine()
-
 col1, col2 = st.columns(2)
 
 with col1:
@@ -248,7 +237,6 @@ with col2:
             st.exception(e)
 
 st.divider()
-
 with st.expander("Table row counts"):
     try:
         st.json(count_rows(eng))
