@@ -9,9 +9,8 @@ from etl.push_daily_pnl import (
     make_engine,
 )
 
-
 def _typed_select_all():
-    # Make the SELECT typed so SQLite returns a real Python date.
+    # Typed SELECT so SQLite returns real Python date objects
     return text("""
         SELECT portfolio_id, date, realized, unrealized, fees
         FROM daily_pnl
@@ -23,9 +22,7 @@ def _typed_select_all():
         fees=Float(),
     )
 
-
 def test_upsert_inserts_then_updates(engine):
-    # INSERT
     df1 = pd.DataFrame([{
         "portfolio_id": 1,
         "date": date(2025, 9, 9),
@@ -45,7 +42,6 @@ def test_upsert_inserts_then_updates(engine):
     assert row["unrealized"] == 5.0
     assert row["fees"] == 1.0
 
-    # UPSERT (update same row)
     df2 = pd.DataFrame([{
         "portfolio_id": 1,
         "date": date(2025, 9, 9),
@@ -65,7 +61,6 @@ def test_upsert_inserts_then_updates(engine):
     assert row["unrealized"] == 7.5
     assert row["fees"] == 2.0
 
-
 def test_upsert_multiple_rows(engine):
     df = pd.DataFrame([
         {"portfolio_id": 1, "date": date(2025, 9, 10), "realized": 1.0, "unrealized": 2.0, "fees": 0.1},
@@ -77,7 +72,6 @@ def test_upsert_multiple_rows(engine):
     with engine.connect() as conn:
         count = conn.execute(text("SELECT COUNT(*) FROM daily_pnl")).scalar_one()
         assert count == 2
-
 
 def test_build_daily_pnl_rows_env_overrides(monkeypatch):
     monkeypatch.setenv("PORTFOLIO_ID", "42")
@@ -95,7 +89,6 @@ def test_build_daily_pnl_rows_env_overrides(monkeypatch):
     assert row["realized"] == 123.45
     assert row["unrealized"] == -6.78
     assert row["fees"] == 0.99
-
 
 def test_make_engine_missing_env_exits(monkeypatch):
     for var in ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]:
