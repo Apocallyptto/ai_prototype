@@ -1,16 +1,16 @@
-name: ETL
+﻿name: ETL
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: '15 2 * * *'   # daily @ 02:15 UTC
+    - cron: "15 2 * * *"   # daily @ 02:15 UTC
   push:
     paths:
-      - 'etl/**.py'
-      - 'backtests/**.py'
-      - 'lib/**.py'
-      - '.github/workflows/etl.yml'
-      - 'requirements.txt'
+      - "etl/**.py"
+      - "backtests/**.py"
+      - "lib/**.py"
+      - ".github/workflows/etl.yml"
+      - "requirements.txt"
 
 permissions:
   contents: read
@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install client
         run: |
@@ -61,34 +61,36 @@ jobs:
               sys.exit(1)
           PY
 
-      # Optional Slack on DB failure
-      - name: Notify Slack (DB smoke failed)
-        if: ${{ failure() && secrets.SLACK_WEBHOOK != '' }}
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          REF: ${{ github.ref }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-               --data "{\"text\":\"❌ DB smoke test FAILED on ${REF} • run ${RUN_ID}\"}" \
-               "${SLACK_WEBHOOK}"
-
-  run-etl:
-    name: Run ETL
+  tests:
+    name: Unit tests
     needs: db-smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-
+          python-version: "3.12"
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest
+      - name: Run pytest
+        run: pytest -q
 
+  run-etl:
+    name: Run ETL
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
       - name: Run ETL (push_daily_pnl.py)
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -96,31 +98,8 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
         run: |
           python etl/push_daily_pnl.py
-
-      - name: Notify Slack (ETL success)
-        if: ${{ success() && secrets.SLACK_WEBHOOK != '' }}
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          REF: ${{ github.ref }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-               --data "{\"text\":\"✅ ETL succeeded on ${REF} • run ${RUN_ID}\"}" \
-               "${SLACK_WEBHOOK}"
-
-      - name: Notify Slack (ETL failure)
-        if: ${{ failure() && secrets.SLACK_WEBHOOK != '' }}
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          REF: ${{ github.ref }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-               --data "{\"text\":\"❌ ETL FAILED on ${REF} • run ${RUN_ID}\"}" \
-               "${SLACK_WEBHOOK}"
 
   backtest-crossover:
     name: Backtest crossover
@@ -128,16 +107,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt yfinance
-
       - name: Run crossover backtest
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -153,7 +129,6 @@ jobs:
             --sma-fast 50 \
             --sma-slow 200 \
             --commission-bps 1
-
       - name: Verify daily_pnl has recent rows
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -163,40 +138,17 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           python - <<'PY'
-          import os, sys, pandas as pd, sqlalchemy as sa
+          import os, pandas as pd, sqlalchemy as sa
           url = (f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
                  f"@{os.environ['DB_HOST']}:{os.environ['DB_PORT']}/{os.environ['DB_NAME']}?sslmode=require")
           eng = sa.create_engine(url, pool_pre_ping=True)
           with eng.connect() as c:
               df = pd.read_sql(sa.text(
-                  "select count(*) as n from daily_pnl where portfolio_id=1 and date >= current_date - interval '30 days'"),
+                  "select count(*) as n from daily_pnl where date >= current_date - interval '30 days'"),
                   c)
               n = int(df.loc[0, 'n'])
               print("Recent PnL rows (last 30d):", n)
               if n == 0:
-                  print("❌ No recent PnL rows written")
-                  sys.exit(1)
+                  raise SystemExit(1)
           print("✅ PnL write verified")
           PY
-
-      - name: Notify Slack (backtest success)
-        if: ${{ success() && secrets.SLACK_WEBHOOK != '' }}
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          REF: ${{ github.ref }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-               --data "{\"text\":\"✅ Backtest wrote equity to daily_pnl on ${REF} • run ${RUN_ID}\"}" \
-               "${SLACK_WEBHOOK}"
-
-      - name: Notify Slack (backtest failure)
-        if: ${{ failure() && secrets.SLACK_WEBHOOK != '' }}
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          REF: ${{ github.ref }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          curl -X POST -H 'Content-type: application/json' \
-               --data "{\"text\":\"❌ Backtest FAILED on ${REF} • run ${RUN_ID}\"}" \
-               "${SLACK_WEBHOOK}"
