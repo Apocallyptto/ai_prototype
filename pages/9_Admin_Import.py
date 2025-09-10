@@ -9,9 +9,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Admin / Import", page_icon="🛠️", layout="wide")
 st.title("🛠️ Admin / Import")
-st.caption("Create/Update tables, reset demo data, and seed examples.")
+st.caption("Create/Update tables, migrate schema if needed, and seed demo data.")
 
-# ---------------- DB helpers ----------------
+# ------------- DB helpers -------------
 def _require(value, name: str):
     if value in (None, "", "None"):
         st.error(f"Missing database setting: `{name}`")
@@ -26,7 +26,7 @@ def get_engine():
     db   = cfg.get("dbname") or cfg.get("name") or os.getenv("DB_NAME")
     user = cfg.get("user") or os.getenv("DB_USER")
     pw   = cfg.get("password") or os.getenv("DB_PASSWORD")
-    ssl  = cfg.get("sslmode") or os.getenv("DB_SSLMODE")  # e.g., "require" for Neon
+    ssl  = cfg.get("sslmode") or os.getenv("DB_SSLMODE")
 
     host = _require(host, "host")
     db   = _require(db, "dbname")
@@ -49,6 +49,15 @@ def get_engine():
     )
     return sa.create_engine(url, pool_pre_ping=True)
 
+def get_table_columns(conn, table: str) -> set[str]:
+    sql = sa.text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = :t
+    """)
+    return {r[0] for r in conn.execute(sql, {"t": table}).fetchall()}
+
+# ------------- Create / migrate schema -------------
 def create_or_update_tables(engine):
     ddl = """
     CREATE TABLE IF NOT EXISTS daily_pnl (
@@ -58,16 +67,6 @@ def create_or_update_tables(engine):
         unrealized DOUBLE PRECISION NOT NULL,
         fees DOUBLE PRECISION NOT NULL,
         PRIMARY KEY (portfolio_id, date)
-    );
-
-    CREATE TABLE IF NOT EXISTS signals (
-        id BIGSERIAL PRIMARY KEY,
-        ts TIMESTAMPTZ NOT NULL,
-        ticker TEXT NOT NULL,
-        timeframe TEXT NOT NULL,
-        model TEXT NOT NULL,
-        side TEXT NOT NULL,
-        strength DOUBLE PRECISION
     );
 
     CREATE TABLE IF NOT EXISTS orders (
@@ -82,19 +81,61 @@ def create_or_update_tables(engine):
         filled_at TIMESTAMPTZ
     );
 
-    -- Symbols may already exist without `name`; create minimally then add name if missing
+    -- Start minimal; we'll migrate/alter after creation as needed.
+    CREATE TABLE IF NOT EXISTS signals (
+        id BIGSERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS symbols (
         ticker TEXT PRIMARY KEY
     );
     """
     with engine.begin() as conn:
         conn.execute(sa.text(ddl))
-        # Add name column if it doesn't exist
+
+        # Ensure symbols.name exists (ignore if perms prevent alter)
         try:
             conn.execute(sa.text("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS name TEXT;"))
         except Exception:
-            # Some managed DBs might block ALTER; that's okay — seeding will adapt.
             pass
+
+        # MIGRATE signals schema from old (symbol/signal) to new (ticker/side/timeframe/model/strength)
+        migrate_signals_schema(conn)
+
+def migrate_signals_schema(conn):
+    cols = get_table_columns(conn, "signals")
+
+    # If old names exist, try to rename them.
+    if "ticker" not in cols and "symbol" in cols:
+        try:
+            conn.execute(sa.text('ALTER TABLE signals RENAME COLUMN symbol TO ticker;'))
+        except Exception:
+            pass
+        cols = get_table_columns(conn, "signals")
+
+    if "side" not in cols and "signal" in cols:
+        try:
+            conn.execute(sa.text('ALTER TABLE signals RENAME COLUMN signal TO side;'))
+        except Exception:
+            pass
+        cols = get_table_columns(conn, "signals")
+
+    # Ensure required columns exist
+    needed = {
+        "ticker": "TEXT",
+        "timeframe": "TEXT",
+        "model": "TEXT",
+        "side": "TEXT",
+        "strength": "DOUBLE PRECISION",
+    }
+    for name, typ in needed.items():
+        if name not in cols:
+            try:
+                conn.execute(sa.text(f"ALTER TABLE signals ADD COLUMN {name} {typ};"))
+            except Exception:
+                # If ALTER fails due to perms, we'll still be able to seed by adapting columns below.
+                pass
 
 def reset_tables(conn):
     try:
@@ -104,25 +145,10 @@ def reset_tables(conn):
         conn.execute(sa.text("DELETE FROM signals;"))
         conn.execute(sa.text("DELETE FROM daily_pnl;"))
 
-def table_has_column(conn, table: str, column: str) -> bool:
-    sql = sa.text("""
-        SELECT EXISTS (
-          SELECT 1
-          FROM information_schema.columns
-          WHERE table_schema = 'public'
-            AND table_name = :t
-            AND column_name = :c
-        )
-    """)
-    return bool(conn.execute(sql, {"t": table, "c": column}).scalar_one())
-
 def upsert_symbols(conn, rows):
-    """
-    Insert demo symbols. If `name` column is present, upsert (update name on conflict).
-    If not present, insert only ticker and ignore conflicts.
-    """
-    has_name = table_has_column(conn, "symbols", "name")
-    if has_name:
+    # Insert/update demo symbols; work even if 'name' column is missing.
+    cols = get_table_columns(conn, "symbols")
+    if "name" in cols:
         stmt = sa.text("""
             INSERT INTO symbols (ticker, name)
             VALUES (:ticker, :name)
@@ -137,12 +163,12 @@ def upsert_symbols(conn, rows):
         """)
         conn.execute(stmt, [{"ticker": r["ticker"]} for r in rows])
 
-# ---------------- Demo data builders ----------------
+# ------------- Demo data -------------
 def make_demo_pnl(portfolio_id=1, days=120, seed=7):
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range(end=pd.Timestamp.utcnow().date(), periods=days)
 
-    daily_ret = rng.normal(loc=0.0005, scale=0.01, size=len(idx))
+    daily_ret = rng.normal(0.0005, 0.01, size=len(idx))
     equity = 100_000 * (1 + pd.Series(daily_ret, index=idx)).cumprod()
     pnl_total = equity.diff().fillna(0.0)
 
@@ -150,14 +176,13 @@ def make_demo_pnl(portfolio_id=1, days=120, seed=7):
     unrealized = pnl_total - realized
     fees = np.clip(rng.normal(2.0, 1.0, size=len(idx)), 0.0, None)
 
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "portfolio_id": portfolio_id,
         "date": idx.date,
         "realized": realized.round(2),
         "unrealized": unrealized.round(2),
         "fees": fees.round(2),
     })
-    return df
 
 def make_demo_signals(ticker="AAPL", n=12, timeframe="1d", model="baseline", seed=11):
     rng = np.random.default_rng(seed)
@@ -167,10 +192,8 @@ def make_demo_signals(ticker="AAPL", n=12, timeframe="1d", model="baseline", see
         ts = base_ts - timedelta(days=(n - i))
         side = "buy" if i % 2 == 0 else "sell"
         strength = float(rng.uniform(0.51, 0.85)) if side == "buy" else float(rng.uniform(0.15, 0.49))
-        rows.append({
-            "ts": ts, "ticker": ticker, "timeframe": timeframe, "model": model,
-            "side": side, "strength": strength,
-        })
+        rows.append({"ts": ts, "ticker": ticker, "timeframe": timeframe, "model": model,
+                     "side": side, "strength": strength})
     return pd.DataFrame(rows)
 
 def make_demo_orders(ticker="AAPL", n=6):
@@ -189,12 +212,15 @@ def make_demo_orders(ticker="AAPL", n=6):
         })
     return pd.DataFrame(rows)
 
-# ---------------- Seeding workflow ----------------
+# ------------- Seeding workflow -------------
 def seed_demo(engine):
     with engine.begin() as conn:
+        # Make sure current DB has the expected columns or compatible ones
+        migrate_signals_schema(conn)
+
         reset_tables(conn)
 
-        # Symbols (robust to missing 'name' column)
+        # Symbols (robust if 'name' missing)
         demo_symbols = [
             {"ticker": "AAPL", "name": "Apple Inc."},
             {"ticker": "MSFT", "name": "Microsoft Corp."},
@@ -202,31 +228,52 @@ def seed_demo(engine):
         ]
         upsert_symbols(conn, demo_symbols)
 
-        # PnL, Signals, Orders
+        # PnL
         make_demo_pnl().to_sql("daily_pnl", conn, if_exists="append", index=False)
-        make_demo_signals().to_sql("signals", conn, if_exists="append", index=False)
+
+        # Signals — adapt to whatever columns exist
+        sig_df = make_demo_signals()
+        sig_cols = get_table_columns(conn, "signals")
+
+        # Map old names if needed
+        df = sig_df.copy()
+        if "ticker" not in sig_cols and "symbol" in sig_cols:
+            df = df.rename(columns={"ticker": "symbol"})
+        if "side" not in sig_cols and "signal" in sig_cols:
+            df = df.rename(columns={"side": "signal"})
+
+        # Keep only columns that exist in the table
+        keep = [c for c in df.columns if c in sig_cols]
+        # Always keep ts if present
+        if "ts" in sig_cols and "ts" not in keep:
+            keep = ["ts"] + keep
+        df = df[keep]
+
+        df.to_sql("signals", conn, if_exists="append", index=False)
+
+        # Orders (expects ticker/side/qty etc.; table was created accordingly)
         make_demo_orders().to_sql("orders", conn, if_exists="append", index=False)
 
 def count_rows(engine):
     with engine.connect() as c:
         def q(t): return c.execute(sa.text(f"SELECT COUNT(*) FROM {t}")).scalar_one()
-        return {"daily_pnl": q("daily_pnl"), "signals": q("signals"), "orders": q("orders"),
-                "symbols": q("symbols")}
+        return {"symbols": q("symbols"), "signals": q("signals"),
+                "orders": q("orders"), "daily_pnl": q("daily_pnl")}
 
-# ---------------- UI ----------------
+# ------------- UI -------------
 eng = get_engine()
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col1:
+with c1:
     if st.button("Create/Update Tables", type="primary", use_container_width=True):
         try:
             create_or_update_tables(eng)
-            st.success("Tables created/verified ✅")
+            st.success("Tables created / verified ✅")
             st.json(count_rows(eng))
         except Exception as e:
             st.exception(e)
 
-with col2:
+with c2:
     if st.button("Seed Demo Data", type="secondary", use_container_width=True):
         try:
             create_or_update_tables(eng)
