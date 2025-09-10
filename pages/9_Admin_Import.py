@@ -79,19 +79,14 @@ def create_or_update_tables(engine):
 
     CREATE TABLE IF NOT EXISTS orders (
         id BIGSERIAL PRIMARY KEY,
-        ts TIMESTAMPTZ NOT NULL DEFAULT now(),
-        ticker TEXT NOT NULL,
-        side TEXT NOT NULL,
-        qty DOUBLE PRECISION NOT NULL,
-        order_type TEXT,
-        limit_price DOUBLE PRECISION,
-        status TEXT NOT NULL DEFAULT 'new',
-        filled_at TIMESTAMPTZ
+        ts TIMESTAMPTZ NOT NULL DEFAULT now()
+        -- other columns added or migrated below
     );
 
     CREATE TABLE IF NOT EXISTS signals (
         id BIGSERIAL PRIMARY KEY,
         ts TIMESTAMPTZ NOT NULL
+        -- other columns added or migrated below
     );
 
     CREATE TABLE IF NOT EXISTS symbols (
@@ -100,19 +95,77 @@ def create_or_update_tables(engine):
     """
     with engine.begin() as conn:
         conn.execute(sa.text(ddl))
-
-        # Ensure symbols.name exists (ignore lack of perms)
+        # Ensure symbols.name exists (ignore if no perms)
         try:
             conn.execute(sa.text("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS name TEXT;"))
         except Exception:
             pass
-
+        migrate_orders_schema(conn)
         migrate_signals_schema(conn)
+
+def migrate_orders_schema(conn):
+    cols = get_table_columns(conn, "orders")
+    # Legacy rename: symbol -> ticker
+    if "ticker" not in cols and "symbol" in cols:
+        try:
+            conn.execute(sa.text('ALTER TABLE orders RENAME COLUMN symbol TO ticker;'))
+        except Exception:
+            pass
+        cols = get_table_columns(conn, "orders")
+
+    # Ensure required columns exist
+    needed = {
+        "ts": "TIMESTAMPTZ",
+        "ticker": "TEXT",
+        "side": "TEXT",
+        "qty": "DOUBLE PRECISION",
+        "order_type": "TEXT",
+        "limit_price": "DOUBLE PRECISION",
+        "status": "TEXT",
+        "filled_at": "TIMESTAMPTZ",
+    }
+    for name, typ in needed.items():
+        if name not in cols:
+            try:
+                conn.execute(sa.text(f"ALTER TABLE orders ADD COLUMN {name} {typ};"))
+            except Exception:
+                pass
+
+    # Normalize types (JSON/JSONB/text, numeric)
+    types = get_column_types(conn, "orders")
+    for name in ("ticker", "side", "order_type", "status"):
+        t = types.get(name)
+        if t in ("json", "jsonb"):
+            try:
+                conn.execute(sa.text(
+                    f"ALTER TABLE orders ALTER COLUMN {name} TYPE TEXT "
+                    f"USING trim(both '\"' from {name}::text)"
+                ))
+            except Exception:
+                pass
+
+    # Cast qty/limit_price to double precision if odd types
+    types = get_column_types(conn, "orders")
+    if types.get("qty") not in ("double precision", "numeric", "real", "integer", "bigint", "smallint"):
+        try:
+            conn.execute(sa.text(
+                "ALTER TABLE orders ALTER COLUMN qty TYPE DOUBLE PRECISION USING qty::double precision"
+            ))
+        except Exception:
+            pass
+    types = get_column_types(conn, "orders")
+    if "limit_price" in types and types.get("limit_price") not in ("double precision", "numeric", "real", "integer", "bigint", "smallint"):
+        try:
+            conn.execute(sa.text(
+                "ALTER TABLE orders ALTER COLUMN limit_price TYPE DOUBLE PRECISION USING limit_price::double precision"
+            ))
+        except Exception:
+            pass
 
 def migrate_signals_schema(conn):
     cols = get_table_columns(conn, "signals")
 
-    # Rename legacy columns if present
+    # Legacy renames
     if "ticker" not in cols and "symbol" in cols:
         try:
             conn.execute(sa.text('ALTER TABLE signals RENAME COLUMN symbol TO ticker;'))
@@ -142,22 +195,20 @@ def migrate_signals_schema(conn):
             except Exception:
                 pass
 
-    # If any of these ended up as JSON/JSONB previously, convert to TEXT
+    # Convert JSON-ish columns to TEXT
     types = get_column_types(conn, "signals")
     for name in ("ticker", "timeframe", "model", "side"):
         t = types.get(name)
         if t in ("json", "jsonb"):
             try:
-                # Strip surrounding quotes from existing JSON strings as we convert
                 conn.execute(sa.text(
                     f"ALTER TABLE signals ALTER COLUMN {name} TYPE TEXT "
                     f"USING trim(both '\"' from {name}::text)"
                 ))
             except Exception:
-                # ignore; we'll handle fallback during insert
                 pass
 
-    # Strength should be numeric
+    # Strength numeric
     t = get_column_types(conn, "signals").get("strength")
     if t not in (None, "double precision", "numeric", "real", "integer", "bigint", "smallint"):
         try:
@@ -241,6 +292,7 @@ def make_demo_orders(ticker="AAPL", n=6):
 # ---------- Seeding workflow ----------
 def seed_demo(engine):
     with engine.begin() as conn:
+        migrate_orders_schema(conn)
         migrate_signals_schema(conn)
         reset_tables(conn)
 
@@ -255,32 +307,44 @@ def seed_demo(engine):
         # PnL
         make_demo_pnl().to_sql("daily_pnl", conn, if_exists="append", index=False)
 
-        # Signals — adapt to actual types/columns
-        target_cols = get_table_columns(conn, "signals")
-        target_types = get_column_types(conn, "signals")
+        # Signals — adapt to actual columns/types
+        sig_cols = get_table_columns(conn, "signals")
+        sig_types = get_column_types(conn, "signals")
+        df_sig = make_demo_signals()
 
-        df = make_demo_signals()
+        if "ticker" not in sig_cols and "symbol" in sig_cols:
+            df_sig = df_sig.rename(columns={"ticker": "symbol"})
+        if "side" not in sig_cols and "signal" in sig_cols:
+            df_sig = df_sig.rename(columns={"side": "signal"})
 
-        # Map to legacy names if ALTER wasn’t possible
-        if "ticker" not in target_cols and "symbol" in target_cols:
-            df = df.rename(columns={"ticker": "symbol"})
-        if "side" not in target_cols and "signal" in target_cols:
-            df = df.rename(columns={"side": "signal"})
-
-        # Fallback for JSON-typed columns: quote simple strings so they are valid JSON
         for col in ("ticker", "timeframe", "model", "side"):
-            if col in target_cols and target_types.get(col) in ("json", "jsonb"):
-                df[col] = df[col].map(lambda x: f"\"{x}\"" if x is not None and not str(x).startswith('"') else x)
+            if col in sig_cols and sig_types.get(col) in ("json", "jsonb"):
+                df_sig[col] = df_sig[col].map(lambda x: f"\"{x}\"" if x is not None and not str(x).startswith('"') else x)
 
-        keep = [c for c in df.columns if c in target_cols]
-        if "ts" in target_cols and "ts" not in keep:
+        keep = [c for c in df_sig.columns if c in sig_cols]
+        if "ts" in sig_cols and "ts" not in keep:
             keep = ["ts"] + keep
-        df = df[keep]
+        df_sig = df_sig[keep]
+        df_sig.to_sql("signals", conn, if_exists="append", index=False)
 
-        df.to_sql("signals", conn, if_exists="append", index=False)
+        # Orders — adapt to actual columns/types
+        ord_cols = get_table_columns(conn, "orders")
+        ord_types = get_column_types(conn, "orders")
+        df_ord = make_demo_orders()
 
-        # Orders
-        make_demo_orders().to_sql("orders", conn, if_exists="append", index=False)
+        if "ticker" not in ord_cols and "symbol" in ord_cols:
+            df_ord = df_ord.rename(columns={"ticker": "symbol"})
+
+        # Fallback for JSON-ish text columns
+        for col in ("ticker", "side", "order_type", "status"):
+            if col in ord_cols and ord_types.get(col) in ("json", "jsonb"):
+                df_ord[col] = df_ord[col].map(lambda x: f"\"{x}\"" if x is not None and not str(x).startswith('"') else x)
+
+        keep = [c for c in df_ord.columns if c in ord_cols]
+        if "ts" in ord_cols and "ts" not in keep:
+            keep = ["ts"] + keep
+        df_ord = df_ord[keep]
+        df_ord.to_sql("orders", conn, if_exists="append", index=False)
 
 def count_rows(engine):
     with engine.connect() as c:
