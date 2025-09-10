@@ -1,28 +1,51 @@
 # pages/6_Dashboard.py
 import os
-import pandas as pd
-import streamlit as st
-import sqlalchemy as sa
 from datetime import date, timedelta
+
+import pandas as pd
+import sqlalchemy as sa
+import streamlit as st
 
 st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
 st.title("📊 Dashboard")
 
+def _require(value, name: str):
+    if value in (None, "", "None"):
+        st.error(f"Missing database setting: `{name}`")
+        st.stop()
+    return value
+
 @st.cache_resource(show_spinner=False)
 def get_engine():
-    # Prefer Streamlit secrets, fallback to env vars
-    if "DB_HOST" in st.secrets:
-        host = st.secrets["DB_HOST"]; port = st.secrets["DB_PORT"]
-        name = st.secrets["DB_NAME"]; user = st.secrets["DB_USER"]; pw = st.secrets["DB_PASSWORD"]
-        ssl = st.secrets.get("DB_SSLMODE", "require")
-    else:
-        host = os.getenv("DB_HOST"); port = os.getenv("DB_PORT")
-        name = os.getenv("DB_NAME"); user = os.getenv("DB_USER"); pw = os.getenv("DB_PASSWORD")
-        ssl = os.getenv("DB_SSLMODE", "prefer")
+    # Prefer .streamlit/secrets.toml -> [db] section; fall back to env vars.
+    cfg = st.secrets.get("db", {})
 
-    url = f"postgresql+psycopg2://{user}:{pw}@{host}:{port}/{name}"
-    if ssl:
-        url += f"?sslmode={ssl}"
+    host = cfg.get("host") or os.getenv("DB_HOST")
+    port = cfg.get("port") or os.getenv("DB_PORT", 5432)
+    db   = cfg.get("dbname") or cfg.get("name") or os.getenv("DB_NAME")
+    user = cfg.get("user") or os.getenv("DB_USER")
+    pw   = cfg.get("password") or os.getenv("DB_PASSWORD")
+    ssl  = cfg.get("sslmode") or os.getenv("DB_SSLMODE")  # e.g. "require" for Neon
+
+    host = _require(host, "host")
+    db   = _require(db, "dbname")
+    user = _require(user, "user")
+    pw   = _require(pw, "password")
+    try:
+        port = int(port)
+    except Exception:
+        st.error(f"DB `port` must be an integer, got: {port!r}")
+        st.stop()
+
+    url = sa.engine.URL.create(
+        drivername="postgresql+psycopg2",
+        username=user,
+        password=pw,
+        host=host,
+        port=port,
+        database=db,
+        query={"sslmode": ssl} if ssl else None,
+    )
     return sa.create_engine(url, pool_pre_ping=True)
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -31,30 +54,36 @@ def load_kpis(days=30, portfolio_id=1):
     with eng.connect() as c:
         pnl = pd.read_sql(
             sa.text("""
-              select date, realized, unrealized, fees,
-                     (realized + unrealized - fees) as total
-              from daily_pnl
-              where portfolio_id = :pid and date >= current_date - interval :days
-              order by date
+                SELECT
+                    date, realized, unrealized, fees,
+                    (realized + unrealized - fees) AS total
+                FROM daily_pnl
+                WHERE portfolio_id = :pid
+                  AND date >= current_date - (:days || ' days')::interval
+                ORDER BY date
             """),
             c,
-            params={"pid": portfolio_id, "days": f"{int(days)} days"},
+            params={"pid": int(portfolio_id), "days": int(days)},
         )
+
         orders = pd.read_sql(
             sa.text("""
-              select id, ts, symbol, side, qty, price, status, filled_at
-              from orders
-              order by ts desc
-              limit 100
-            """), c
+                SELECT id, ts, symbol, side, qty, price, status, filled_at
+                FROM orders
+                ORDER BY ts DESC
+                LIMIT 100
+            """),
+            c
         )
+
         signals = pd.read_sql(
             sa.text("""
-              select ts, symbol, signal, strength
-              from signals
-              order by ts desc
-              limit 100
-            """), c
+                SELECT ts, symbol, signal, strength
+                FROM signals
+                ORDER BY ts DESC
+                LIMIT 100
+            """),
+            c
         )
     return pnl, orders, signals
 
@@ -65,7 +94,7 @@ with left:
 
 pnl, orders, signals = load_kpis(days=lookback, portfolio_id=pid)
 
-# Top KPIs
+# KPIs
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 if not pnl.empty:
     total_pnl = float(pnl["total"].sum())
