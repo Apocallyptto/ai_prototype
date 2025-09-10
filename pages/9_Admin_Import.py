@@ -11,7 +11,7 @@ st.set_page_config(page_title="Admin / Import", page_icon="🛠️", layout="wid
 st.title("🛠️ Admin / Import")
 st.caption("Create/Update tables, migrate schema if needed, and seed demo data.")
 
-# ------------- DB helpers -------------
+# ---------- DB helpers ----------
 def _require(value, name: str):
     if value in (None, "", "None"):
         st.error(f"Missing database setting: `{name}`")
@@ -50,14 +50,22 @@ def get_engine():
     return sa.create_engine(url, pool_pre_ping=True)
 
 def get_table_columns(conn, table: str) -> set[str]:
-    sql = sa.text("""
+    rows = conn.execute(sa.text("""
         SELECT column_name
         FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = :t
-    """)
-    return {r[0] for r in conn.execute(sql, {"t": table}).fetchall()}
+        WHERE table_schema='public' AND table_name=:t
+    """), {"t": table}).fetchall()
+    return {r[0] for r in rows}
 
-# ------------- Create / migrate schema -------------
+def get_column_types(conn, table: str) -> dict:
+    rows = conn.execute(sa.text("""
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=:t
+    """), {"t": table}).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+# ---------- Create / migrate schema ----------
 def create_or_update_tables(engine):
     ddl = """
     CREATE TABLE IF NOT EXISTS daily_pnl (
@@ -81,7 +89,6 @@ def create_or_update_tables(engine):
         filled_at TIMESTAMPTZ
     );
 
-    -- Start minimal; we'll migrate/alter after creation as needed.
     CREATE TABLE IF NOT EXISTS signals (
         id BIGSERIAL PRIMARY KEY,
         ts TIMESTAMPTZ NOT NULL
@@ -94,19 +101,18 @@ def create_or_update_tables(engine):
     with engine.begin() as conn:
         conn.execute(sa.text(ddl))
 
-        # Ensure symbols.name exists (ignore if perms prevent alter)
+        # Ensure symbols.name exists (ignore lack of perms)
         try:
             conn.execute(sa.text("ALTER TABLE symbols ADD COLUMN IF NOT EXISTS name TEXT;"))
         except Exception:
             pass
 
-        # MIGRATE signals schema from old (symbol/signal) to new (ticker/side/timeframe/model/strength)
         migrate_signals_schema(conn)
 
 def migrate_signals_schema(conn):
     cols = get_table_columns(conn, "signals")
 
-    # If old names exist, try to rename them.
+    # Rename legacy columns if present
     if "ticker" not in cols and "symbol" in cols:
         try:
             conn.execute(sa.text('ALTER TABLE signals RENAME COLUMN symbol TO ticker;'))
@@ -134,8 +140,32 @@ def migrate_signals_schema(conn):
             try:
                 conn.execute(sa.text(f"ALTER TABLE signals ADD COLUMN {name} {typ};"))
             except Exception:
-                # If ALTER fails due to perms, we'll still be able to seed by adapting columns below.
                 pass
+
+    # If any of these ended up as JSON/JSONB previously, convert to TEXT
+    types = get_column_types(conn, "signals")
+    for name in ("ticker", "timeframe", "model", "side"):
+        t = types.get(name)
+        if t in ("json", "jsonb"):
+            try:
+                # Strip surrounding quotes from existing JSON strings as we convert
+                conn.execute(sa.text(
+                    f"ALTER TABLE signals ALTER COLUMN {name} TYPE TEXT "
+                    f"USING trim(both '\"' from {name}::text)"
+                ))
+            except Exception:
+                # ignore; we'll handle fallback during insert
+                pass
+
+    # Strength should be numeric
+    t = get_column_types(conn, "signals").get("strength")
+    if t not in (None, "double precision", "numeric", "real", "integer", "bigint", "smallint"):
+        try:
+            conn.execute(sa.text(
+                "ALTER TABLE signals ALTER COLUMN strength TYPE DOUBLE PRECISION USING strength::double precision"
+            ))
+        except Exception:
+            pass
 
 def reset_tables(conn):
     try:
@@ -146,24 +176,20 @@ def reset_tables(conn):
         conn.execute(sa.text("DELETE FROM daily_pnl;"))
 
 def upsert_symbols(conn, rows):
-    # Insert/update demo symbols; work even if 'name' column is missing.
     cols = get_table_columns(conn, "symbols")
     if "name" in cols:
-        stmt = sa.text("""
+        conn.execute(sa.text("""
             INSERT INTO symbols (ticker, name)
             VALUES (:ticker, :name)
             ON CONFLICT (ticker) DO UPDATE SET name = EXCLUDED.name;
-        """)
-        conn.execute(stmt, rows)
+        """), rows)
     else:
-        stmt = sa.text("""
-            INSERT INTO symbols (ticker)
-            VALUES (:ticker)
+        conn.execute(sa.text("""
+            INSERT INTO symbols (ticker) VALUES (:ticker)
             ON CONFLICT (ticker) DO NOTHING;
-        """)
-        conn.execute(stmt, [{"ticker": r["ticker"]} for r in rows])
+        """), [{"ticker": r["ticker"]} for r in rows])
 
-# ------------- Demo data -------------
+# ---------- Demo data ----------
 def make_demo_pnl(portfolio_id=1, days=120, seed=7):
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range(end=pd.Timestamp.utcnow().date(), periods=days)
@@ -212,15 +238,13 @@ def make_demo_orders(ticker="AAPL", n=6):
         })
     return pd.DataFrame(rows)
 
-# ------------- Seeding workflow -------------
+# ---------- Seeding workflow ----------
 def seed_demo(engine):
     with engine.begin() as conn:
-        # Make sure current DB has the expected columns or compatible ones
         migrate_signals_schema(conn)
-
         reset_tables(conn)
 
-        # Symbols (robust if 'name' missing)
+        # Symbols
         demo_symbols = [
             {"ticker": "AAPL", "name": "Apple Inc."},
             {"ticker": "MSFT", "name": "Microsoft Corp."},
@@ -231,27 +255,31 @@ def seed_demo(engine):
         # PnL
         make_demo_pnl().to_sql("daily_pnl", conn, if_exists="append", index=False)
 
-        # Signals — adapt to whatever columns exist
-        sig_df = make_demo_signals()
-        sig_cols = get_table_columns(conn, "signals")
+        # Signals — adapt to actual types/columns
+        target_cols = get_table_columns(conn, "signals")
+        target_types = get_column_types(conn, "signals")
 
-        # Map old names if needed
-        df = sig_df.copy()
-        if "ticker" not in sig_cols and "symbol" in sig_cols:
+        df = make_demo_signals()
+
+        # Map to legacy names if ALTER wasn’t possible
+        if "ticker" not in target_cols and "symbol" in target_cols:
             df = df.rename(columns={"ticker": "symbol"})
-        if "side" not in sig_cols and "signal" in sig_cols:
+        if "side" not in target_cols and "signal" in target_cols:
             df = df.rename(columns={"side": "signal"})
 
-        # Keep only columns that exist in the table
-        keep = [c for c in df.columns if c in sig_cols]
-        # Always keep ts if present
-        if "ts" in sig_cols and "ts" not in keep:
+        # Fallback for JSON-typed columns: quote simple strings so they are valid JSON
+        for col in ("ticker", "timeframe", "model", "side"):
+            if col in target_cols and target_types.get(col) in ("json", "jsonb"):
+                df[col] = df[col].map(lambda x: f"\"{x}\"" if x is not None and not str(x).startswith('"') else x)
+
+        keep = [c for c in df.columns if c in target_cols]
+        if "ts" in target_cols and "ts" not in keep:
             keep = ["ts"] + keep
         df = df[keep]
 
         df.to_sql("signals", conn, if_exists="append", index=False)
 
-        # Orders (expects ticker/side/qty etc.; table was created accordingly)
+        # Orders
         make_demo_orders().to_sql("orders", conn, if_exists="append", index=False)
 
 def count_rows(engine):
@@ -260,7 +288,7 @@ def count_rows(engine):
         return {"symbols": q("symbols"), "signals": q("signals"),
                 "orders": q("orders"), "daily_pnl": q("daily_pnl")}
 
-# ------------- UI -------------
+# ---------- UI ----------
 eng = get_engine()
 c1, c2 = st.columns(2)
 
