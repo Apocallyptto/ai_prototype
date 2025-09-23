@@ -1,47 +1,87 @@
 # jobs/make_signals.py
-from __future__ import annotations
-import os, json
+import os
+import pandas as pd
+import numpy as np
 import sqlalchemy as sa
 from datetime import datetime, timezone
-from strategies.ma_cross import ma_cross_signal
+from sklearn.linear_model import LogisticRegression
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, SMAIndicator
 
-DB_URL = (
-    f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
-    f"@{os.environ['DB_HOST']}:{os.environ.get('DB_PORT','5432')}/{os.environ['DB_NAME']}"
-    f"?sslmode=require&channel_binding=require"
-)
-ENGINE = sa.create_engine(DB_URL, pool_pre_ping=True)
+from lib.db import make_engine  # you already have DB helpers
 
-MODEL = "ma_cross_v1"
+TICKERS = os.getenv("SIGNAL_TICKERS", "AAPL,MSFT,SPY").split(",")
 TIMEFRAME = "1d"
+MODEL_NAME = "lr_v1"
+PORTFOLIO_ID = int(os.getenv("PORTFOLIO_ID", "1"))
 
-def main():
-    with ENGINE.begin() as conn:
-        # get tickers
-        syms = conn.execute(sa.text("select id, ticker from symbols order by ticker")).fetchall()
-        if not syms:
-            print("No symbols found. Insert into symbols table first.")
-            return
+def _get_bars(ticker: str) -> pd.DataFrame:
+    # use yfinance for demo; you can swap in Alpaca data
+    import yfinance as yf
+    df = yf.download(ticker, period="1y", interval="1d", auto_adjust=False, progress=False)
+    df = df.rename(columns={"Open":"o","High":"h","Low":"l","Close":"c","Volume":"v"})
+    df.index.name = "ts"
+    df = df.reset_index()
+    df["ticker"] = ticker
+    return df
 
-        ins = sa.text("""
-            insert into signals(symbol_id, ts, timeframe, model, signal)
-            values (:sid, :ts, :tf, :model, :payload::jsonb)
-        """)
+def _build_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["sma_fast"] = SMAIndicator(df["c"], window=10).sma_indicator()
+    df["sma_slow"] = SMAIndicator(df["c"], window=30).sma_indicator()
+    df["rsi"] = RSIIndicator(df["c"], window=14).rsi()
+    macd = MACD(df["c"])
+    df["macd"] = macd.macd()
+    df["macd_sig"] = macd.macd_signal()
+    df["ret_1d"] = df["c"].pct_change()
+    df = df.dropna().reset_index(drop=True)
+    return df
 
-        made = 0
-        for sid, ticker in syms:
-            sig = ma_cross_signal(ticker)
-            if not sig:
-                continue
-            conn.execute(ins, {
-                "sid": sid,
-                "ts": datetime.now(timezone.utc),
-                "tf": TIMEFRAME,
-                "model": MODEL,
-                "payload": json.dumps(sig),
-            })
-            made += 1
-        print(f"Inserted {made} signals.")
+def _train_quick_model(df: pd.DataFrame):
+    # label: next-day up/down
+    y = (df["c"].shift(-1) > df["c"]).astype(int)[:-1]
+    X = df[["sma_fast","sma_slow","rsi","macd","macd_sig","ret_1d"]][:-1]
+    if len(X) < 50:
+        return None
+    m = LogisticRegression(max_iter=1000)
+    m.fit(X, y)
+    return m
+
+def _predict_latest(m, df: pd.DataFrame):
+    row = df.iloc[[-1]][["sma_fast","sma_slow","rsi","macd","macd_sig","ret_1d"]]
+    proba_up = float(m.predict_proba(row)[0,1])
+    side = "buy" if proba_up >= 0.55 else ("sell" if proba_up <= 0.45 else "hold")
+    strength = abs(proba_up - 0.5) * 2  # 0..1
+    return side, strength, proba_up
+
+def run():
+    eng = make_engine()
+    rows = []
+    now = datetime.now(timezone.utc)
+    for t in TICKERS:
+        bars = _get_bars(t)
+        feat = _build_features(bars)
+        model = _train_quick_model(feat)
+        if model is None:
+            continue
+        side, strength, _ = _predict_latest(model, feat)
+        if side == "hold":
+            continue
+        rows.append({
+            "ts": now,
+            "ticker": t,
+            "timeframe": TIMEFRAME,
+            "model": MODEL_NAME,
+            "side": side,
+            "strength": round(float(strength), 4),
+        })
+    if not rows:
+        return 0
+    df = pd.DataFrame(rows)
+    with eng.begin() as c:
+        df.to_sql("signals", c, if_exists="append", index=False)
+    return len(rows)
 
 if __name__ == "__main__":
-    main()
+    n = run()
+    print(f"wrote {n} signals")
