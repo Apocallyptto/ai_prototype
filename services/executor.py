@@ -1,65 +1,114 @@
-import os, math, pandas as pd
-from datetime import datetime, timezone
-from sqlalchemy import create_engine, text
+# services/executor.py
+import os
+import math
+import pandas as pd
+import sqlalchemy as sa
+from datetime import datetime, timezone, timedelta
+from alpaca_trade_api import REST
+from lib.db import make_engine
 
-def eng():
-    url = (f"postgresql+psycopg2://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
-           f"@{os.environ['DB_HOST']}:{os.environ.get('DB_PORT','5432')}/{os.environ['DB_NAME']}"
-           "?sslmode=require&channel_binding=require")
-    return create_engine(url, pool_pre_ping=True)
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% of equity
+MAX_POS_PCT = float(os.getenv("MAX_POS_PCT", "0.20"))        # 20% per name
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-0.03"))  # -3%
+PORTFOLIO_ID = int(os.getenv("PORTFOLIO_ID", "1"))
+MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.2"))
 
-def fetch_new_signals(e):
-    q = text("""
-      SELECT s.id, sy.ticker, s.ts, s.signal
-      FROM signals s
-      JOIN symbols sy ON sy.id = s.symbol_id
-      WHERE s.ts >= now() - interval '2 days'
-      ORDER BY s.ts DESC
-    """)
-    with e.connect() as c:
-        return pd.read_sql(q, c)
+def _alpaca():
+    return REST(
+        key_id=os.environ["ALPACA_API_KEY"],
+        secret_key=os.environ["ALPACA_API_SECRET"],
+        base_url=os.environ.get("ALPACA_BASE_URL","https://paper-api.alpaca.markets"),
+    )
 
-def decide_qty(equity, price, risk_frac=0.05):
-    notional = equity * risk_frac
-    return max(0, math.floor(notional / max(price, 1e-6)))
+def _equity(api: REST) -> float:
+    a = api.get_account()
+    return float(a.equity)
 
-def last_equity(e):
-    q = text("""SELECT (realized+unrealized-fees) AS eq
-                FROM daily_pnl WHERE portfolio_id=1
-                ORDER BY date DESC LIMIT 1""")
-    with e.connect() as c:
-        row = c.execute(q).fetchone()
-    return float(row[0]) if row else 100_000.0
+def _price(api: REST, ticker: str) -> float:
+    q = api.get_latest_quote(ticker)
+    px = float(q.ap) if q.ap and q.ap > 0 else float(q.bp)
+    return px
 
-def place_order(e, ticker, side, qty, price, meta):
-    ins = text("""
-      INSERT INTO orders(ts, symbol_id, side, qty, type, limit_price, status, meta)
-      SELECT now(), id, :side, :qty, 'market', NULL, 'new', :meta::jsonb
-      FROM symbols WHERE ticker=:t
-      RETURNING id
-    """)
-    with e.begin() as c:
-        oid = c.execute(ins, {"t": ticker, "side": side, "qty": qty, "meta": meta}).scalar()
-    return oid
+def _get_open_positions(api: REST) -> dict:
+    pos = {}
+    for p in api.list_positions():
+        pos[p.symbol] = float(p.qty) * (1 if p.side=="long" else -1)
+    return pos
 
-def run():
-    e = eng()
-    eq = last_equity(e)
-    sigs = fetch_new_signals(e)
-    if sigs.empty:
-        return
-    # very naive: buy when signal["action"] == "buy", sell when "sell"
-    for _, r in sigs.iterrows():
-        s = r["signal"]
-        # assume your signal json looks like {"action":"buy","price":123.45}
-        action = s.get("action")
-        px = float(s.get("price", 0.0))
-        if action not in ("buy", "sell") or px <= 0:
-            continue
-        qty = decide_qty(eq, px, risk_frac=0.05)
-        if qty == 0: 
-            continue
-        place_order(e, r["ticker"], action, qty, px, meta=s)
+def _read_latest_signals(eng) -> pd.DataFrame:
+    sql = """
+      select distinct on (ticker) *
+      from signals
+      where ts >= now() - interval '2 days'
+      order by ticker, ts desc
+    """
+    with eng.connect() as c:
+        return pd.read_sql(sa.text(sql), c)
+
+def _insert_order(c, row):
+    df = pd.DataFrame([row])
+    df.to_sql("orders", c, if_exists="append", index=False)
+
+def run_once():
+    eng = make_engine()
+    api = _alpaca()
+
+    sig = _read_latest_signals(eng)
+    if sig.empty:
+        print("no signals")
+        return 0
+
+    eq = _equity(api)
+    positions = _get_open_positions(api)
+
+    placed = 0
+    with eng.begin() as c:
+        for _, s in sig.iterrows():
+            tkr = s["ticker"]
+            side = s["side"]
+            strength = float(s["strength"])
+            if strength < MIN_STRENGTH:
+                continue
+
+            px = _price(api, tkr)
+            # position sizing
+            max_pos_notional = eq * MAX_POS_PCT
+            risk_notional = eq * RISK_PER_TRADE * max(0.5, strength)  # scale by strength
+            notional = min(max_pos_notional, risk_notional)
+            qty = max(1, math.floor(notional / px))
+
+            # simple direction rule: avoid flipping rapidly
+            cur = positions.get(tkr, 0)
+            if side == "buy" and cur > 0:
+                continue
+            if side == "sell" and cur < 0:
+                continue
+
+            # place market order (simplest first)
+            try:
+                api.submit_order(symbol=tkr,
+                                 qty=qty,
+                                 side=side,
+                                 type="market",
+                                 time_in_force="day")
+                order_row = {
+                    "ts": datetime.now(timezone.utc),
+                    "ticker": tkr,
+                    "side": side,
+                    "qty": qty,
+                    "order_type": "market",
+                    "limit_price": None,
+                    "status": "new",
+                    "filled_at": None,
+                }
+                _insert_order(c, order_row)
+                placed += 1
+                print(f"placed {side} {qty} {tkr} @ ~{px}")
+            except Exception as e:
+                print("order error:", e)
+                continue
+    return placed
 
 if __name__ == "__main__":
-    run()
+    n = run_once()
+    print("orders placed:", n)
