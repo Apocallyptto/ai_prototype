@@ -1,87 +1,85 @@
 # jobs/make_signals.py
-import os
-import pandas as pd
+from __future__ import annotations
+import os, random, datetime as dt
 import numpy as np
+import pandas as pd
 import sqlalchemy as sa
-from datetime import datetime, timezone
-from sklearn.linear_model import LogisticRegression
-from ta.momentum import RSIIndicator
-from ta.trend import MACD, SMAIndicator
 
-from lib.db import make_engine  # you already have DB helpers
+from lib.db import make_engine
 
-TICKERS = os.getenv("SIGNAL_TICKERS", "AAPL,MSFT,SPY").split(",")
-TIMEFRAME = "1d"
-MODEL_NAME = "lr_v1"
-PORTFOLIO_ID = int(os.getenv("PORTFOLIO_ID", "1"))
 
-def _get_bars(ticker: str) -> pd.DataFrame:
-    # use yfinance for demo; you can swap in Alpaca data
-    import yfinance as yf
-    df = yf.download(ticker, period="1y", interval="1d", auto_adjust=False, progress=False)
-    df = df.rename(columns={"Open":"o","High":"h","Low":"l","Close":"c","Volume":"v"})
-    df.index.name = "ts"
-    df = df.reset_index()
-    df["ticker"] = ticker
-    return df
+def _table_has_column(conn, table: str, col: str) -> bool:
+    sql = sa.text("""
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name=:t AND column_name=:c
+      LIMIT 1
+    """)
+    return conn.execute(sql, {"t": table, "c": col}).scalar() is not None
 
-def _build_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["sma_fast"] = SMAIndicator(df["c"], window=10).sma_indicator()
-    df["sma_slow"] = SMAIndicator(df["c"], window=30).sma_indicator()
-    df["rsi"] = RSIIndicator(df["c"], window=14).rsi()
-    macd = MACD(df["c"])
-    df["macd"] = macd.macd()
-    df["macd_sig"] = macd.macd_signal()
-    df["ret_1d"] = df["c"].pct_change()
-    df = df.dropna().reset_index(drop=True)
-    return df
 
-def _train_quick_model(df: pd.DataFrame):
-    # label: next-day up/down
-    y = (df["c"].shift(-1) > df["c"]).astype(int)[:-1]
-    X = df[["sma_fast","sma_slow","rsi","macd","macd_sig","ret_1d"]][:-1]
-    if len(X) < 50:
-        return None
-    m = LogisticRegression(max_iter=1000)
-    m.fit(X, y)
-    return m
+def ensure_symbols(conn):
+    # upsert 3 demo rows
+    data = pd.DataFrame([
+        {"ticker": "AAPL", "name": "Apple Inc."},
+        {"ticker": "MSFT", "name": "Microsoft Corp."},
+        {"ticker": "SPY",  "name": "SPDR S&P 500 ETF"},
+    ])
+    # Insert ticker if missing
+    for _, r in data.iterrows():
+        conn.execute(sa.text("""
+          INSERT INTO symbols (ticker, name)
+          VALUES (:t, :n)
+          ON CONFLICT (ticker) DO UPDATE SET name=EXCLUDED.name
+        """), {"t": r["ticker"], "n": r["name"]})
 
-def _predict_latest(m, df: pd.DataFrame):
-    row = df.iloc[[-1]][["sma_fast","sma_slow","rsi","macd","macd_sig","ret_1d"]]
-    proba_up = float(m.predict_proba(row)[0,1])
-    side = "buy" if proba_up >= 0.55 else ("sell" if proba_up <= 0.45 else "hold")
-    strength = abs(proba_up - 0.5) * 2  # 0..1
-    return side, strength, proba_up
 
-def run():
-    eng = make_engine()
+def get_symbol_id(conn, ticker: str) -> int:
+    return conn.execute(sa.text("SELECT id FROM symbols WHERE ticker=:t"), {"t": ticker}).scalar()
+
+
+def make_demo_signals(tickers: list[str], n_days: int = 12) -> pd.DataFrame:
     rows = []
-    now = datetime.now(timezone.utc)
-    for t in TICKERS:
-        bars = _get_bars(t)
-        feat = _build_features(bars)
-        model = _train_quick_model(feat)
-        if model is None:
-            continue
-        side, strength, _ = _predict_latest(model, feat)
-        if side == "hold":
-            continue
-        rows.append({
-            "ts": now,
-            "ticker": t,
-            "timeframe": TIMEFRAME,
-            "model": MODEL_NAME,
-            "side": side,
-            "strength": round(float(strength), 4),
-        })
-    if not rows:
-        return 0
-    df = pd.DataFrame(rows)
-    with eng.begin() as c:
-        df.to_sql("signals", c, if_exists="append", index=False)
-    return len(rows)
+    base = dt.datetime.now(dt.timezone.utc).replace(hour=17, minute=0, second=0, microsecond=0)
+    for t in tickers:
+        for i in range(n_days):
+            ts = base - dt.timedelta(days=(n_days - 1 - i))
+            side = random.choice(["buy", "sell"])
+            strength = float(np.clip(np.random.normal(0.55 if side == "buy" else 0.35, 0.15), 0.05, 0.95))
+            rows.append({
+                "ts": ts, "ticker": t, "timeframe": "1d", "model": "baseline",
+                "side": side, "strength": strength
+            })
+    return pd.DataFrame(rows)
+
+
+def main():
+    eng = make_engine()
+    tickers = os.getenv("SIGNAL_TICKERS", "AAPL,MSFT,SPY").split(",")
+    tickers = [t.strip().upper() for t in tickers if t.strip()]
+
+    with eng.begin() as conn:
+        ensure_symbols(conn)
+
+        df = make_demo_signals(tickers)
+        # Map tickers to symbol_id
+        df["symbol_id"] = [get_symbol_id(conn, t) for t in df["ticker"]]
+
+        # Decide which insert shape to use
+        has_json = _table_has_column(conn, "signals", "signal")
+        if has_json:
+            # Insert JSONB document in column 'signal'
+            df2 = df[["ts", "symbol_id", "timeframe", "model", "side", "strength"]].copy()
+            df2["signal"] = df2.apply(lambda r: {"side": r["side"], "strength": r["strength"]}, axis=1)
+            df2 = df2.drop(columns=["side", "strength"])
+            df2.to_sql("signals", conn, if_exists="append", index=False)
+        else:
+            # Insert as separate columns (your current schema)
+            cols = ["ts", "symbol_id", "timeframe", "model", "side", "strength"]
+            df[cols].to_sql("signals", conn, if_exists="append", index=False)
+
+    print(f"✅ Inserted {len(df)} signals for {tickers}")
+
 
 if __name__ == "__main__":
-    n = run()
-    print(f"wrote {n} signals")
+    main()
