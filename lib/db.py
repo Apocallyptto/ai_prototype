@@ -1,68 +1,42 @@
 # lib/db.py
-from __future__ import annotations
-
 import os
-import pathlib
 import sqlalchemy as sa
 
-# py3.11+ has tomllib in stdlib; fallback to tomli for earlier versions if needed
-try:
-    import tomllib  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover
-    import tomli as tomllib  # type: ignore[no-redef]
+def make_engine():
+    # prefer env (CLI, Jobs, GitHub Actions)
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    pw   = os.getenv("DB_PASSWORD")
+    ssl  = os.getenv("DB_SSLMODE", "require")
 
+    # optional: allow .streamlit/secrets.toml when running the UI locally
+    try:
+        import streamlit as st  # only available in UI
+        if not host and "db" in st.secrets:
+            s = st.secrets["db"]
+            host = s.get("host", host)
+            port = s.get("port", port)
+            name = s.get("dbname", name)
+            user = s.get("user", user)
+            pw   = s.get("password", pw)
+            ssl  = s.get("sslmode", ssl)
+    except Exception:
+        pass
 
-def _load_streamlit_secrets() -> dict:
-    """
-    Load .streamlit/secrets.toml so CLI scripts (not Streamlit) can reuse the same creds.
-    Returns {} if the file is missing.
-    """
-    repo_root = pathlib.Path(__file__).resolve().parents[1]
-    p = repo_root / ".streamlit" / "secrets.toml"
-    if not p.exists():
-        return {}
-    with p.open("rb") as f:
-        return tomllib.load(f)
-
-
-def make_engine() -> sa.Engine:
-    """
-    Build a SQLAlchemy engine, preferring OS env vars, then falling back to .streamlit/secrets.toml
-    Secrets format expected:
-
-    [db]
-    host     = "..."
-    port     = "5432"
-    dbname   = "neondb"
-    user     = "neondb_owner"
-    password = "..."
-    sslmode  = "require"
-    """
-    secrets = _load_streamlit_secrets()
-    dbs = secrets.get("db", {})
-
-    host = os.getenv("DB_HOST", dbs.get("host"))
-    port = int(os.getenv("DB_PORT", dbs.get("port", 5432)))
-    name = os.getenv("DB_NAME", dbs.get("dbname"))
-    user = os.getenv("DB_USER", dbs.get("user"))
-    pwd  = os.getenv("DB_PASSWORD", dbs.get("password"))
-    ssl  = os.getenv("DB_SSLMODE", dbs.get("sslmode", "require"))
-
-    missing = [k for k, v in {
-        "DB_HOST/host": host,
-        "DB_NAME/dbname": name,
-        "DB_USER/user": user,
-        "DB_PASSWORD/password": pwd,
-    }.items() if not v]
-    if missing:
+    if not all([host, port, name, user, pw]):
+        missing = [k for k, v in dict(
+            DB_HOST=host, DB_PORT=port, DB_NAME=name, DB_USER=user, DB_PASSWORD=pw
+        ).items() if not v]
         raise RuntimeError(f"Missing DB settings: {', '.join(missing)}")
 
     url = sa.engine.URL.create(
-        drivername="postgresql+psycopg2",
+        "postgresql+psycopg2",
         username=user,
-        password=pwd,
+        password=pw,
         host=host,
-        port=port,
+        port=int(port),
         database=name,
         query={"sslmode": ssl} if ssl else None,
     )
