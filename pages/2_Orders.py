@@ -1,6 +1,6 @@
 import streamlit as st, pandas as pd
 from sqlalchemy import text
-from lib.db import get_engine
+from lib.db import make_engine as get_engine
 
 st.title("📑 Orders & Fills")
 
