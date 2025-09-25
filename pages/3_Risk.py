@@ -3,8 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sqlalchemy import text
-from lib.db import get_engine
-
+from lib.db import make_engine as get_engine
 st.set_page_config(page_title="Risk", page_icon="🛡️", layout="wide")
 st.title("🛡️ Risk Dashboard")
 
