@@ -4,8 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import yfinance as yf
 from sqlalchemy import text
-from lib.db import get_engine
-
+from lib.db import make_engine as get_engine
 st.title("📊 Chart + Signals")
 
 # --- Controls (always render) ---
