@@ -11,6 +11,8 @@ def make_engine():
     pw   = os.getenv("DB_PASSWORD")
     ssl  = os.getenv("DB_SSLMODE", "require")
 
+
+
     # optional: allow .streamlit/secrets.toml when running the UI locally
     try:
         import streamlit as st  # only available in UI
@@ -41,3 +43,5 @@ def make_engine():
         query={"sslmode": ssl} if ssl else None,
     )
     return sa.create_engine(url, pool_pre_ping=True)
+
+
