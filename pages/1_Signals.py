@@ -10,15 +10,19 @@ def load_signals(sym_like: str, limit: int) -> pd.DataFrame:
         # works whether your schema has JSON `signal` or plain columns
         try:
             q = sa.text("""
-                SELECT s.ts, sym.ticker, s.timeframe, s.model,
-                       s.signal->>'side' AS side,
-                       (s.signal->>'strength')::float AS strength
+                SELECT
+                  s.ts,
+                  COALESCE(sym.ticker, s.ticker)     AS ticker,
+                  s.timeframe, s.model,
+                  COALESCE((s.signal->>'side'), s.side) AS side,
+                  COALESCE(NULLIF((s.signal->>'strength'), '')::float, s.strength) AS strength
                 FROM signals s
-                JOIN symbols sym ON sym.id = s.symbol_id
-                WHERE (:sym = '' OR sym.ticker ILIKE '%' || :sym || '%')
+                LEFT JOIN symbols sym ON sym.id = s.symbol_id
+                WHERE (:sym = '' OR COALESCE(sym.ticker, s.ticker) ILIKE '%'||:sym||'%')
                 ORDER BY s.ts DESC
                 LIMIT :lim
             """)
+
             return pd.read_sql(q, c, params={"sym": sym_like, "lim": limit})
         except Exception:
             q2 = sa.text("""
