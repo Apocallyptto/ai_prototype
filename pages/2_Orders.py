@@ -1,26 +1,27 @@
-import streamlit as st, pandas as pd
-from sqlalchemy import text
-from lib.db import make_engine as get_engine
+import pandas as pd
+import sqlalchemy as sa
+import streamlit as st
+from lib.db import make_engine
 
-st.title("📑 Orders & Fills")
+@st.cache_data(ttl=30)
+def load_orders(limit: int) -> pd.DataFrame:
+    eng = make_engine()
+    with eng.connect() as c:
+        q = sa.text("""
+            SELECT o.ts,
+                   sym.ticker,
+                   o.side,
+                   o.qty,
+                   o.order_type,
+                   o.limit_price,
+                   o.status
+            FROM orders o
+            JOIN symbols sym ON sym.id = o.symbol_id
+            ORDER BY o.ts DESC
+            LIMIT :lim
+        """)
+        return pd.read_sql(q, c, params={"lim": limit})
 
-@st.cache_data(ttl=120)
-def load_orders(limit=200):
-    q = text("""
-        SELECT o.ts,
-               sym.ticker,
-               o.side,
-               o.qty,
-               o."type" AS order_type,     -- quote to avoid keyword issues
-               o.limit_price,
-               o.status
-        FROM orders o
-        JOIN symbols sym ON sym.id = o.symbol_id
-        ORDER BY o.ts DESC
-        LIMIT :lim
-    """)
-    # use a connection so pandas doesn't switch to exec_driver_sql silently
-    with get_engine().connect() as conn:
-        return pd.read_sql(q, conn, params={"lim": limit})
-
-st.dataframe(load_orders(), use_container_width=True)
+st.title("📄 Orders & Fills")
+lim = st.slider("Max rows", 50, 1000, 200, 50)
+st.dataframe(load_orders(lim), width="stretch")
