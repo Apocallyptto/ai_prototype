@@ -2,194 +2,159 @@
 from __future__ import annotations
 
 import os
-import sys
-import time
-import logging
 import argparse
-from typing import Iterable, List, Tuple
+import datetime as dt
+import logging
+from typing import Optional
 
-import sqlalchemy as sa
 import pandas as pd
+import sqlalchemy as sa
 
 from lib.db import make_engine
-from lib.broker_alpaca import place_marketable_limit, latest_price
+from lib.db_orders import log_order_row
+from lib.broker_alpaca import place_marketable_limit
 
-# ---------- Logging ----------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-logger = logging.getLogger("executor")
 
-# ---------- Config (env) ----------------------------------------------------
-PORTFOLIO_ID   = int(os.getenv("PORTFOLIO_ID", "1"))
-MIN_STRENGTH   = float(os.getenv("MIN_STRENGTH", "0.30"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.05"))   # fraction of equity (fallback sizing)
-MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "10"))
-MAX_QTY        = int(os.getenv("MAX_QTY_PER_ORDER", "5"))
-TICKER_FILTER  = [s.strip().upper() for s in os.getenv("SIGNAL_TICKERS", "").split(",") if s.strip()]
-DRY_RUN        = os.getenv("DRY_RUN", "").lower() in {"1","true","yes"}
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return default
 
-# --------- Helpers -----------------------------------------------------------
-def load_recent_signals(conn, since_days:int) -> pd.DataFrame:
-    """
-    Load signals newer than since_days and above MIN_STRENGTH.
-    Optionally filter tickers if SIGNAL_TICKERS is set.
-    """
-    base_sql = """
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return default
+
+
+def env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
+
+
+def get_signals(since_days: int, tickers_csv: Optional[str]) -> pd.DataFrame:
+    eng = make_engine()
+    where_tickers = ""
+    params = {"days": since_days}
+    if tickers_csv:
+        tickers = [t.strip().upper() for t in tickers_csv.split(",") if t.strip()]
+        where_tickers = "AND s.ticker = ANY(:tickers)"
+        params["tickers"] = tickers
+
+    q = sa.text(
+        f"""
         SELECT s.ts, s.ticker, s.timeframe, s.model, s.side, s.strength
         FROM signals s
-        WHERE s.ts >= now() - interval :since
-          AND s.strength >= :min_strength
-        ORDER BY s.ts DESC
-    """
-    df = pd.read_sql(
-        sa.text(base_sql),
-        conn,
-        params={"since": f"{since_days} days", "min_strength": MIN_STRENGTH},
+        WHERE s.ts >= now() - (:days || ' days')::interval
+          {where_tickers}
+        ORDER BY s.ts ASC
+        """
     )
-    if TICKER_FILTER:
-        df = df[df["ticker"].isin(TICKER_FILTER)]
-    return df.reset_index(drop=True)
+    with make_engine().connect() as c:
+        df = pd.read_sql(q, c, params=params)
+    return df
 
-def _portfolio_equity(conn) -> float:
-    """
-    Best-effort equity: last daily_pnl.equity for the portfolio.
-    Fallback to 10_000 if not found.
-    """
-    q = """
-        SELECT equity
-        FROM daily_pnl
-        WHERE portfolio_id = :pid
-        ORDER BY "date" DESC
-        LIMIT 1
-    """
-    try:
-        row = conn.execute(sa.text(q), {"pid": PORTFOLIO_ID}).fetchone()
-        if row and row[0] is not None:
-            return float(row[0])
-    except Exception as e:
-        logger.debug("equity fetch fail: %s", e)
-    return 10_000.0
 
-def _current_open_positions(conn) -> int:
-    q = "SELECT COUNT(*) FROM orders WHERE status IN ('submitted','pending_new','accepted','new')"
+def should_trade(row: pd.Series, min_strength: float) -> bool:
     try:
-        n = conn.execute(sa.text(q)).scalar()
-        return int(n or 0)
+        return float(row["strength"]) >= min_strength
     except Exception:
-        return 0
+        return False
 
-def _sized_qty(ticker: str, equity: float) -> int:
-    """
-    Position size by RISK_PER_TRADE fraction of equity / last price,
-    clamped to [1, MAX_QTY].
-    """
-    try:
-        px = latest_price(ticker)
-        qty = max(1, int((equity * RISK_PER_TRADE) // px))
-    except Exception as e:
-        logger.debug("price sizing failed for %s: %s; defaulting to 1", ticker, e)
-        qty = 1
 
-    return max(1, min(qty, MAX_QTY))
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--since-days", type=int, default=3, help="look-back window for signals")
+    parser.add_argument("--dry-run", action="store_true", help="no broker orders, only log")
+    args = parser.parse_args()
 
-def create_order_row(conn, ticker: str, side: str, qty: int, lim: float, status_text: str):
-    conn.execute(sa.text("""
-        INSERT INTO orders
-            (ts, symbol_id, ticker, side, qty, order_type, limit_price, status)
-        VALUES
-            (now(),
-             (SELECT id FROM symbols WHERE ticker = :ticker),
-             :ticker, :side, :qty, 'limit', :lim, :status)
-    """), {
-        "ticker": ticker,
-        "side": side,
-        "qty": qty,
-        "lim": lim,
-        "status": status_text
-    })
+    # --- logging
+    level = env_str("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    logger = logging.getLogger("executor")
 
-# --------- Main execution ----------------------------------------------------
-def run(since_days:int, dry_run:bool=False):
-    eng = make_engine()
-    with eng.begin() as conn:
-        # 1) Load candidate signals
-        sigs = load_recent_signals(conn, since_days)
-        if sigs.empty:
-            logger.info("No recent signals (>= %.2f).", MIN_STRENGTH)
-            return
+    min_strength = env_float("MIN_STRENGTH", 0.30)
+    signal_tickers = os.environ.get("SIGNAL_TICKERS", "")  # optional filter like "AAPL,MSFT,SPY"
+    pad_up = env_float("PAD_UP", 1.05)
+    pad_down = env_float("PAD_DOWN", 0.95)
 
-        logger.info("Loaded %d signals (min_strength=%.2f).", len(sigs), MIN_STRENGTH)
+    df = get_signals(args.since_days, signal_tickers)
+    if df.empty:
+        logger.info("No signals in the last %s day(s).", args.since_days)
+        return
 
-        # 2) Capacity check
-        open_n = _current_open_positions(conn)
-        if open_n >= MAX_POSITIONS:
-            logger.info("Max open positions reached (%d). No new orders.", MAX_POSITIONS)
-            return
+    placed = 0
+    last_ts_by_ticker = {}  # tiny cooldown: one trade per ticker per run
+    for _, row in df.iterrows():
+        ticker = str(row["ticker"]).upper()
+        side = str(row["side"]).lower().strip()  # "buy" or "sell"
+        strength = float(row["strength"])
+        qty = 1  # simple demo sizing; wire in your sizing if you prefer
 
-        # 3) One pass, place orders for top signals per ticker/timeframe
-        equity = _portfolio_equity(conn)
+        if not should_trade(row, min_strength):
+            continue
 
-        # You can add smarter dedupe here; keep it simple: latest rows first
-        placed = 0
-        for _, row in sigs.iterrows():
-            if placed + open_n >= MAX_POSITIONS:
-                logger.info("Reached position cap while iterating.")
-                break
+        # one per ticker per run (prevent rapid flip-flopping from back-to-back signals)
+        if ticker in last_ts_by_ticker:
+            continue
+        last_ts_by_ticker[ticker] = row["ts"]
 
-            ticker = row["ticker"]
-            side   = row["side"]
-            strength = float(row["strength"])
+        if args.dry_run:
+            logger.info("[DRY] %s %s qty=%s str=%.3f", side, ticker, qty, strength)
+            continue
 
-            qty = _sized_qty(ticker, equity)
-            logger.info("Signal %s %s str=%.3f qty=%s", ticker, side, strength, qty)
+        # --- broker call (DAY+LIMIT, “marketable” price)
+        res = place_marketable_limit(
+            ticker,
+            side,
+            qty,
+            pad_up=pad_up,
+            pad_down=pad_down,
+            extended_hours=True,
+        )
 
-            if dry_run or DRY_RUN:
-                # simulate broker, still show in logs (do NOT write to DB on dry-run)
-                try:
-                    from lib.broker_alpaca import latest_price
-                    last = latest_price(ticker)
-                    lim  = round(last * (1.05 if side=="buy" else 0.95), 2)
-                except Exception:
-                    lim = None
-                logger.info("[DRY-RUN] would place limit DAY extended %s %s x%s @%s",
-                            side, ticker, qty, lim)
-                placed += 1
-                continue
+        http_status = res.get("http_status")
+        last_px = res.get("last")
+        lim_px = res.get("limit_price")
+        txt = res.get("text", "")
 
-            # 4) Send to broker (marketable DAY+LIMIT)
-            result = place_marketable_limit(
-                ticker, side, qty,
-                # these may also come from env via lib.broker_alpaca defaults
-                pad_up=1.05, pad_down=0.95, extended_hours=True,
-            )
+        status_text = "error"
+        ts_iso = dt.datetime.utcnow().isoformat() + "Z"
+        if http_status == 200 and res.get("json"):
+            j = res["json"]
+            status_text = j.get("status", "submitted")
+            ts_iso = j.get("submitted_at") or j.get("created_at") or ts_iso
 
-            status_text = "submitted"
-            if result["http_status"] == 200 and result["json"]:
-                status_text = result["json"].get("status", "submitted")
+        ok = log_order_row(
+            ts_iso=ts_iso,
+            ticker=ticker,
+            side=side,
+            qty=float(qty),
+            order_type="limit",
+            limit_price=float(lim_px) if lim_px is not None else None,
+            status=status_text,
+            logger=logger,
+        )
 
-            # 5) Persist to orders table for the UI
-            try:
-                create_order_row(conn, ticker, side, qty, float(result["limit_price"]), status_text)
-                placed += 1
-            except Exception as e:
-                logger.error("DB insert failed for %s %s: %s", ticker, side, e)
+        if not ok:
+            logger.error("Order logged with error for %s %s", ticker, side)
 
-            # 6) Log details
-            logger.info("alpaca order -> %s | last=%.2f lim=%.2f | %s",
-                        result["http_status"], result["last"], result["limit_price"], result["text"])
+        logger.info(
+            "alpaca order -> %s | last=%s lim=%s | %s",
+            http_status,
+            f"{last_px:.2f}" if isinstance(last_px, (int, float)) else last_px,
+            f"{lim_px:.2f}" if isinstance(lim_px, (int, float)) else lim_px,
+            txt[:300],
+        )
+        placed += 1
 
-        logger.info("Done. Placed %d order(s).", placed)
+    logger.info("Done. Placed %s order(s).", placed)
 
-# --------- CLI ---------------------------------------------------------------
-def parse_args(argv: List[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Execute signals -> Alpaca orders")
-    p.add_argument("--since-days", type=int, default=3, help="lookback window for signals")
-    p.add_argument("--dry-run", action="store_true", help="simulate broker orders only")
-    return p.parse_args(argv)
 
 if __name__ == "__main__":
-    args = parse_args(sys.argv[1:])
-    run(args.since_days, dry_run=args.dry_run)
+    main()
