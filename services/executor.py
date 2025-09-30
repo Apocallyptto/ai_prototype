@@ -1,159 +1,149 @@
 # services/executor.py
-from __future__ import annotations
-
 import os
 import argparse
-import datetime as dt
 import logging
-from typing import Optional
+import datetime as dt
+from datetime import timezone
 
 import pandas as pd
 import sqlalchemy as sa
 
 from lib.db import make_engine
-from lib.db_orders import log_order_row
 from lib.broker_alpaca import place_marketable_limit
 
-
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except Exception:
-        return default
-
-
-def env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except Exception:
-        return default
+# -------- logging ----------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("executor")
 
 
-def env_str(name: str, default: str) -> str:
-    v = os.environ.get(name)
-    return v if v not in (None, "") else default
+# -------- config via env ----------
+MIN_STRENGTH = float(os.environ.get("MIN_STRENGTH", "0.30"))
+SIGNAL_TICKERS = [
+    t.strip().upper() for t in os.environ.get("SIGNAL_TICKERS", "AAPL,MSFT,SPY").split(",") if t.strip()
+]
+MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "10"))
+RISK_PER_TRADE = float(os.environ.get("RISK_PER_TRADE", "0.05"))
+
+# simple constant size while testing
+DEFAULT_QTY = int(os.environ.get("TEST_QTY", "1"))
+
+# aggressiveness for marketable limit
+PAD_UP = float(os.environ.get("PAD_UP", "1.05"))
+PAD_DOWN = float(os.environ.get("PAD_DOWN", "0.95"))
 
 
-def get_signals(since_days: int, tickers_csv: Optional[str]) -> pd.DataFrame:
-    eng = make_engine()
-    where_tickers = ""
-    params = {"days": since_days}
-    if tickers_csv:
-        tickers = [t.strip().upper() for t in tickers_csv.split(",") if t.strip()]
-        where_tickers = "AND s.ticker = ANY(:tickers)"
-        params["tickers"] = tickers
-
+def fetch_signals(conn, since_days: int) -> pd.DataFrame:
     q = sa.text(
-        f"""
-        SELECT s.ts, s.ticker, s.timeframe, s.model, s.side, s.strength
-        FROM signals s
-        WHERE s.ts >= now() - (:days || ' days')::interval
-          {where_tickers}
-        ORDER BY s.ts ASC
+        """
+        SELECT ts, ticker, timeframe, model, side, strength
+        FROM signals
+        WHERE ts >= now() - (:d || ' days')::interval
+        ORDER BY ts ASC
         """
     )
-    with make_engine().connect() as c:
-        df = pd.read_sql(q, c, params=params)
+    df = pd.read_sql(q, conn, params={"d": since_days})
+    if SIGNAL_TICKERS:
+        df = df[df["ticker"].isin(SIGNAL_TICKERS)]
+    df = df[df["strength"] >= MIN_STRENGTH]
     return df
 
 
-def should_trade(row: pd.Series, min_strength: float) -> bool:
-    try:
-        return float(row["strength"]) >= min_strength
-    except Exception:
-        return False
+def have_recent_pending(conn, ticker: str, side: str) -> bool:
+    row = conn.execute(
+        sa.text(
+            """
+            SELECT 1
+            FROM orders
+            WHERE ticker=:t AND side=:s
+              AND status IN ('pending_new','submitted')
+              AND ts >= now() - interval '10 minutes'
+            LIMIT 1
+            """
+        ),
+        {"t": ticker, "s": side},
+    ).fetchone()
+    return bool(row)
+
+
+def insert_order_row(conn, ticker: str, side: str, qty: int, lim: float, status_text: str, ts_iso: str):
+    conn.execute(
+        sa.text(
+            """
+            INSERT INTO orders
+                (ts, symbol_id, ticker, side, qty, order_type, limit_price, status)
+            VALUES
+                (:ts,
+                 (SELECT id FROM symbols WHERE ticker = :ticker),
+                 :ticker, :side, :qty, 'limit', :lim, :status)
+            """
+        ),
+        {
+            "ts": ts_iso,
+            "ticker": ticker,
+            "side": side,
+            "qty": qty,
+            "lim": lim,
+            "status": status_text,
+        },
+    )
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--since-days", type=int, default=3, help="look-back window for signals")
-    parser.add_argument("--dry-run", action="store_true", help="no broker orders, only log")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--since-days", type=int, default=3, help="how many days back to read signals")
+    args = ap.parse_args()
 
-    # --- logging
-    level = env_str("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    logger = logging.getLogger("executor")
-
-    min_strength = env_float("MIN_STRENGTH", 0.30)
-    signal_tickers = os.environ.get("SIGNAL_TICKERS", "")  # optional filter like "AAPL,MSFT,SPY"
-    pad_up = env_float("PAD_UP", 1.05)
-    pad_down = env_float("PAD_DOWN", 0.95)
-
-    df = get_signals(args.since_days, signal_tickers)
-    if df.empty:
-        logger.info("No signals in the last %s day(s).", args.since_days)
-        return
-
+    eng = make_engine()
     placed = 0
-    last_ts_by_ticker = {}  # tiny cooldown: one trade per ticker per run
-    for _, row in df.iterrows():
-        ticker = str(row["ticker"]).upper()
-        side = str(row["side"]).lower().strip()  # "buy" or "sell"
-        strength = float(row["strength"])
-        qty = 1  # simple demo sizing; wire in your sizing if you prefer
 
-        if not should_trade(row, min_strength):
-            continue
+    with eng.begin() as conn:
+        sigs = fetch_signals(conn, args.since_days)
 
-        # one per ticker per run (prevent rapid flip-flopping from back-to-back signals)
-        if ticker in last_ts_by_ticker:
-            continue
-        last_ts_by_ticker[ticker] = row["ts"]
+        # crude position cap
+        open_positions = pd.read_sql("SELECT COUNT(*) AS n FROM positions", conn).iloc[0]["n"] if "positions" in eng.dialect.get_table_names(conn) else 0  # type: ignore
 
-        if args.dry_run:
-            logger.info("[DRY] %s %s qty=%s str=%.3f", side, ticker, qty, strength)
-            continue
+        for _, row in sigs.iterrows():
+            ticker = str(row["ticker"]).upper()
+            side = str(row["side"]).lower()
+            qty = DEFAULT_QTY
 
-        # --- broker call (DAY+LIMIT, “marketable” price)
-        res = place_marketable_limit(
-            ticker,
-            side,
-            qty,
-            pad_up=pad_up,
-            pad_down=pad_down,
-            extended_hours=True,
-        )
+            if have_recent_pending(conn, ticker, side):
+                logger.info("skip %s %s: recent pending order exists", ticker, side)
+                continue
 
-        http_status = res.get("http_status")
-        last_px = res.get("last")
-        lim_px = res.get("limit_price")
-        txt = res.get("text", "")
+            if open_positions >= MAX_POSITIONS and side == "buy":
+                logger.info("skip %s buy: max positions reached", ticker)
+                continue
 
-        status_text = "error"
-        ts_iso = dt.datetime.utcnow().isoformat() + "Z"
-        if http_status == 200 and res.get("json"):
-            j = res["json"]
-            status_text = j.get("status", "submitted")
-            ts_iso = j.get("submitted_at") or j.get("created_at") or ts_iso
+            # place marketable DAY+LIMIT
+            res = place_marketable_limit(
+                ticker,
+                side,
+                qty,
+                pad_up=PAD_UP,
+                pad_down=PAD_DOWN,
+                extended_hours=True,
+            )
 
-        ok = log_order_row(
-            ts_iso=ts_iso,
-            ticker=ticker,
-            side=side,
-            qty=float(qty),
-            order_type="limit",
-            limit_price=float(lim_px) if lim_px is not None else None,
-            status=status_text,
-            logger=logger,
-        )
+            status_text = "submitted"
+            if res["http_status"] == 200 and res["json"]:
+                status_text = res["json"].get("status", "submitted")
 
-        if not ok:
-            logger.error("Order logged with error for %s %s", ticker, side)
+            # timezone-aware UTC
+            ts_iso = dt.datetime.now(timezone.utc).isoformat()
 
-        logger.info(
-            "alpaca order -> %s | last=%s lim=%s | %s",
-            http_status,
-            f"{last_px:.2f}" if isinstance(last_px, (int, float)) else last_px,
-            f"{lim_px:.2f}" if isinstance(lim_px, (int, float)) else lim_px,
-            txt[:300],
-        )
-        placed += 1
+            try:
+                insert_order_row(conn, ticker, side, qty, res["limit_price"], status_text, ts_iso)
+            except Exception as e:
+                logger.exception("DB insert failed for %s %s", ticker, side)
 
-    logger.info("Done. Placed %s order(s).", placed)
+            placed += 1
+
+    logger.info("Done. Placed %d order(s).", placed)
 
 
 if __name__ == "__main__":
