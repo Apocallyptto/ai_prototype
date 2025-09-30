@@ -1,157 +1,119 @@
 # lib/broker_alpaca.py
-from __future__ import annotations
-
 import os
-from typing import Any, Dict, Optional
-
+import math
+import logging
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
+log = logging.getLogger(__name__)
 
-# --- config from env (paper by default)
-ALPACA_BASE = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-ALPACA_DATA = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-ALPACA_KEY  = os.environ["ALPACA_API_KEY"]
-ALPACA_SEC  = os.environ["ALPACA_API_SECRET"]
+# -------- retrying HTTP session (handles brief network blips) ----------
+def _retrying_session(total: int = 3, backoff: float = 0.5) -> requests.Session:
+    sess = requests.Session()
+    retries = Retry(
+        total=total,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+
+SESSION = _retrying_session()
+
+# -------- env / endpoints ----------
+ALPACA_BASE = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_DATA = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+KEY = os.environ["ALPACA_API_KEY"]
+SEC = os.environ["ALPACA_API_SECRET"]
 
 HDR = {
-    "APCA-API-KEY-ID": ALPACA_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SEC,
+    "APCA-API-KEY-ID": KEY,
+    "APCA-API-SECRET-KEY": SEC,
     "accept": "application/json",
-    "content-type": "application/json",
 }
 
-# --- a resilient HTTP session (retries + backoff)
-def _session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=4,                  # 1 try + 4 retries
-        connect=4,
-        read=4,
-        status=4,
-        backoff_factor=0.6,       # 0.6, 1.2, 2.4, 4.8...
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "POST", "DELETE"),
-        raise_on_status=False,
+# -------- data helpers ----------
+def latest_price(ticker: str) -> float:
+    """Return the latest trade price from Alpaca Data API."""
+    r = SESSION.get(
+        f"{ALPACA_DATA}/v2/stocks/{ticker}/trades/latest",
+        headers=HDR,
+        timeout=15,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
+    r.raise_for_status()
+    px = r.json().get("trade", {}).get("p")
+    if not px:
+        raise RuntimeError(f"No last trade for {ticker}")
+    return float(px)
 
 
-_SES = _session()
-
-
-# --- price helpers -----------------------------------------------------------
-def latest_price(ticker: str, timeout: float = 25.0) -> float:
-    """
-    Get the most recent trade price. Falls back to quotes/latest.
-    Raises RuntimeError if neither endpoint yields a price.
-    """
-    # Try trades/latest
-    try:
-        r = _SES.get(
-            f"{ALPACA_DATA}/v2/stocks/{ticker}/trades/latest",
-            headers=HDR,
-            timeout=timeout,
-        )
-        if r.ok:
-            px = r.json().get("trade", {}).get("p")
-            if px:
-                return float(px)
-    except requests.RequestException:
-        pass
-
-    # Fallback: quotes/latest (use mid of bid/ask if both present; else the one we have)
-    try:
-        r = _SES.get(
-            f"{ALPACA_DATA}/v2/stocks/{ticker}/quotes/latest",
-            headers=HDR,
-            timeout=timeout,
-        )
-        if r.ok:
-            q = r.json().get("quote", {}) or {}
-            bp = q.get("bp")
-            ap = q.get("ap")
-            if bp and ap:
-                return (float(bp) + float(ap)) / 2.0
-            if ap:
-                return float(ap)
-            if bp:
-                return float(bp)
-    except requests.RequestException:
-        pass
-
-    raise RuntimeError(f"Could not fetch latest price for {ticker}")
-
-
-# --- order placement ---------------------------------------------------------
+# -------- order helper ----------
 def place_marketable_limit(
     symbol: str,
     side: str,
     qty: int,
-    *,
     pad_up: float = 1.05,
     pad_down: float = 0.95,
-    time_in_force: str = "day",
     extended_hours: bool = True,
-    timeout: float = 30.0,
-) -> Dict[str, Any]:
+):
     """
-    Place a DAY+LIMIT order with a 'marketable' price:
-      - BUY at last * pad_up
-      - SELL at last * pad_down
+    Submit a DAY + LIMIT 'marketable' order that works during RTH and extended hours.
+    We compute a limit just beyond the last trade (buy: above / sell: below).
 
-    Returns:
-        {
-          "http_status": int|None,
-          "json": dict|None,
-          "text": str,
-          "last": float|None,
-          "limit_price": float|None,
-        }
+    Returns a dict with:
+      http_status, json (response JSON or None), text (raw text),
+      last (float), limit_price (float)
     """
-    result: Dict[str, Any] = {
-        "http_status": None,
-        "json": None,
-        "text": "",
-        "last": None,
-        "limit_price": None,
-    }
+    side = side.lower().strip()
+    assert side in ("buy", "sell"), f"invalid side: {side}"
 
-    # Get a resilient last price
-    try:
-        last = latest_price(symbol)
-        result["last"] = last
-    except Exception as e:
-        result["text"] = f"price_error: {e}"
-        return result  # executor will log and skip
+    last = latest_price(symbol)
 
-    # Compute marketable limit
-    if side.lower() == "buy":
-        limit_px = round(last * pad_up + 1e-9, 2)
-    else:
-        limit_px = round(last * pad_down + 1e-9, 2)
-    result["limit_price"] = limit_px
+    # compute marketable limit
+    limit_price = last * (pad_up if side == "buy" else pad_down)
+    # round to cents
+    limit_price = round(limit_price + 1e-9, 2)
 
     payload = {
         "symbol": symbol,
-        "qty": int(qty),
-        "side": side.lower(),
+        "qty": qty,
+        "side": side,
         "type": "limit",
-        "limit_price": limit_px,
-        "time_in_force": time_in_force,
+        "limit_price": limit_price,
+        "time_in_force": "day",
         "extended_hours": bool(extended_hours),
     }
 
-    try:
-        r = _SES.post(f"{ALPACA_BASE}/v2/orders", json=payload, headers=HDR, timeout=timeout)
-        result["http_status"] = r.status_code
-        result["text"] = r.text
-        if r.ok:
-            result["json"] = r.json()
-    except requests.RequestException as e:
-        result["text"] = f"post_error: {e}"
+    r = SESSION.post(
+        f"{ALPACA_BASE}/v2/orders",
+        json=payload,
+        headers={**HDR, "content-type": "application/json"},
+        timeout=20,
+    )
 
-    return result
+    text = r.text
+    data = None
+    try:
+        data = r.json()
+    except Exception:
+        pass
+
+    log.info(
+        "alpaca order -> %s | last=%.2f lim=%.2f | %s",
+        r.status_code,
+        last,
+        limit_price,
+        text[:500],
+    )
+
+    return {
+        "http_status": r.status_code,
+        "json": data,
+        "text": text,
+        "last": last,
+        "limit_price": limit_price,
+    }
