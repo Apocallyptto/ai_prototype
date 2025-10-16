@@ -48,6 +48,7 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 API_KEY = os.getenv("ALPACA_API_KEY")
 API_SECRET = os.getenv("ALPACA_API_SECRET")
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")  # 'iex' works on free/paper; 'sip' needs subscription
 
 # Strategy knobs (env -> defaults)
 ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "1.2"))
@@ -161,31 +162,50 @@ def submit_oco_exit(symbol: str, side_exit: str, qty: int, tp_price: float, sl_s
 
 
 def recent_bars(symbol: str, timeframe: str = ATR_TIMEFRAME, lookback: int = 400) -> pd.DataFrame:
-    # Alpaca v2 bars endpoint
-    # We request enough bars to compute ATR(ATR_LENGTH)
+    """Fetch recent bars. Default feed is 'iex' (paper/free). Fallback to 'iex' on 403 if user tried 'sip'."""
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=10)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": timeframe,
-        "start": start.isoformat(),
-        "end": now.isoformat(),
-        "limit": lookback,
-        "adjustment": "split",
-        "feed": "sip",  # paper supports 'sip' in most plans; fallback not handled here
-    }
-    r = http("GET", url, params=params)
-    r.raise_for_status()
-    js = r.json()
-    bars = js.get("bars", [])
-    if not bars:
-        raise RuntimeError(f"No bars for {symbol}")
-    df = pd.DataFrame(bars)
-    # Normalize columns
-    df.rename(columns={"t": "timestamp", "o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df.set_index("timestamp", inplace=True)
-    return df[["open","high","low","close","volume"]]
+
+    def _get(feed: str):
+        params = {
+            "timeframe": timeframe,
+            "start": start.isoformat(),
+            "end": now.isoformat(),
+            "limit": lookback,
+            "adjustment": "split",
+            "feed": feed,
+        }
+        r = http("GET", url, params=params)
+        return r
+
+    # Try configured feed first, then fallback
+    feeds_to_try = [ALPACA_DATA_FEED]
+    if ALPACA_DATA_FEED.lower() != "iex":
+        feeds_to_try.append("iex")
+
+    last_err = None
+    for feed in feeds_to_try:
+        try:
+            r = _get(feed)
+            if r.status_code == 403:
+                last_err = RuntimeError(f"403 on feed '{feed}' — likely not enabled for your plan")
+                continue
+            r.raise_for_status()
+            js = r.json()
+            bars = js.get("bars", [])
+            if not bars:
+                raise RuntimeError(f"No bars for {symbol} (feed={feed})")
+            df = pd.DataFrame(bars)
+            df.rename(columns={"t": "timestamp", "o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            df.set_index("timestamp", inplace=True)
+            return df[["open","high","low","close","volume"]]
+        except Exception as e:
+            last_err = e
+            log(f"Bar fetch failed for {symbol} on feed={feed}: {e}", level="WARN")
+            continue
+    raise RuntimeError(f"Bar fetch failed for {symbol} on all feeds tried: {feeds_to_try}. Last error: {last_err}")
 
 
 def compute_atr(df: pd.DataFrame, length: int = ATR_LENGTH) -> float:
