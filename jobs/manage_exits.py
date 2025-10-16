@@ -36,6 +36,7 @@ import time
 import math
 import json
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -133,24 +134,32 @@ def get_open_orders(symbol: Optional[str] = None) -> List[dict]:
     return r.json()
 
 
+def _quantize_price(price: float, tick: Decimal = Decimal('0.01')) -> float:
+    """Quantize to the nearest tick (default 1 cent) using bankers-safe decimal rounding."""
+    return float(Decimal(str(price)).quantize(tick, rounding=ROUND_HALF_UP))
+
 def submit_oco_exit(symbol: str, side_exit: str, qty: int, tp_price: float, sl_stop: float, sl_limit: Optional[float]) -> dict:
+    # Enforce US equity tick size (no sub-pennies)
+    tp_q = _quantize_price(tp_price)
+    sl_q = _quantize_price(sl_stop)
+    sl_lim_q = _quantize_price(sl_limit) if sl_limit is not None else None
+
     url = f"{ALPACA_BASE_URL}/v2/orders"
     client_id = f"EXIT-{symbol}-{int(time.time())}"
     payload = {
         "symbol": symbol,
-        "side": side_exit,  # opposite of position
-        "type": "limit",   # for OCO the 'type' refers to TP leg (limit)
+        "side": side_exit,
+        "type": "limit",
         "qty": str(qty),
         "time_in_force": "gtc",
         "order_class": "oco",
-        "take_profit": {"limit_price": f"{tp_price:.4f}"},
+        "take_profit": {"limit_price": f"{tp_q:.2f}"},
         "client_order_id": client_id,
         "extended_hours": EXTENDED_HOURS,
     }
-    # Stop leg: stop or stop-limit
-    stop = {"stop_price": f"{sl_stop:.4f}"}
-    if sl_limit is not None:
-        stop["limit_price"] = f"{sl_limit:.4f}"
+    stop = {"stop_price": f"{sl_q:.2f}"}
+    if sl_lim_q is not None:
+        stop["limit_price"] = f"{sl_lim_q:.2f}"
     payload["stop_loss"] = stop
 
     log(f"Submitting OCO exit: {payload}")
