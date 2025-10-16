@@ -234,6 +234,33 @@ def build_exit_plan(pos: Position, atr: float) -> ExitPlan:
     return ExitPlan(tp=round(tp, 4), sl_stop=round(sl_stop, 4), sl_limit=sl_limit)
 
 
+def _summarize_orders(orders: List[dict]) -> str:
+    if not orders:
+        return "(no open orders)"
+    by_sym = {}
+    for o in orders:
+        sym = o.get("symbol")
+        by_sym.setdefault(sym, 0)
+        by_sym[sym] += 1
+    parts = [f"{sym}:{cnt}" for sym, cnt in sorted(by_sym.items())]
+    return ", ".join(parts)
+
+def print_state(symbols: Optional[List[str]] = None):
+    positions = get_open_positions()
+    orders = get_open_orders()
+    if symbols:
+        syms = set(s.strip().upper() for s in symbols)
+        positions = [p for p in positions if p.symbol in syms]
+        orders = [o for o in orders if o.get("symbol") in syms]
+    if positions:
+        log("Open positions:")
+        for p in positions:
+            log(f"- {p.symbol} qty={p.qty} side={p.side} avg={p.avg_entry}")
+    else:
+        log("No open positions found.")
+    log(f"Open orders summary: {_summarize_orders(orders)}")
+
+
 def ensure_exits(symbols: Optional[List[str]] = None):
     if not API_KEY or not API_SECRET:
         raise RuntimeError("ALPACA_API_KEY/SECRET missing in env")
@@ -245,6 +272,12 @@ def ensure_exits(symbols: Optional[List[str]] = None):
 
     if not positions:
         log("No open positions to manage exits for.")
+        # Extra context to help debugging
+        try:
+            oo = get_open_orders()
+            log(f"Open orders summary: {_summarize_orders(oo)}")
+        except Exception as e:
+            log(f"Failed to query open orders: {e}", level="WARN")
         return
 
     all_open_orders = get_open_orders()
@@ -268,11 +301,15 @@ def parse_cli(argv: List[str]):
     import argparse
     ap = argparse.ArgumentParser(description="Ensure OCO exits exist for open positions.")
     ap.add_argument("--symbols", type=str, default="", help="Comma-separated whitelist, e.g., AAPL,MSFT,SPY")
+    ap.add_argument("--debug", action="store_true", help="Print current positions and open orders, then exit.")
     args = ap.parse_args(argv)
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
-    return symbols
+    return args, symbols
 
 
 if __name__ == "__main__":
-    syms = parse_cli(sys.argv[1:])
+    args, syms = parse_cli(sys.argv[1:])
+    if args.debug:
+        print_state(syms)
+        sys.exit(0)
     ensure_exits(syms)
