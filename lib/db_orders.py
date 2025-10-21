@@ -59,7 +59,7 @@ def upsert_orders(orders: List[Dict[str, Any]]) -> int:
         return 0
 
     cols = [
-        "id", "client_order_id", "symbol", "side", "type", "order_class",
+        "id", "client_order_id", "symbol", "side", "order_type", "order_class",
         "qty", "filled_qty", "status", "limit_price", "stop_price",
         "filled_avg_price", "time_in_force", "extended_hours",
         "created_at", "updated_at", "submitted_at", "filled_at",
@@ -74,7 +74,7 @@ def upsert_orders(orders: List[Dict[str, Any]]) -> int:
       client_order_id = EXCLUDED.client_order_id,
       symbol          = EXCLUDED.symbol,
       side            = EXCLUDED.side,
-      type            = EXCLUDED.type,
+      order_type      = EXCLUDED.order_type,
       order_class     = EXCLUDED.order_class,
       qty             = EXCLUDED.qty,
       filled_qty      = EXCLUDED.filled_qty,
