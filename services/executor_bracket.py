@@ -104,17 +104,18 @@ def _pg_conn():
 def fetch_signals(since_days: int, min_strength: float, portfolio_id: int | None):
     import psycopg2
     from datetime import datetime, timezone, timedelta
+
     DBURL = os.getenv("DATABASE_URL")
-    if not DBURL:
-        # fall back to discrete PG env vars
-        PGHOST = os.getenv("PGHOST", "localhost")
-        PGUSER = os.getenv("PGUSER", "postgres")
-        PGPASSWORD = os.getenv("PGPASSWORD", "postgres")
-        PGDATABASE = os.getenv("PGDATABASE", "ai_prototype")
-        PGPORT = int(os.getenv("PGPORT", "5432"))
-        conn = psycopg2.connect(host=PGHOST, user=PGUSER, password=PGPASSWORD, dbname=PGDATABASE, port=PGPORT)
-    else:
+    if DBURL:
         conn = psycopg2.connect(DBURL)
+    else:
+        conn = psycopg2.connect(
+            host=os.getenv("PGHOST", "localhost"),
+            user=os.getenv("PGUSER", "postgres"),
+            password=os.getenv("PGPASSWORD", "postgres"),
+            dbname=os.getenv("PGDATABASE", "ai_prototype"),
+            port=int(os.getenv("PGPORT", "5432")),
+        )
 
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
 
@@ -122,8 +123,7 @@ def fetch_signals(since_days: int, min_strength: float, portfolio_id: int | None
         SELECT symbol,
                side,
                strength,
-               created_at AS ts,
-               portfolio_id
+               created_at AS ts
         FROM signals
         WHERE created_at >= %s
           AND strength >= %s
@@ -136,17 +136,9 @@ def fetch_signals(since_days: int, min_strength: float, portfolio_id: int | None
             cur.execute(sql, (since, float(min_strength), portfolio_id, portfolio_id))
             rows = cur.fetchall()
 
-    # rows: [(symbol, side, strength, ts, portfolio_id), ...]
-    out = []
-    for sym, side, strength, ts, pfid in rows:
-        out.append({
-            "symbol": sym,
-            "side": side,
-            "strength": float(strength),
-            "ts": ts,                    # keep 'ts' key for downstream code
-            "portfolio_id": pfid,
-        })
-    return out
+    # rows is already a list of 4-tuples (symbol, side, strength, ts)
+    return rows
+
 
 
 # -------------------- Alpaca order lookups -------------------- #
