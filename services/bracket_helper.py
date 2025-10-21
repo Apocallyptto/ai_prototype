@@ -1,6 +1,6 @@
 # services/bracket_helper.py
 from __future__ import annotations
-import os, time, json, math
+import os, time, json
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
@@ -35,7 +35,7 @@ def _http(method: str, url: str, **kwargs):
             if r.status_code >= 500:
                 raise requests.HTTPError(f"{r.status_code} {r.text}")
             return r
-        except Exception as e:
+        except Exception:
             time.sleep(min(2**i, 8))
     raise RuntimeError(f"HTTP failed after retries: {method} {url}")
 
@@ -141,3 +141,8 @@ def submit_bracket(symbol: str, side: str, qty: int, *, prefer_limit_when_closed
         _log(f"submit failed: {r.status_code} {r.text}")
         r.raise_for_status()
     return r.json()
+
+# --- Backward compatibility for older code paths ---
+def submit_bracket_entry(symbol: str, side: str, qty: int, prefer_limit_when_closed: bool = True) -> dict:
+    """Deprecated alias; forwards to submit_bracket()."""
+    return submit_bracket(symbol, side, qty, prefer_limit_when_closed=prefer_limit_when_closed)
