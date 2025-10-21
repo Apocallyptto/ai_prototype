@@ -101,27 +101,53 @@ def _pg_conn():
     port = int(os.getenv("PGPORT", "5432"))
     return psycopg2.connect(host=host, user=user, password=pwd, dbname=db, port=port)
 
-def fetch_signals(since_days: int, min_strength: float, portfolio_id: int) -> List[Tuple[str, str, float, datetime]]:
-    """
-    Returns list of (symbol, side, strength, ts) filtered by window/strength/portfolio,
-    most recent first.
-    """
+def fetch_signals(since_days: int, min_strength: float, portfolio_id: int | None):
+    import psycopg2
+    from datetime import datetime, timezone, timedelta
+    DBURL = os.getenv("DATABASE_URL")
+    if not DBURL:
+        # fall back to discrete PG env vars
+        PGHOST = os.getenv("PGHOST", "localhost")
+        PGUSER = os.getenv("PGUSER", "postgres")
+        PGPASSWORD = os.getenv("PGPASSWORD", "postgres")
+        PGDATABASE = os.getenv("PGDATABASE", "ai_prototype")
+        PGPORT = int(os.getenv("PGPORT", "5432"))
+        conn = psycopg2.connect(host=PGHOST, user=PGUSER, password=PGPASSWORD, dbname=PGDATABASE, port=PGPORT)
+    else:
+        conn = psycopg2.connect(DBURL)
+
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
+
     sql = """
-        SELECT symbol, side, strength, ts
+        SELECT symbol,
+               side,
+               strength,
+               created_at AS ts,
+               portfolio_id
         FROM signals
-        WHERE ts >= %s
+        WHERE created_at >= %s
           AND strength >= %s
-          AND portfolio_id = %s
-          AND UPPER(symbol) = UPPER(symbol)  -- passthrough, placeholder for future filters
-        ORDER BY ts DESC
+          AND (%s IS NULL OR portfolio_id = %s)
+        ORDER BY created_at DESC
+        LIMIT 1000;
     """
-    out: List[Tuple[str, str, float, datetime]] = []
-    with _pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, (since, float(min_strength), int(portfolio_id)))
-        for symbol, side, strength, ts in cur.fetchall():
-            out.append((symbol.upper(), side.lower(), float(strength), ts))
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (since, float(min_strength), portfolio_id, portfolio_id))
+            rows = cur.fetchall()
+
+    # rows: [(symbol, side, strength, ts, portfolio_id), ...]
+    out = []
+    for sym, side, strength, ts, pfid in rows:
+        out.append({
+            "symbol": sym,
+            "side": side,
+            "strength": float(strength),
+            "ts": ts,                    # keep 'ts' key for downstream code
+            "portfolio_id": pfid,
+        })
     return out
+
 
 # -------------------- Alpaca order lookups -------------------- #
 
