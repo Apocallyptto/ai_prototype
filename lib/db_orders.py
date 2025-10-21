@@ -1,18 +1,18 @@
 # lib/db_orders.py
 from __future__ import annotations
 import os
-from typing import Any, Dict, Iterable, List, Optional
-from datetime import datetime
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
 
-# prefer psycopg3; fallback psycopg2
+# Prefer psycopg3, fallback to psycopg2
 try:
-    import psycopg  # type: ignore
+    import psycopg  # psycopg3
     HAVE3 = True
 except Exception:
     HAVE3 = False
-    import psycopg2  # type: ignore
+    import psycopg2
 
-def _conn():
+def _pg_conn():
     dsn = os.getenv("DATABASE_URL")
     if HAVE3:
         return psycopg.connect(dsn) if dsn else psycopg.connect(
@@ -31,78 +31,98 @@ def _conn():
             port=os.getenv("PGPORT","5432"),
         )
 
-UPSERT_SQL = """
-INSERT INTO orders (id, client_order_id, symbol, side, order_type, order_class,
-                    qty, filled_qty, filled_avg_price, status, time_in_force,
-                    limit_price, stop_price, extended_hours,
-                    created_at, submitted_at, updated_at, filled_at, canceled_at, expires_at)
-VALUES (%(id)s, %(client_order_id)s, %(symbol)s, %(side)s, %(order_type)s, %(order_class)s,
-        %(qty)s, %(filled_qty)s, %(filled_avg_price)s, %(status)s, %(time_in_force)s,
-        %(limit_price)s, %(stop_price)s, %(extended_hours)s,
-        %(created_at)s, %(submitted_at)s, %(updated_at)s, %(filled_at)s, %(canceled_at)s, %(expires_at)s)
-ON CONFLICT (id) DO UPDATE SET
-  client_order_id=EXCLUDED.client_order_id,
-  symbol=EXCLUDED.symbol,
-  side=EXCLUDED.side,
-  order_type=EXCLUDED.order_type,
-  order_class=EXCLUDED.order_class,
-  qty=EXCLUDED.qty,
-  filled_qty=EXCLUDED.filled_qty,
-  filled_avg_price=EXCLUDED.filled_avg_price,
-  status=EXCLUDED.status,
-  time_in_force=EXCLUDED.time_in_force,
-  limit_price=EXCLUDED.limit_price,
-  stop_price=EXCLUDED.stop_price,
-  extended_hours=EXCLUDED.extended_hours,
-  created_at=EXCLUDED.created_at,
-  submitted_at=EXCLUDED.submitted_at,
-  updated_at=EXCLUDED.updated_at,
-  filled_at=EXCLUDED.filled_at,
-  canceled_at=EXCLUDED.canceled_at,
-  expires_at=EXCLUDED.expires_at;
-"""
-
-def _ts(x):
-    if not x:
+def _ts(x: Any) -> Optional[datetime]:
+    """Return a UTC-aware datetime or None."""
+    if x is None:
         return None
     if isinstance(x, datetime):
-        return x
-    s = str(x).replace("Z", "+00:00")
-    try:
-        from datetime import datetime
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
+        return x.astimezone(timezone.utc) if x.tzinfo else x.replace(tzinfo=timezone.utc)
+    if isinstance(x, (int, float)):
+        return datetime.fromtimestamp(float(x), tz=timezone.utc)
+    if isinstance(x, str):
+        s = x.strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
 
-def upsert_orders(rows: Iterable[Dict[str, Any]]) -> int:
-    count = 0
-    with _conn() as c:
-        if HAVE3:
-            c.execute("SET TIME ZONE 'UTC';")
+def upsert_orders(orders: List[Dict[str, Any]]) -> int:
+    """
+    Upsert a list of Alpaca order dicts into the 'orders' table.
+    Assumes the table exists (created by tools.init_orders_db).
+    """
+    if not orders:
+        return 0
+
+    cols = [
+        "id", "client_order_id", "symbol", "side", "type", "order_class",
+        "qty", "filled_qty", "status", "limit_price", "stop_price",
+        "filled_avg_price", "time_in_force", "extended_hours",
+        "created_at", "updated_at", "submitted_at", "filled_at",
+        "canceled_at", "expired_at", "failed_at",
+    ]
+    placeholders = "(" + ",".join(["%s"] * len(cols)) + ")"
+
+    sql = f"""
+    INSERT INTO orders ({",".join(cols)})
+    VALUES {placeholders}
+    ON CONFLICT (id) DO UPDATE SET
+      client_order_id = EXCLUDED.client_order_id,
+      symbol          = EXCLUDED.symbol,
+      side            = EXCLUDED.side,
+      type            = EXCLUDED.type,
+      order_class     = EXCLUDED.order_class,
+      qty             = EXCLUDED.qty,
+      filled_qty      = EXCLUDED.filled_qty,
+      status          = EXCLUDED.status,
+      limit_price     = EXCLUDED.limit_price,
+      stop_price      = EXCLUDED.stop_price,
+      filled_avg_price= EXCLUDED.filled_avg_price,
+      time_in_force   = EXCLUDED.time_in_force,
+      extended_hours  = EXCLUDED.extended_hours,
+      created_at      = EXCLUDED.created_at,
+      updated_at      = EXCLUDED.updated_at,
+      submitted_at    = EXCLUDED.submitted_at,
+      filled_at       = EXCLUDED.filled_at,
+      canceled_at     = EXCLUDED.canceled_at,
+      expired_at      = EXCLUDED.expired_at,
+      failed_at       = EXCLUDED.failed_at
+    """
+
+    def row(o: Dict[str, Any]) -> tuple:
+        return (
+            o.get("id"),
+            o.get("client_order_id"),
+            o.get("symbol"),
+            o.get("side"),
+            o.get("type") or o.get("order_type"),
+            o.get("order_class"),
+            o.get("qty"),
+            o.get("filled_qty"),
+            o.get("status"),
+            o.get("limit_price"),
+            o.get("stop_price"),
+            o.get("filled_avg_price"),
+            o.get("time_in_force"),
+            bool(o.get("extended_hours", False)),
+            _ts(o.get("created_at")),
+            _ts(o.get("updated_at")),
+            _ts(o.get("submitted_at")),
+            _ts(o.get("filled_at")),
+            _ts(o.get("canceled_at")),
+            _ts(o.get("expired_at")),
+            _ts(o.get("failed_at")),
+        )
+
+    rows = [row(o) for o in orders]
+
+    with _pg_conn() as c:
         with c.cursor() as cur:
-            for o in rows:
-                params = {
-                    "id": o.get("id"),
-                    "client_order_id": o.get("client_order_id"),
-                    "symbol": o.get("symbol"),
-                    "side": o.get("side"),
-                    "order_type": (o.get("type") or o.get("order_type")),
-                    "order_class": o.get("order_class"),
-                    "qty": float(o["qty"]) if o.get("qty") is not None else None,
-                    "filled_qty": float(o["filled_qty"]) if o.get("filled_qty") is not None else None,
-                    "filled_avg_price": float(o["filled_avg_price"]) if o.get("filled_avg_price") else None,
-                    "status": o.get("status"),
-                    "time_in_force": o.get("time_in_force"),
-                    "limit_price": float(o["limit_price"]) if o.get("limit_price") else None,
-                    "stop_price": float(o["stop_price"]) if o.get("stop_price") else None,
-                    "extended_hours": bool(o.get("extended_hours")),
-                    "created_at": _ts(o.get("created_at")),
-                    "submitted_at": _ts(o.get("submitted_at")),
-                    "updated_at": _ts(o.get("updated_at")),
-                    "filled_at": _ts(o.get("filled_at")),
-                    "canceled_at": _ts(o.get("canceled_at")),
-                    "expires_at": _ts(o.get("expires_at")),
-                }
-                cur.execute(UPSERT_SQL, params)
-                count += 1
-    return count
+            for r in rows:
+                cur.execute(sql, r)
+        c.commit()
+    return len(rows)
