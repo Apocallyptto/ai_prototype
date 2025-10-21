@@ -3,7 +3,7 @@ from __future__ import annotations
 import os, time, json
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import requests
 
@@ -13,7 +13,6 @@ API_KEY    = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 DATA_FEED  = os.getenv("ALPACA_DATA_FEED", "iex")  # 'iex' for paper/free
 
-# ATR exit spacing (same knobs you used elsewhere)
 ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "1.2"))
 ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.0"))
 
@@ -48,7 +47,6 @@ def _clock_is_open() -> bool:
     return bool(r.json().get("is_open", False))
 
 def _latest_trade_price(symbol: str) -> float:
-    """Get a base/reference price for validations & padding."""
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest"
     feeds = [DATA_FEED] + ([] if DATA_FEED.lower()=="iex" else ["iex"])
     last_err = None
@@ -69,7 +67,6 @@ def _latest_trade_price(symbol: str) -> float:
     raise RuntimeError(f"latest trade failed for {symbol}: {last_err}")
 
 def _build_tp_sl(side: str, ref: float, atr: float) -> Tuple[float,float]:
-    """Raw ATR-based TP/SL (before venue clamping)."""
     if side.lower() == "buy":
         tp = ref + ATR_MULT_TP * atr
         sl = ref - ATR_MULT_SL * atr
@@ -79,40 +76,27 @@ def _build_tp_sl(side: str, ref: float, atr: float) -> Tuple[float,float]:
     return tp, sl
 
 def _clamp_to_rules(side: str, tp: float, sl: float, base: float, tick: float=0.01) -> Tuple[float,float]:
-    """Apply exchange/venue constraints using 'base_price' logic from Alpaca."""
     if side.lower() == "buy":
-        # must be at least 1 cent away
         min_tp = base + tick
         max_sl = base - tick
         tp = max(tp, min_tp)
         sl = min(sl, max_sl)
     else:
-        # for shorts, mirror: TP ≤ base - tick, SL ≥ base + tick
         max_tp = base - tick
         min_sl = base + tick
         tp = min(tp, max_tp)
         sl = max(sl, min_sl)
-    # quantize
     return _q(tp), _q(sl)
 
 def submit_bracket(symbol: str, side: str, qty: int, *, prefer_limit_when_closed: bool = True,
                    ref_atr: Optional[float] = None) -> dict:
-    """
-    Places a bracket with entry + attached TP/SL, enforcing venue constraints.
-    If the market is closed and prefer_limit_when_closed=True, submit a limit entry around last trade.
-    """
-    # 1) venue state + base price
     is_open = _clock_is_open()
     base = _latest_trade_price(symbol)
+    atr = ref_atr if (ref_atr and ref_atr > 0) else max(0.0025 * base, 0.05)
 
-    # 2) ATR distance (optional external ATR; if missing, use a small % as a fallback)
-    atr = ref_atr if (ref_atr and ref_atr > 0) else max(0.0025 * base, 0.05)  # ~25 bp or 5c minimum
-
-    # 3) compute & clamp exits vs base
     raw_tp, raw_sl = _build_tp_sl(side, base, atr)
     tp, sl = _clamp_to_rules(side, raw_tp, raw_sl, base)
 
-    # 4) choose entry order type
     payload = {
         "symbol": symbol,
         "side": side.lower(),
@@ -129,7 +113,6 @@ def submit_bracket(symbol: str, side: str, qty: int, *, prefer_limit_when_closed
         payload["type"] = "market"
     else:
         payload["type"] = "limit" if prefer_limit_when_closed else "market"
-        # pad limit gently to improve chances to rest
         if side.lower() == "buy":
             payload["limit_price"] = f"{_q(base + 0.05):.2f}"
         else:
@@ -142,7 +125,15 @@ def submit_bracket(symbol: str, side: str, qty: int, *, prefer_limit_when_closed
         r.raise_for_status()
     return r.json()
 
-# --- Backward compatibility for older code paths ---
+# NEW: provide list_open_orders for executor_bracket compatibility
+def list_open_orders(symbols: Optional[List[str]] = None) -> list[dict]:
+    url = f"{ALPACA_BASE_URL}/v2/orders?status=open&nested=true"
+    if symbols:
+        url += "&symbols=" + ",".join(s.upper() for s in symbols)
+    r = _http("GET", url)
+    r.raise_for_status()
+    return r.json()
+
+# Back-compat alias kept:
 def submit_bracket_entry(symbol: str, side: str, qty: int, prefer_limit_when_closed: bool = True) -> dict:
-    """Deprecated alias; forwards to submit_bracket()."""
     return submit_bracket(symbol, side, qty, prefer_limit_when_closed=prefer_limit_when_closed)
