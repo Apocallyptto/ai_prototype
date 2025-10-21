@@ -4,14 +4,13 @@ import os, time, json
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple, List
-
 import requests
 
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 API_KEY    = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
-DATA_FEED  = os.getenv("ALPACA_DATA_FEED", "iex")  # 'iex' for paper/free
+DATA_FEED  = os.getenv("ALPACA_DATA_FEED", "iex")  # paper/free
 
 ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "1.2"))
 ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.0"))
@@ -88,8 +87,11 @@ def _clamp_to_rules(side: str, tp: float, sl: float, base: float, tick: float=0.
         sl = max(sl, min_sl)
     return _q(tp), _q(sl)
 
-def submit_bracket(symbol: str, side: str, qty: int, *, prefer_limit_when_closed: bool = True,
+def submit_bracket(symbol: str, side: str, qty: Optional[int], *, prefer_limit_when_closed: bool = True,
                    ref_atr: Optional[float] = None) -> dict:
+    # Guard: default to 1 share if qty is None/0
+    qty_int = int(qty or 1)
+
     is_open = _clock_is_open()
     base = _latest_trade_price(symbol)
     atr = ref_atr if (ref_atr and ref_atr > 0) else max(0.0025 * base, 0.05)
@@ -100,7 +102,7 @@ def submit_bracket(symbol: str, side: str, qty: int, *, prefer_limit_when_closed
     payload = {
         "symbol": symbol,
         "side": side.lower(),
-        "qty": str(int(qty)),
+        "qty": str(qty_int),
         "time_in_force": "day",
         "order_class": "bracket",
         "take_profit": {"limit_price": f"{tp:.2f}"},
@@ -125,7 +127,6 @@ def submit_bracket(symbol: str, side: str, qty: int, *, prefer_limit_when_closed
         r.raise_for_status()
     return r.json()
 
-# NEW: provide list_open_orders for executor_bracket compatibility
 def list_open_orders(symbols: Optional[List[str]] = None) -> list[dict]:
     url = f"{ALPACA_BASE_URL}/v2/orders?status=open&nested=true"
     if symbols:
@@ -134,6 +135,6 @@ def list_open_orders(symbols: Optional[List[str]] = None) -> list[dict]:
     r.raise_for_status()
     return r.json()
 
-# Back-compat alias kept:
-def submit_bracket_entry(symbol: str, side: str, qty: int, prefer_limit_when_closed: bool = True) -> dict:
+# Back-compat alias for old callers
+def submit_bracket_entry(symbol: str, side: str, qty: Optional[int], prefer_limit_when_closed: bool = True) -> dict:
     return submit_bracket(symbol, side, qty, prefer_limit_when_closed=prefer_limit_when_closed)
