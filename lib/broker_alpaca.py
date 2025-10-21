@@ -1,119 +1,92 @@
 # lib/broker_alpaca.py
-import os
-import math
-import logging
+from __future__ import annotations
+import os, time, json
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional
+
 import requests
-from requests.adapters import HTTPAdapter, Retry
 
-log = logging.getLogger(__name__)
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")  # 'iex' for paper/free
+API_KEY = os.getenv("ALPACA_API_KEY")
+API_SECRET = os.getenv("ALPACA_API_SECRET")
 
-# -------- retrying HTTP session (handles brief network blips) ----------
-def _retrying_session(total: int = 3, backoff: float = 0.5) -> requests.Session:
-    sess = requests.Session()
-    retries = Retry(
-        total=total,
-        backoff_factor=backoff,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST"]),
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
+SESSION = requests.Session()
+SESSION.headers.update({
+    "APCA-API-KEY-ID": API_KEY or "",
+    "APCA-API-SECRET-KEY": API_SECRET or "",
+    "Content-Type": "application/json",
+})
 
+def _http(method: str, url: str, **kwargs) -> requests.Response:
+    backoff = 1.0
+    for _ in range(5):
+        try:
+            r = SESSION.request(method, url, timeout=20, **kwargs)
+            # retry 5xx and transient 4xx from data feed
+            if r.status_code >= 500:
+                raise requests.HTTPError(f"{r.status_code} {r.text}")
+            return r
+        except Exception:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+    raise RuntimeError(f"HTTP failed after retries: {method} {url}")
 
-SESSION = _retrying_session()
-
-# -------- env / endpoints ----------
-ALPACA_BASE = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-ALPACA_DATA = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-KEY = os.environ["ALPACA_API_KEY"]
-SEC = os.environ["ALPACA_API_SECRET"]
-
-HDR = {
-    "APCA-API-KEY-ID": KEY,
-    "APCA-API-SECRET-KEY": SEC,
-    "accept": "application/json",
-}
-
-# -------- data helpers ----------
-def latest_price(ticker: str) -> float:
-    """Return the latest trade price from Alpaca Data API."""
-    r = SESSION.get(
-        f"{ALPACA_DATA}/v2/stocks/{ticker}/trades/latest",
-        headers=HDR,
-        timeout=15,
-    )
+# ---------- Trading API ----------
+def list_positions() -> List[Dict[str, Any]]:
+    r = _http("GET", f"{ALPACA_BASE_URL}/v2/positions")
     r.raise_for_status()
-    px = r.json().get("trade", {}).get("p")
-    if not px:
-        raise RuntimeError(f"No last trade for {ticker}")
-    return float(px)
+    return r.json()
 
+def list_orders(status: str = "all", nested: bool = True, limit: int = 200, after: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    params = {"status": status, "limit": str(limit), "nested": "true" if nested else "false"}
+    if after:
+        params["after"] = after.isoformat()
+    r = _http("GET", f"{ALPACA_BASE_URL}/v2/orders", params=params)
+    r.raise_for_status()
+    return r.json()
 
-# -------- order helper ----------
-def place_marketable_limit(
-    symbol: str,
-    side: str,
-    qty: int,
-    pad_up: float = 1.05,
-    pad_down: float = 0.95,
-    extended_hours: bool = True,
-):
-    """
-    Submit a DAY + LIMIT 'marketable' order that works during RTH and extended hours.
-    We compute a limit just beyond the last trade (buy: above / sell: below).
+def cancel_order(order_id: str) -> requests.Response:
+    return _http("DELETE", f"{ALPACA_BASE_URL}/v2/orders/{order_id}")
 
-    Returns a dict with:
-      http_status, json (response JSON or None), text (raw text),
-      last (float), limit_price (float)
-    """
-    side = side.lower().strip()
-    assert side in ("buy", "sell"), f"invalid side: {side}"
+def submit_order(payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = _http("POST", f"{ALPACA_BASE_URL}/v2/orders", data=json.dumps(payload))
+    r.raise_for_status()
+    return r.json()
 
-    last = latest_price(symbol)
+# ---------- Market Data ----------
+def get_bars(symbol: str, timeframe: str, start: datetime, end: datetime, limit: int = 400) -> List[Dict[str, Any]]:
+    """Tries configured feed then falls back to IEX if needed."""
+    feeds = [ALPACA_DATA_FEED] + (["iex"] if ALPACA_DATA_FEED.lower() != "iex" else [])
+    last_err = None
+    for feed in feeds:
+        params = {
+            "timeframe": timeframe,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "limit": limit,
+            "adjustment": "split",
+            "feed": feed,
+        }
+        r = _http("GET", f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars", params=params)
+        if r.status_code == 403:
+            last_err = RuntimeError(f"403 on feed '{feed}' — not enabled")
+            continue
+        try:
+            r.raise_for_status()
+            js = r.json()
+            bars = js.get("bars", [])
+            if not bars:
+                last_err = RuntimeError(f"no bars for {symbol} on feed={feed}")
+                continue
+            return bars
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"bar fetch failed for {symbol}: {last_err}")
 
-    # compute marketable limit
-    limit_price = last * (pad_up if side == "buy" else pad_down)
-    # round to cents
-    limit_price = round(limit_price + 1e-9, 2)
-
-    payload = {
-        "symbol": symbol,
-        "qty": qty,
-        "side": side,
-        "type": "limit",
-        "limit_price": limit_price,
-        "time_in_force": "day",
-        "extended_hours": bool(extended_hours),
-    }
-
-    r = SESSION.post(
-        f"{ALPACA_BASE}/v2/orders",
-        json=payload,
-        headers={**HDR, "content-type": "application/json"},
-        timeout=20,
-    )
-
-    text = r.text
-    data = None
-    try:
-        data = r.json()
-    except Exception:
-        pass
-
-    log.info(
-        "alpaca order -> %s | last=%.2f lim=%.2f | %s",
-        r.status_code,
-        last,
-        limit_price,
-        text[:500],
-    )
-
-    return {
-        "http_status": r.status_code,
-        "json": data,
-        "text": text,
-        "last": last,
-        "limit_price": limit_price,
-    }
+# ---------- Utils ----------
+def quantize_price(price: float, tick: Decimal = Decimal("0.01")) -> float:
+    return float(Decimal(str(price)).quantize(tick, rounding=ROUND_HALF_UP))
