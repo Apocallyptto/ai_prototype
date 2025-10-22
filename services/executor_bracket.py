@@ -51,7 +51,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # Reuse your submission logic (no duplication)
-from services.bracket_helper import submit_bracket, list_open_orders
+from services.bracket_helper import submit_bracket
 
 # -------------------- Config -------------------- #
 
@@ -101,43 +101,27 @@ def _pg_conn():
     port = int(os.getenv("PGPORT", "5432"))
     return psycopg2.connect(host=host, user=user, password=pwd, dbname=db, port=port)
 
-def fetch_signals(since_days: int, min_strength: float, portfolio_id: int | None):
-    import os
-    if os.getenv("DISABLE_DB_SIGNALS", "0").lower() in {"1", "true", "yes"}:
-        print("INFO executor_bracket | DB signals disabled by env; returning empty list.")
-        return []
-
-    try:
-        import psycopg2
-        from datetime import datetime, timedelta, timezone
-        since = (datetime.now(timezone.utc) - timedelta(days=int(since_days)))
-
-        conn = psycopg2.connect(
-            host=os.getenv("PGHOST", "localhost"),
-            dbname=os.getenv("PGDATABASE", "trader"),
-            user=os.getenv("PGUSER", "postgres"),
-            password=os.getenv("PGPASSWORD", "postgres"),
-            port=int(os.getenv("PGPORT", "5432")),
-        )
-        with conn, conn.cursor() as cur:
-            sql = """
-                SELECT DISTINCT ON (ticker, side)
-                       ticker, side, strength, created_at AS ts
-                FROM signals
-                WHERE created_at >= %s
-                  AND strength >= %s
-                  AND (%s IS NULL OR portfolio_id = %s)
-                ORDER BY ticker, side, created_at DESC
-                LIMIT 1000
-            """
-            cur.execute(sql, (since, float(min_strength), portfolio_id, portfolio_id))
-            rows = cur.fetchall()
-        return rows
-    except Exception as e:
-        print(f"ERROR executor_bracket | fetch_signals failed: {e} — returning empty list.")
-        return []
-
-
+def fetch_signals(since_days: int, min_strength: float, portfolio_id: int) -> List[Tuple[str, str, float, datetime]]:
+    """
+    Returns list of (symbol, side, strength, ts) filtered by window/strength/portfolio,
+    most recent first.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    sql = """
+        SELECT symbol, side, strength, ts
+        FROM signals
+        WHERE ts >= %s
+          AND strength >= %s
+          AND portfolio_id = %s
+          AND UPPER(symbol) = UPPER(symbol)  -- passthrough, placeholder for future filters
+        ORDER BY ts DESC
+    """
+    out: List[Tuple[str, str, float, datetime]] = []
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (since, float(min_strength), int(portfolio_id)))
+        for symbol, side, strength, ts in cur.fetchall():
+            out.append((symbol.upper(), side.lower(), float(strength), ts))
+    return out
 
 # -------------------- Alpaca order lookups -------------------- #
 
