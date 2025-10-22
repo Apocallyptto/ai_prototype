@@ -1,8 +1,7 @@
 # jobs/train_nn.py
 from __future__ import annotations
-import os, json, math, random, time
-from dataclasses import dataclass
-from typing import List, Tuple, Dict
+import os, json, random
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,7 +50,9 @@ def _bars_yf(symbol: str, days: int) -> pd.DataFrame:
         raise RuntimeError(f"yfinance empty for {symbol}")
     df = df.tz_localize("UTC") if df.index.tz is None else df.tz_convert("UTC")
     df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}, inplace=True)
-    return df[["open","high","low","close","volume"]]
+    df = df[["open","high","low","close","volume"]]
+    df = df[~df.index.duplicated(keep="last")]
+    return df
 
 def _bars_alpaca(symbol: str, days: int) -> pd.DataFrame:
     try:
@@ -66,7 +67,9 @@ def _bars_alpaca(symbol: str, days: int) -> pd.DataFrame:
     df.rename(columns={"t":"timestamp","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df.set_index("timestamp", inplace=True)
-    return df[["open","high","low","close","volume"]]
+    df = df[["open","high","low","close","volume"]]
+    df = df[~df.index.duplicated(keep="last")]
+    return df
 
 def fetch_bars(symbol: str, days: int) -> pd.DataFrame:
     if not USE_YF:
@@ -80,8 +83,20 @@ def fetch_bars(symbol: str, days: int) -> pd.DataFrame:
 # =========================
 # Feature engineering
 # =========================
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    """
+    Robust 1-D float Series extractor.
+    Handles cases where df[name] is a DataFrame with shape (N,1) or object arrays.
+    """
+    s = df[name]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    # make sure it's 1-D numeric
+    arr = np.asarray(s).reshape(-1)
+    return pd.Series(pd.to_numeric(arr, errors="coerce"), index=df.index, dtype="float64")
+
 def _ema(s: pd.Series, span: int) -> pd.Series:
-    s = pd.Series(s, index=s.index)  # force Series
+    s = pd.Series(s, index=s.index)
     return s.ewm(span=span, adjust=False, min_periods=span).mean()
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -107,12 +122,11 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
 
 def _session_flags(index: pd.DatetimeIndex) -> pd.Series:
-    # RTH for US: 13:30–20:00 UTC approx
     idx = index.tz_convert("UTC")
     hour = idx.hour
     minute = idx.minute
     hm = hour*60 + minute
-    return ((hm >= 13*60+30) & (hm <= 20*60+0)).astype(float)  # 1.0 RTH, 0.0 ETH
+    return ((hm >= 13*60+30) & (hm <= 20*60)).astype(float)  # 1.0 RTH, 0.0 ETH
 
 def _time_sin_cos(index: pd.DatetimeIndex) -> pd.DataFrame:
     idx = index.tz_convert("UTC")
@@ -121,12 +135,12 @@ def _time_sin_cos(index: pd.DatetimeIndex) -> pd.DataFrame:
     return pd.DataFrame({"tod_sin": np.sin(angle), "tod_cos": np.cos(angle)}, index=index)
 
 def make_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure plain Series objects for arithmetic
-    open_  = pd.Series(df["open"],  index=df.index, dtype="float64")
-    high   = pd.Series(df["high"],  index=df.index, dtype="float64")
-    low    = pd.Series(df["low"],   index=df.index, dtype="float64")
-    close  = pd.Series(df["close"], index=df.index, dtype="float64")
-    volume = pd.Series(df["volume"],index=df.index, dtype="float64")
+    # Robustly extract columns as 1-D Series
+    open_  = _col(df, "open")
+    high   = _col(df, "high")
+    low    = _col(df, "low")
+    close  = _col(df, "close")
+    volume = _col(df, "volume")
 
     out = pd.DataFrame(index=df.index)
 
@@ -143,9 +157,10 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     out["ema21"] = ema21
     out["ema50"] = ema50
 
-    # EMA gaps (use local Series to avoid DataFrame alignment surprises)
-    out["ema_gap_9"]  = (close - ema9) / (close.replace(0, np.nan))
-    out["ema_gap_21"] = (close - ema21) / (close.replace(0, np.nan))
+    # EMA gaps
+    safe_close = close.replace(0, np.nan)
+    out["ema_gap_9"]  = (close - ema9) / safe_close
+    out["ema_gap_21"] = (close - ema21) / safe_close
 
     # RSI + norm
     rsi14 = _rsi(close, 14)
@@ -175,8 +190,7 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
 # Labeling (+HORIZON)
 # =========================
 def build_xy(df: pd.DataFrame, feats: pd.DataFrame, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
-    close = pd.Series(df["close"], index=df.index)
-    close = close.reindex(feats.index)
+    close = _col(df, "close").reindex(feats.index)
     fut = close.shift(-horizon)
     y = (fut > close).astype(np.float32).iloc[:-horizon]
     X = feats.iloc[:-horizon].copy()
@@ -195,7 +209,7 @@ class XYDataset(Dataset):
         return torch.from_numpy(self.X[i]), torch.tensor(self.y[i])
 
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: List[int] = [128, 64], dropout: float = 0.25):
+    def __init__(self, in_dim: int, hidden: List[int] = [192, 96, 48], dropout: float = 0.25):
         super().__init__()
         layers: List[nn.Module] = []
         d = in_dim
