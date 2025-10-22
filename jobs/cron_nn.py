@@ -1,55 +1,57 @@
 # jobs/cron_nn.py
 from __future__ import annotations
-import os, sys, time, subprocess
+
+import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timezone
-from typing import List
 
-SLEEP_SECONDS = int(os.getenv("CRON_SLEEP_SECONDS", "60"))
-SYMBOLS = os.getenv("CRON_SYMBOLS", "AAPL,MSFT,SPY")
-PY = sys.executable  # absolute path to the current python (may include spaces on Windows)
+PY = sys.executable
 
-def log(msg: str):
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
-    print(f"{ts} cron_nn | {msg}", flush=True)
+# cadence + universe
+SLEEP_SEC = int(os.getenv("CRON_SLEEP_SECONDS", "180"))
+SYMBOLS   = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
+MIN_STRENGTH = os.getenv("MIN_STRENGTH", "0.60")
 
-def run_argv(argv: List[str]) -> int:
-    """
-    Run a command using argv (list form). This avoids quoting issues
-    on Windows paths with spaces (e.g., Program Files).
-    """
-    log(f"run: {' '.join(argv)}")
-    p = subprocess.run(argv, capture_output=True, text=True)
-    if p.stdout:
-        print(p.stdout.rstrip())
-    if p.stderr:
-        # keep stderr visible; many libs print warnings here
-        print(p.stderr.rstrip(), file=sys.stderr)
+# choose which signals job to run
+# options: jobs.make_signals_ensemble | jobs.make_signals_nn | jobs.make_signals_ml
+SIGNAL_JOB = os.getenv("SIGNAL_JOB", "jobs.make_signals_ensemble")
+
+def ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
+
+def run_argv(argv: list[str]):
+    print(f"{ts()} cron_nn | run: {' '.join(argv)}", flush=True)
+    p = subprocess.Popen(argv)
+    p.wait()
     return p.returncode
 
 def main():
-    log(f"start loop symbols={SYMBOLS} sleep={SLEEP_SECONDS}s")
+    print(f"{ts()} cron_nn | start loop symbols={SYMBOLS} sleep={SLEEP_SEC}s", flush=True)
+    print(f"{ts()} cron_nn | signals via {SIGNAL_JOB} (MIN_STRENGTH={MIN_STRENGTH})", flush=True)
 
     while True:
-        # 1) Produce fresh NN signals (schema-aware insert)
-        run_argv([PY, "-m", "jobs.make_signals_nn"])
+        # 1) generate signals
+        run_argv([PY, "-m", SIGNAL_JOB])
 
-        # 2) Place bracket orders from signals (dedupe/wash-guard already in your executor)
-        min_strength = os.getenv("MIN_STRENGTH", "0.45")
-        run_argv([PY, "-m", "services.executor_bracket", "--since-days", "1", "--min-strength", str(min_strength)])
+        # 2) place brackets from DB signals (last 1 day, min strength = env)
+        run_argv([PY, "-m", "services.executor_bracket", "--since-days", "1", "--min-strength", MIN_STRENGTH])
 
-        # 3) Ensure exits for any filled positions (OCO TP/SL)
+        # 3) manage exits (idempotent)
         run_argv([PY, "-m", "jobs.manage_exits", "--symbols", SYMBOLS])
 
-        # 4) Reprice/cancel stale working orders (RTH/ETH thresholds)
+        # 4) refresh stale open limit parents
         run_argv([PY, "-m", "jobs.manage_stale_orders", "--symbols", SYMBOLS])
 
-        # 5) Sync orders table for the dashboard/analytics
+        # 5) sync order book -> Neon
         run_argv([PY, "-m", "tools.sync_orders"])
 
-        time.sleep(SLEEP_SECONDS)
+        # sleep to next tick
+        time.sleep(SLEEP_SEC)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        log("stopped by user")
+        print(f"{ts()} cron_nn | stopped by user", flush=True)
