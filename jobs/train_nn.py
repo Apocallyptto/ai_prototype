@@ -40,7 +40,6 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
 
-
 # =========================
 # Data access
 # =========================
@@ -55,7 +54,6 @@ def _bars_yf(symbol: str, days: int) -> pd.DataFrame:
     return df[["open","high","low","close","volume"]]
 
 def _bars_alpaca(symbol: str, days: int) -> pd.DataFrame:
-    # optional: use your Alpaca helper if present
     try:
         from lib.broker_alpaca import get_bars
     except Exception as e:
@@ -75,20 +73,19 @@ def fetch_bars(symbol: str, days: int) -> pd.DataFrame:
         try:
             return _bars_alpaca(symbol, days)
         except Exception:
-            # fallback to yfinance if allowed
             if not USE_YF:
                 raise
     return _bars_yf(symbol, days)
 
-
 # =========================
 # Feature engineering
-# (self-contained)
 # =========================
 def _ema(s: pd.Series, span: int) -> pd.Series:
+    s = pd.Series(s, index=s.index)  # force Series
     return s.ewm(span=span, adjust=False, min_periods=span).mean()
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    close = pd.Series(close, index=close.index)
     delta = close.diff()
     up = delta.clip(lower=0.0)
     down = -delta.clip(upper=0.0)
@@ -98,6 +95,9 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100.0 - 100.0 / (1.0 + rs)
 
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    high = pd.Series(high, index=high.index)
+    low  = pd.Series(low, index=low.index)
+    close = pd.Series(close, index=close.index)
     prev_close = close.shift(1)
     tr = pd.concat([
         high - low,
@@ -108,73 +108,81 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
 
 def _session_flags(index: pd.DatetimeIndex) -> pd.Series:
     # RTH for US: 13:30–20:00 UTC approx
-    hour = index.tz_convert("UTC").hour
-    minute = index.tz_convert("UTC").minute
+    idx = index.tz_convert("UTC")
+    hour = idx.hour
+    minute = idx.minute
     hm = hour*60 + minute
     return ((hm >= 13*60+30) & (hm <= 20*60+0)).astype(float)  # 1.0 RTH, 0.0 ETH
 
 def _time_sin_cos(index: pd.DatetimeIndex) -> pd.DataFrame:
-    # encode minutes-in-day as sin/cos
-    hour = index.tz_convert("UTC").hour
-    minute = index.tz_convert("UTC").minute
-    mins = hour*60 + minute
+    idx = index.tz_convert("UTC")
+    mins = idx.hour*60 + idx.minute
     angle = 2*np.pi * (mins / (24*60))
     return pd.DataFrame({"tod_sin": np.sin(angle), "tod_cos": np.cos(angle)}, index=index)
 
 def make_features(df: pd.DataFrame) -> pd.DataFrame:
-    # df columns: open, high, low, close, volume; index tz-aware UTC
+    # Ensure plain Series objects for arithmetic
+    open_  = pd.Series(df["open"],  index=df.index, dtype="float64")
+    high   = pd.Series(df["high"],  index=df.index, dtype="float64")
+    low    = pd.Series(df["low"],   index=df.index, dtype="float64")
+    close  = pd.Series(df["close"], index=df.index, dtype="float64")
+    volume = pd.Series(df["volume"],index=df.index, dtype="float64")
+
     out = pd.DataFrame(index=df.index)
 
-    # price relatives
-    out["ret1"] = df["close"].pct_change(1)
-    out["ret3"] = df["close"].pct_change(3)
-    out["ret6"] = df["close"].pct_change(6)
+    # returns
+    out["ret1"] = close.pct_change(1)
+    out["ret3"] = close.pct_change(3)
+    out["ret6"] = close.pct_change(6)
 
     # EMAs
-    out["ema9"]  = _ema(df["close"], 9)
-    out["ema21"] = _ema(df["close"], 21)
-    out["ema50"] = _ema(df["close"], 50)
-    out["ema_gap_9"]  = (df["close"] - out["ema9"]) / df["close"]
-    out["ema_gap_21"] = (df["close"] - out["ema21"]) / df["close"]
+    ema9  = _ema(close, 9)
+    ema21 = _ema(close, 21)
+    ema50 = _ema(close, 50)
+    out["ema9"]  = ema9
+    out["ema21"] = ema21
+    out["ema50"] = ema50
 
-    # RSI + normalized
-    out["rsi14"] = _rsi(df["close"], 14)
-    out["rsi_norm"] = (out["rsi14"] - 50.0) / 50.0
+    # EMA gaps (use local Series to avoid DataFrame alignment surprises)
+    out["ema_gap_9"]  = (close - ema9) / (close.replace(0, np.nan))
+    out["ema_gap_21"] = (close - ema21) / (close.replace(0, np.nan))
 
-    # ATR and ATR%
-    atr = _atr(df["high"], df["low"], df["close"], 14)
+    # RSI + norm
+    rsi14 = _rsi(close, 14)
+    out["rsi14"] = rsi14
+    out["rsi_norm"] = (rsi14 - 50.0) / 50.0
+
+    # ATR, ATR%
+    atr = _atr(high, low, close, 14)
     out["atr"] = atr
-    out["atr_pct"] = atr / (df["close"].abs() + 1e-9)
+    out["atr_pct"] = atr / (close.abs() + 1e-9)
 
-    # Volume features
-    vmean = df["volume"].rolling(50, min_periods=10).mean()
-    vstd  = df["volume"].rolling(50, min_periods=10).std()
-    out["vol_z"] = (df["volume"] - vmean) / (vstd + 1e-9)
+    # Volume zscore
+    vmean = volume.rolling(50, min_periods=10).mean()
+    vstd  = volume.rolling(50, min_periods=10).std()
+    out["vol_z"] = (volume - vmean) / (vstd + 1e-9)
 
-    # Time encodings
+    # Time encodings & session
     tod = _time_sin_cos(df.index)
     out = out.join(tod, how="left")
-
-    # Session flag
     out["is_rth"] = _session_flags(df.index)
 
-    # Drop early NaNs
-    out = out.dropna().astype("float32")
+    # Tidy
+    out = out.replace([np.inf, -np.inf], np.nan).dropna().astype("float32")
     return out
-
 
 # =========================
 # Labeling (+HORIZON)
 # =========================
 def build_xy(df: pd.DataFrame, feats: pd.DataFrame, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
-    close = df["close"].reindex(feats.index)
+    close = pd.Series(df["close"], index=df.index)
+    close = close.reindex(feats.index)
     fut = close.shift(-horizon)
-    y = (fut > close).astype(np.float32).iloc[:-horizon]  # 1 if up in +HORIZON bars
+    y = (fut > close).astype(np.float32).iloc[:-horizon]
     X = feats.iloc[:-horizon].copy()
     X = X.replace([np.inf, -np.inf], np.nan).dropna()
     y = y.loc[X.index]
     return X.values.astype("float32"), y.values.astype("float32")
-
 
 # =========================
 # Torch dataset / model
@@ -194,11 +202,10 @@ class MLP(nn.Module):
         for h in hidden:
             layers += [nn.Linear(d, h), nn.ReLU(), nn.Dropout(dropout)]
             d = h
-        layers += [nn.Linear(d, 1)]  # logits
+        layers += [nn.Linear(d, 1)]
         self.net = nn.Sequential(*layers)
     def forward(self, x):
         return self.net(x).squeeze(-1)  # logits
-
 
 # =========================
 # Training loop
@@ -221,7 +228,6 @@ def train_loop(model: nn.Module, train_loader: DataLoader, val_loader: DataLoade
             tr_loss += loss.item() * len(xb)
         tr_loss /= len(train_loader.dataset)
 
-        # val
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
@@ -249,13 +255,12 @@ def train_loop(model: nn.Module, train_loader: DataLoader, val_loader: DataLoade
     model.load_state_dict(best_state)
     return model
 
-
 # =========================
 # Build dataset across symbols
 # =========================
 def build_dataset(symbols: List[str], days: int, horizon: int) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     framesX = []; framesY = []
-    feat_names = None
+    feat_names: List[str] | None = None
 
     for sym in symbols:
         df = fetch_bars(sym, days)
@@ -272,7 +277,6 @@ def build_dataset(symbols: List[str], days: int, horizon: int) -> Tuple[np.ndarr
     X = np.vstack(framesX)
     y = np.concatenate(framesY)
     return X, y, feat_names
-
 
 # =========================
 # Main
