@@ -2,14 +2,13 @@
 from __future__ import annotations
 import os, json
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Sequence
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import torch
 import joblib
 
-# DB drivers (psycopg3 preferred, fall back to psycopg2)
 try:
     import psycopg  # psycopg3
     HAVE3 = True
@@ -18,23 +17,19 @@ except Exception:
     import psycopg2
 
 from lib.broker_alpaca import get_bars
-from ml.nn_train import make_features  # keep the exact same feature recipe
+from ml.nn_train import make_features  # keep feature recipe
 
-# ---- Config ----
-TIMEFRAME   = os.getenv("NN_TIMEFRAME", "5Min")
-OUTDIR      = os.getenv("NN_OUTDIR", "models")
-MODEL_PATH  = os.path.join(OUTDIR, "nn_5m.pt")
+TIMEFRAME = os.getenv("NN_TIMEFRAME", "5Min")
+OUTDIR = os.getenv("NN_OUTDIR", "models")
+MODEL_PATH = os.path.join(OUTDIR, "nn_5m.pt")
 SCALER_PATH = os.path.join(OUTDIR, "nn_5m_scaler.pkl")
-FEAT_JSON   = os.path.join(OUTDIR, "nn_5m_features.json")
-SYMBOLS     = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-PORTFOLIO_ID= int(os.getenv("PORTFOLIO_ID", "1"))
-MIN_STRENGTH= float(os.getenv("MIN_STRENGTH", "0.30"))
-
-# Allow yfinance fallback for inference too (optional)
+FEAT_JSON = os.path.join(OUTDIR, "nn_5m_features.json")
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+PORTFOLIO_ID = int(os.getenv("PORTFOLIO_ID", "1"))
+MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.30"))
 USE_YF = os.getenv("USE_YFINANCE_TRAIN", "0").lower() in {"1","true","yes","y"} or \
          os.getenv("USE_YFINANCE_INFER", "0").lower() in {"1","true","yes","y"}
 
-# ---- DB helpers ----
 def _pg_conn():
     dsn = os.getenv("DATABASE_URL")
     if HAVE3:
@@ -54,45 +49,13 @@ def _pg_conn():
             port=os.getenv("PGPORT","5432"),
         )
 
-def _signal_columns() -> set[str]:
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_name='signals'
-    """
+def insert_signal(symbol: str, side: str, strength: float, ts: datetime):
+    sql = "INSERT INTO signals (symbol, side, strength, ts, portfolio_id) VALUES (%s,%s,%s,%s,%s)"
     with _pg_conn() as c:
         with c.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-    # psycopg3 returns tuples, psycopg2 also returns tuples
-    return {r[0] for r in rows}
-
-def _insert_signal(symbol: str, side: str, strength: float, ts: datetime):
-    cols = _signal_columns()
-    # build column list dynamically
-    col_names: list[str] = ["symbol", "side", "strength"]
-    values: list[object] = [symbol, side, float(strength)]
-
-    # timestamp column name can vary
-    ts_col = "ts" if "ts" in cols else ("created_at" if "created_at" in cols else None)
-    if ts_col:
-        col_names.append(ts_col)
-        values.append(ts)
-
-    # optional portfolio_id
-    if "portfolio_id" in cols:
-        col_names.append("portfolio_id")
-        values.append(PORTFOLIO_ID)
-
-    placeholders = ",".join(["%s"]*len(values))
-    col_sql = ",".join(col_names)
-    sql = f"INSERT INTO signals ({col_sql}) VALUES ({placeholders})"
-    with _pg_conn() as c:
-        with c.cursor() as cur:
-            cur.execute(sql, tuple(values))
+            cur.execute(sql, (symbol, side, float(strength), ts, PORTFOLIO_ID))
         c.commit()
 
-# ---- Market data ----
 def _bars_yf(symbol: str) -> pd.DataFrame:
     import yfinance as yf
     df = yf.download(symbol, period="7d", interval="5m", progress=False, auto_adjust=False)
@@ -102,7 +65,7 @@ def _bars_yf(symbol: str) -> pd.DataFrame:
     df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}, inplace=True)
     return df[["open","high","low","close","volume"]]
 
-def _latest_features(symbol: str) -> Optional[np.ndarray]:
+def latest_features(symbol: str) -> Optional[np.ndarray]:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=7)
     try:
@@ -124,23 +87,19 @@ def _latest_features(symbol: str) -> Optional[np.ndarray]:
         return None
     return feats.iloc[-1:].values.astype("float32")
 
-# ---- Main ----
 def main():
     from ml.nn_model import MLP
-
-    # load artifacts
     ckpt = torch.load(MODEL_PATH, map_location="cpu")
     model = MLP(in_dim=ckpt["in_dim"])
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
     scaler = joblib.load(SCALER_PATH)
-    if os.path.exists(FEAT_JSON):
-        with open(FEAT_JSON, "r") as f:
-            _ = json.load(f)  # reserved for future checks
+    with open(FEAT_JSON, "r") as f:
+        _ = json.load(f)  # reserved for future feature alignment
 
     for sym in SYMBOLS:
-        x = _latest_features(sym)
+        x = latest_features(sym)
         if x is None:
             print(f"{sym}: no features")
             continue
@@ -151,10 +110,9 @@ def main():
             side, strength = "buy", p_up
         else:
             side, strength = "sell", 1.0 - p_up
-
         if strength >= MIN_STRENGTH:
             ts = datetime.now(timezone.utc)
-            _insert_signal(sym, side, strength, ts)
+            insert_signal(sym, side, strength, ts)
             print(f"{sym}: {side} strength={strength:.2f} at {ts.isoformat()}")
         else:
             print(f"{sym}: below MIN_STRENGTH ({strength:.2f} < {MIN_STRENGTH})")
