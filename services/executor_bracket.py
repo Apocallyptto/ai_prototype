@@ -101,25 +101,27 @@ def _pg_conn():
     port = int(os.getenv("PGPORT", "5432"))
     return psycopg2.connect(host=host, user=user, password=pwd, dbname=db, port=port)
 
-def fetch_signals(since_days: int, min_strength: float, portfolio_id: Optional[int]):
+def fetch_signals(since_days: int, min_strength: float, portfolio_id: int) -> List[Tuple[str, str, float, datetime]]:
+    """
+    Returns list of (symbol, side, strength, ts) filtered by window/strength/portfolio,
+    most recent first.
+    """
     since = datetime.now(timezone.utc) - timedelta(days=since_days)
     sql = """
-        SELECT DISTINCT ON (symbol, side)
-               symbol,
-               side,
-               strength,
-               created_at AS ts
+        SELECT symbol, side, strength, ts
         FROM signals
-        WHERE created_at >= %s
-          AND strength   >= %s
-          AND (portfolio_id = COALESCE(%s, portfolio_id))
-        ORDER BY symbol, side, created_at DESC
-        LIMIT 1000
+        WHERE ts >= %s
+          AND strength >= %s
+          AND portfolio_id = %s
+          AND UPPER(symbol) = UPPER(symbol)  -- passthrough, placeholder for future filters
+        ORDER BY ts DESC
     """
-    with psycopg2.connect(dsn=os.environ["DATABASE_URL"]) as conn, conn.cursor() as cur:
-        cur.execute(sql, (since, float(min_strength), None if portfolio_id in (None, "", "null") else int(portfolio_id)))
-        return cur.fetchall()
-
+    out: List[Tuple[str, str, float, datetime]] = []
+    with _pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (since, float(min_strength), int(portfolio_id)))
+        for symbol, side, strength, ts in cur.fetchall():
+            out.append((symbol.upper(), side.lower(), float(strength), ts))
+    return out
 
 # -------------------- Alpaca order lookups -------------------- #
 
