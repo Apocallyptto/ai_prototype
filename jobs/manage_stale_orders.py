@@ -1,26 +1,43 @@
 # jobs/manage_stale_orders.py
 from __future__ import annotations
+
 import os
-import sys
-import time
 import json
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import requests
 
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
-ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
-API_KEY = os.getenv("ALPACA_API_KEY")
-API_SECRET = os.getenv("ALPACA_API_SECRET")
+API_KEY = os.getenv("ALPACA_API_KEY", "")
+API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
-REPRICE_RTH_SEC = int(os.getenv("REPRICE_RTH_SEC", "60"))
-REPRICE_ETH_SEC = int(os.getenv("REPRICE_ETH_SEC", "180"))
-PRICE_PAD_CENTS = int(os.getenv("PRICE_PAD_CENTS", "2"))
-MAX_REPRICES_PER_ORDER = int(os.getenv("MAX_REPRICES_PER_ORDER", "3"))
-EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "false").lower() in {"1", "true", "yes", "y"}
+# -------- Behavior knobs --------
+# Mode affects default age threshold (ETH typically slower fills)
+MODE = os.getenv("STALE_MODE", os.getenv("MODE", "ETH")).upper()  # "RTH" or "ETH"
+FEED = os.getenv("ALPACA_DATA_FEED", "iex")
+
+# Reprice when order age >= threshold
+REPRICE_THRESHOLD_SECONDS_RTH = int(os.getenv("REPRICE_THRESHOLD_SECONDS_RTH", "60"))
+REPRICE_THRESHOLD_SECONDS_ETH = int(os.getenv("REPRICE_THRESHOLD_SECONDS_ETH", "180"))
+
+# NEW: Cool-down so we don't churn on tiny quote wiggles
+MIN_COOLDOWN_SEC = int(os.getenv("REPRICE_MIN_COOLDOWN_SEC", "45"))
+
+# Only reprice if the limit is "far" from the quote mid by more than this pct
+# Example: 0.001 => 0.10% away from mid
+REPRICE_AWAY_PCT = float(os.getenv("REPRICE_AWAY_PCT", "0.001"))
+
+# Safety: don't reprice more frequently than this per order (hard floor)
+PER_ORDER_MIN_SECONDS = int(os.getenv("PER_ORDER_MIN_SECONDS", "30"))
+
+# Where to peg the new price:
+#   For buys => min(ask, last) + SLIPPAGE_TICKS * tick
+#   For sells => max(bid, last) - SLIPPAGE_TICKS * tick
+SLIPPAGE_TICKS = int(os.getenv("SLIPPAGE_TICKS", "0"))
+DEFAULT_TICK = float(os.getenv("DEFAULT_TICK", "0.01"))
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 SESSION = requests.Session()
@@ -31,243 +48,226 @@ SESSION.headers.update({
 })
 
 def log(msg: str, level: str = "INFO"):
-    levels = ["DEBUG", "INFO", "WARN", "ERROR"]
-    if levels.index(level) >= levels.index(LOG_LEVEL):
+    order = ["DEBUG", "INFO", "WARN", "ERROR"]
+    if order.index(level) >= order.index(LOG_LEVEL):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
-        print(f"{ts} {level} manage_stale | {msg}")
+        print(f"{ts} {level} manage_stale | {msg}", flush=True)
 
-def http(method: str, url: str, **kwargs):
-    for attempt in range(5):
+def _http(method: str, url: str, **kwargs) -> requests.Response:
+    for attempt in range(4):
         try:
-            resp = SESSION.request(method, url, timeout=15, **kwargs)
-            if resp.status_code >= 500:
-                raise requests.HTTPError(f"{resp.status_code} {resp.text}")
-            return resp
+            r = SESSION.request(method, url, timeout=15, **kwargs)
+            if r.status_code >= 500:
+                raise requests.HTTPError(f"{r.status_code} {r.text}")
+            return r
         except Exception as e:
             wait = min(2 ** attempt, 8)
-            log(f"HTTP error {e} -> retrying in {wait}s", level="WARN")
+            log(f"HTTP {method} {url} failed: {e} -> retry {wait}s", "WARN")
             time.sleep(wait)
     raise RuntimeError(f"HTTP failed after retries: {method} {url}")
 
-# ---- Alpaca helpers ----
-
-def get_clock() -> dict:
-    r = http("GET", f"{ALPACA_BASE_URL}/v2/clock")
-    r.raise_for_status()
-    return r.json()
-
-def is_rth_now() -> bool:
-    try:
-        clock = get_clock()
-        return bool(clock.get("is_open"))
-    except Exception as e:
-        log(f"clock check failed: {e}", level="WARN")
-        # If uncertain, assume RTH so we reprice more responsively
-        return True
-
-def list_open_orders(symbols: Optional[List[str]] = None) -> List[dict]:
-    url = f"{ALPACA_BASE_URL}/v2/orders?status=open&nested=true"
-    if symbols:
-        url += f"&symbols={','.join(symbols)}"
-    r = http("GET", url)
-    r.raise_for_status()
-    return r.json()
-
-def cancel_order(order_id: str):
-    r = http("DELETE", f"{ALPACA_BASE_URL}/v2/orders/{order_id}")
-    if r.status_code not in (200, 204):
-        log(f"cancel failed {order_id}: {r.status_code} {r.text}", level="WARN")
-    return r
-
-def place_order(
-    symbol: str,
-    side: str,
-    qty: str,
-    tif: str,
-    order_type: str,
-    limit_price: Optional[str],
-    stop_price: Optional[str],
-    client_id: str,
-):
-    payload = {
-        "symbol": symbol,
-        "side": side,
-        "qty": qty,
-        "time_in_force": tif,
-        "type": order_type,
-        "client_order_id": client_id,
-        "extended_hours": EXTENDED_HOURS,
-    }
-    if order_type in ("limit", "stop_limit") and limit_price is not None:
-        payload["limit_price"] = limit_price
-    if order_type in ("stop", "stop_limit") and stop_price is not None:
-        payload["stop_price"] = stop_price
-
-    r = http("POST", f"{ALPACA_BASE_URL}/v2/orders", data=json.dumps(payload))
-    if r.status_code >= 300:
-        log(f"repost failed: {r.status_code} {r.text}", level="WARN")
-    return r
-
-# ---- Data helpers ----
-
-def _q2(price: float) -> str:
-    return str(Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
-def latest_quote(symbol: str) -> Optional[dict]:
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/quotes/latest"
-    r = http("GET", url, params={"feed": ALPACA_DATA_FEED})
-    if r.status_code == 403 and ALPACA_DATA_FEED.lower() != "iex":
-        # Fallback to iex if current feed is not allowed
-        r = http("GET", url, params={"feed": "iex"})
-    if r.status_code >= 300:
-        log(f"quote fetch failed for {symbol}: {r.status_code} {r.text}", level="WARN")
+def _iso_to_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
         return None
     try:
-        js = r.json()
-        return js.get("quote") or js
-    except Exception as e:
-        log(f"quote json parse failed for {symbol}: {e}", level="WARN")
-        return None
-
-def calc_new_limit(symbol: str, side: str, order_type: str) -> Optional[str]:
-    q = latest_quote(symbol)
-    if not q:
-        return None
-    # Common Alpaca fields: bp/ap (best bid/ask), lp (last price)
-    bid = float(q.get("bp") or q.get("bid_price") or 0)
-    ask = float(q.get("ap") or q.get("ask_price") or 0)
-    last = float(q.get("lp") or q.get("last") or 0)
-    pad = PRICE_PAD_CENTS / 100.0
-
-    if order_type == "limit":
-        if side == "buy":
-            target = ask if ask > 0 else (last + pad)
-            return _q2(target)
-        else:
-            target = bid if bid > 0 else (last - pad)
-            return _q2(target)
-
-    # For stop-limit, we adjust only the limit leg; leave stop untouched
-    if order_type == "stop_limit":
-        if side == "buy":
-            target = max(ask, last + pad) if ask > 0 else (last + pad)
-            return _q2(target)
-        else:
-            target = min(bid, last - pad) if bid > 0 else (last - pad)
-            return _q2(target)
-
-    return None
-
-# ---- Reprice bookkeeping ----
-
-def parse_reprice_count(client_order_id: str) -> int:
-    # Only count if '-RP' appears; otherwise 0
-    if "-RP" not in client_order_id:
-        return 0
-    parts = client_order_id.split("-RP")
-    try:
-        tail = parts[1] if len(parts) > 1 else ""
-        digits = []
-        for ch in tail:
-            if ch.isdigit():
-                digits.append(ch)
-            else:
-                break
-        return int("".join(digits)) if digits else 0
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
-        return 0
+        return None
 
-# ---- Main logic ----
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-def manage_stale(symbols: Optional[List[str]] = None):
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError("ALPACA_API_KEY/SECRET missing in env")
+def _threshold_sec() -> int:
+    return REPRICE_THRESHOLD_SECONDS_RTH if MODE == "RTH" else REPRICE_THRESHOLD_SECONDS_ETH
 
-    rth = is_rth_now()
-    threshold = REPRICE_RTH_SEC if rth else REPRICE_ETH_SEC
-    log(f"mode={'RTH' if rth else 'ETH'} threshold={threshold}s feed={ALPACA_DATA_FEED}")
+def _tick_size(symbol: str) -> float:
+    # If you want per-symbol ticks later, plug a map here.
+    return DEFAULT_TICK
 
-    orders = list_open_orders(symbols)
-    if not orders:
-        log("No open orders to manage.")
-        return
+def _get_quote(symbol: str) -> Optional[dict]:
+    # Alpaca v2 market data (free) — use 'iex' unless you pay for 'sip'
+    # https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest?feed=iex
+    try:
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest"
+        r = _http("GET", url, params={"feed": FEED})
+        if r.status_code != 200:
+            return None
+        return r.json().get("quote")
+    except Exception:
+        return None
 
-    now = datetime.now(timezone.utc)
+def _get_last(symbol: str) -> Optional[float]:
+    try:
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest"
+        r = _http("GET", url, params={"feed": FEED})
+        if r.status_code != 200:
+            return None
+        t = r.json().get("trade")
+        if not t:
+            return None
+        return float(t.get("p", 0) or 0)
+    except Exception:
+        return None
 
-    for o in orders:
-        # Skip OCO/bracket/child orders — only reprice standalone entries/adjustments
-        if (o.get("order_class") in ("oco", "bracket")) or o.get("parent_order_id") or o.get("legs"):
+def _quote_mid(symbol: str) -> Optional[float]:
+    q = _get_quote(symbol)
+    if not q:
+        return _get_last(symbol)
+    bid = float(q.get("bp", 0) or 0)
+    ask = float(q.get("ap", 0) or 0)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return _get_last(symbol)
+
+def _list_open_orders(symbols: Optional[List[str]]) -> List[dict]:
+    # Returns open, top-level orders (parents and any single orders)
+    params = {"status": "open", "nested": "false", "limit": 500}
+    if symbols:
+        params["symbols"] = ",".join(symbols)
+    r = _http("GET", f"{ALPACA_BASE_URL}/v2/orders", params=params)
+    r.raise_for_status()
+    return r.json()
+
+def _cancel_order(order_id: str) -> bool:
+    r = _http("DELETE", f"{ALPACA_BASE_URL}/v2/orders/{order_id}")
+    # 204 normally
+    if r.status_code not in (200, 204):
+        log(f"cancel {order_id} -> {r.status_code} {r.text}", "WARN")
+    return r.status_code in (200, 204)
+
+def _submit_replacement(o: dict, new_limit: float) -> Optional[dict]:
+    # Re-post a similar parent (or single) with updated limit
+    payload = {
+        "symbol": o.get("symbol"),
+        "side": o.get("side"),
+        "type": "limit",
+        "qty": o.get("qty", "1"),
+        "time_in_force": o.get("time_in_force", "day"),
+        "extended_hours": bool(o.get("extended_hours", False)),
+        "limit_price": f"{new_limit:.2f}",
+        # Mark as a replacement to help dedupe/analytics
+        "client_order_id": f"REPRICE-{o.get('symbol')}-{int(time.time())}"
+    }
+    # Preserve order_class only for non-brackets (we *never* rebuild bracket children here)
+    oc = o.get("order_class")
+    if oc and oc != "bracket":
+        payload["order_class"] = oc
+
+    r = _http("POST", f"{ALPACA_BASE_URL}/v2/orders", data=json.dumps(payload))
+    if r.status_code >= 300:
+        log(f"repost failed: {r.status_code} {r.text}", "ERROR")
+        return None
+    return r.json()
+
+def _is_parent_bracket(o: dict) -> bool:
+    return (o.get("order_class") == "bracket") and (not o.get("parent_order_id"))
+
+def _is_child_of_bracket(o: dict) -> bool:
+    return (o.get("order_class") == "bracket") and bool(o.get("parent_order_id"))
+
+def _should_consider(o: dict) -> bool:
+    # Consider only top-level **limit** orders we created as parents (either bracket parents or vanilla limit)
+    if o.get("status") != "open":
+        return False
+    if (o.get("type") or "").lower() != "limit":
+        return False
+    if _is_child_of_bracket(o):
+        return False  # let the parent logic manage children
+    return True
+
+def _price(o: dict, key: str) -> Optional[float]:
+    v = o.get(key)
+    try:
+        return None if v in (None, "") else float(v)
+    except Exception:
+        return None
+
+def _compute_new_limit(symbol: str, side: str, current_limit: float) -> Optional[float]:
+    mid = _quote_mid(symbol)
+    if not mid or mid <= 0:
+        return None
+    away = abs(current_limit - mid) / mid
+    if away < REPRICE_AWAY_PCT:
+        return None  # close enough; no need to churn
+
+    tick = _tick_size(symbol)
+    last = _get_last(symbol) or mid
+    if side == "buy":
+        peg = min(last, mid) + SLIPPAGE_TICKS * tick
+        return round(peg / tick) * tick
+    else:
+        peg = max(last, mid) - SLIPPAGE_TICKS * tick
+        return round(peg / tick) * tick
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbols", required=False, help="Comma-separated tickers, optional")
+    args = ap.parse_args()
+    syms = None
+    if args.symbols:
+        syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    threshold = _threshold_sec()
+    log(f"mode={MODE} threshold={threshold}s feed={FEED}")
+
+    opened = _list_open_orders(syms)
+    now = _now()
+    acted = 0
+
+    for o in opened:
+        if not _should_consider(o):
             continue
 
-        typ = (o.get("type") or o.get("order_type") or "").lower()
-        if typ not in ("limit", "stop_limit"):
-            continue
-        if o.get("status") not in ("new", "accepted", "open", "partially_filled"):
+        symbol = o.get("symbol")
+        side = (o.get("side") or "").lower()  # 'buy'/'sell'
+        if not symbol or side not in ("buy", "sell"):
             continue
 
-        # Age
-        created = o.get("created_at") or o.get("submitted_at")
-        try:
-            created_dt = datetime.fromisoformat((created or "").replace("Z", "+00:00"))
-        except Exception:
-            created_dt = now - timedelta(hours=1)
+        created_dt = _iso_to_dt(o.get("created_at")) or now
+        updated_dt = _iso_to_dt(o.get("updated_at")) or created_dt
+        submitted_dt = _iso_to_dt(o.get("submitted_at")) or created_dt
+
         age = (now - created_dt).total_seconds()
+
+        # -------- NEW: Cool-down guard (prevents flapping) --------
+        last_update = _iso_to_dt(o.get("updated_at")) or _iso_to_dt(o.get("created_at")) or _iso_to_dt(o.get("submitted_at")) or created_dt
+        cool = (now - last_update).total_seconds()
+        if cool < MIN_COOLDOWN_SEC:
+            # too fresh to touch
+            continue
+        # -------- END Cool-down guard --------
+
+        # Hard floor so we don't touch hyper-fresh orders even if created_at parsing was odd
+        if (now - submitted_dt).total_seconds() < PER_ORDER_MIN_SECONDS:
+            continue
+
         if age < threshold:
             continue
 
-        # Reprice count guard
-        cid = o.get("client_order_id", "")
-        rp_count = parse_reprice_count(cid)
-        if rp_count >= MAX_REPRICES_PER_ORDER:
-            log(f"{o['symbol']} order {o['id']} hit max reprice count; skipping.")
+        limit_px = _price(o, "limit_price")
+        if not limit_px or limit_px <= 0:
             continue
 
-        new_limit = calc_new_limit(o["symbol"], o["side"], typ)
-        if not new_limit:
-            log(f"{o['symbol']} unable to compute new limit; skipping.")
+        # Decide if price is far enough from mid to bother
+        new_limit = _compute_new_limit(symbol, side, limit_px)
+        if new_limit is None or abs(new_limit - limit_px) < 1e-9:
+            continue  # close enough; skip
+
+        # Cancel + repost
+        if not _cancel_order(o["id"]):
+            # If cancel failed (race with fill or already canceled), skip
             continue
 
-        log(f"Repricing {o['symbol']} {typ} {o['side']} qty={o['qty']} age={int(age)}s -> new limit {new_limit}")
-        # Cancel old
-        cancel_order(o["id"])
-        # Repost
-        new_cid = f"RP-{cid}-RP{rp_count+1}-{int(time.time())}"
-        place_order(
-            symbol=o["symbol"],
-            side=o["side"],
-            qty=o["qty"],
-            tif=o.get("time_in_force", "day"),
-            order_type=typ,
-            limit_price=new_limit,
-            stop_price=o.get("stop_price"),
-            client_id=new_cid,
-        )
+        new_o = _submit_replacement(o, new_limit)
+        if new_o:
+            acted += 1
+            log(f"{symbol} {side}: repriced {limit_px:.2f} -> {new_limit:.2f} (age={int(age)}s)")
 
-def print_state(symbols: Optional[List[str]] = None):
-    log("Clock/venue state:")
-    try:
-        log(json.dumps(get_clock(), indent=2))
-    except Exception as e:
-        log(f"clock fetch failed: {e}", level="WARN")
-    log("Open orders:")
-    try:
-        js = list_open_orders(symbols)
-        log(json.dumps(js, indent=2))
-    except Exception as e:
-        log(f"list_open_orders failed: {e}", level="WARN")
-
-def parse_cli(argv: List[str]):
-    import argparse
-    ap = argparse.ArgumentParser(description="Manage stale open limit orders by cancel+reprice.")
-    ap.add_argument("--symbols", type=str, default="", help="Comma-separated whitelist, e.g., AAPL,MSFT,SPY")
-    ap.add_argument("--debug", action="store_true", help="Just print clock and open orders, no actions")
-    args = ap.parse_args(argv)
-    syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
-    return args, syms
+    if acted == 0:
+        log("no stale orders to reprice")
+    else:
+        log(f"repriced {acted} order(s)")
 
 if __name__ == "__main__":
-    args, symbols = parse_cli(sys.argv[1:])
-    if args.debug:
-        print_state(symbols)
-        sys.exit(0)
-    manage_stale(symbols)
+    main()
