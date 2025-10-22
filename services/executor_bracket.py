@@ -51,7 +51,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # Reuse your submission logic (no duplication)
-from services.bracket_helper import submit_bracket
+from services.bracket_helper import submit_bracket, list_open_orders
 
 # -------------------- Config -------------------- #
 
