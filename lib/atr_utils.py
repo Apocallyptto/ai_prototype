@@ -1,153 +1,92 @@
 # lib/atr_utils.py
 from __future__ import annotations
-import os, time
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Tuple, Optional, Dict
 
+import os
+import math
+from typing import List, Tuple, Optional, Literal
+from datetime import datetime, timezone
 import requests
-import pandas as pd
 
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
-API_KEY = os.getenv("ALPACA_API_KEY", "")
-API_SECRET = os.getenv("ALPACA_API_SECRET", "")
-ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")  # 'iex' for paper/free
+ALPACA_MARKET_BASE = "https://data.alpaca.markets"
+FEED = os.getenv("ALPACA_DATA_FEED", "iex")  # 'iex' (default) or 'sip'
+
+# Risk knobs (can be overridden by env)
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "1.2"))  # take-profit = entry +- ATR*mult
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.0"))  # stop-loss  = entry +- ATR*mult
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": API_SECRET,
     "Content-Type": "application/json",
+    # market data is public for free feed, but set keys if you have them to avoid rate limits
+    "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
+    "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "")
 })
 
-_cache: Dict[str, Tuple[float, float]] = {}  # key -> (atr_value, expires_epoch)
-
-
-def _http(method: str, url: str, **kwargs):
-    for attempt in range(5):
-        try:
-            r = SESSION.request(method, url, timeout=15, **kwargs)
-            if r.status_code >= 500:
-                raise requests.HTTPError(f"{r.status_code} {r.text}")
-            return r
-        except Exception:
-            time.sleep(min(2 ** attempt, 8))
-    raise RuntimeError(f"HTTP failed after retries: {method} {url}")
-
-
-def _quantize(price: float, tick: Decimal = Decimal("0.01")) -> float:
-    return float(Decimal(str(price)).quantize(tick, rounding=ROUND_HALF_UP))
-
-
-def get_last_price(symbol: str) -> float:
-    """Return latest trade price; fallback to last 1-min bar close if feed is restricted."""
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest"
-    r = _http("GET", url, params={"feed": ALPACA_DATA_FEED})
-    if r.status_code == 403:
-        now = datetime.now(timezone.utc)
-        start = now - timedelta(days=2)
-        bars_url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-        rb = _http("GET", bars_url, params={
-            "timeframe": "1Min",
-            "start": start.isoformat(),
-            "end": now.isoformat(),
-            "limit": 500,
-            "adjustment": "split",
-            "feed": "iex",
-        })
-        rb.raise_for_status()
-        bars = rb.json().get("bars", [])
-        if not bars:
-            raise RuntimeError(f"No bars for {symbol}")
-        return float(bars[-1]["c"])
+def _bars(symbol: str, timeframe: str = "5Min", limit: int = 200) -> List[dict]:
+    """
+    Fetch recent bars. timeframe one of: 1Min, 5Min, 15Min, 1Hour, 1Day.
+    Returns list of bars (each has t, o, h, l, c, v).
+    """
+    url = f"{ALPACA_MARKET_BASE}/v2/stocks/{symbol}/bars"
+    params = {"timeframe": timeframe, "limit": str(limit), "feed": FEED, "adjustment": "split"}
+    r = SESSION.get(url, params=params, timeout=15)
     r.raise_for_status()
-    return float(r.json()["trade"]["p"])
+    js = r.json()
+    return js.get("bars", []) or []
 
+def _last_trade_price(symbol: str) -> Optional[float]:
+    try:
+        url = f"{ALPACA_MARKET_BASE}/v2/stocks/{symbol}/trades/latest"
+        r = SESSION.get(url, params={"feed": FEED}, timeout=10)
+        r.raise_for_status()
+        t = r.json().get("trade")
+        if not t:
+            return None
+        return float(t.get("p", 0) or 0)
+    except Exception:
+        return None
 
-def _recent_bars(symbol: str, timeframe: str, lookback_days: int = 10, limit: int = 400) -> pd.DataFrame:
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=lookback_days)
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+def _true_ranges(bars: List[dict]) -> List[float]:
+    tr: List[float] = []
+    prev_close: Optional[float] = None
+    for b in bars:
+        h = float(b["h"]); l = float(b["l"]); c = float(b["c"])
+        if prev_close is None:
+            tr.append(h - l)
+        else:
+            tr.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
+        prev_close = c
+    return tr
 
-    def _get(feed: str):
-        return _http("GET", url, params={
-            "timeframe": timeframe,
-            "start": start.isoformat(),
-            "end": now.isoformat(),
-            "limit": limit,
-            "adjustment": "split",
-            "feed": feed,
-        })
-
-    last_err = None
-    feeds = [ALPACA_DATA_FEED] + ([] if ALPACA_DATA_FEED == "iex" else ["iex"])
-    for feed in feeds:
-        try:
-            r = _get(feed)
-            if r.status_code == 403:
-                last_err = RuntimeError(f"403 on feed '{feed}'")
-                continue
-            r.raise_for_status()
-            bars = r.json().get("bars", [])
-            if not bars:
-                last_err = RuntimeError("no bars")
-                continue
-            df = pd.DataFrame(bars)
-            df.rename(columns={"t": "ts", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}, inplace=True)
-            df["ts"] = pd.to_datetime(df["ts"], utc=True)
-            df.set_index("ts", inplace=True)
-            return df[["open", "high", "low", "close", "volume"]]
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"bar fetch failed for {symbol}: {last_err}")
-
-
-def _atr_from_df(df: pd.DataFrame, length: int) -> float:
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
-    prev_close = close.shift(1)
-    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / length, adjust=False).mean().dropna()
-    return float(atr.iloc[-1])
-
-
-def get_atr(symbol: str,
-            timeframe: str = os.getenv("ATR_TIMEFRAME", "5Min"),
-            length: int = int(os.getenv("ATR_LENGTH", "14")),
-            cache_sec: int = 60) -> float:
-    """Fetch ATR with a tiny TTL cache to avoid API spam."""
-    key = f"{symbol}|{timeframe}|{length}"
-    now = time.time()
-    hit = _cache.get(key)
-    if hit and hit[1] > now:
-        return hit[0]
-    df = _recent_bars(symbol, timeframe=timeframe)
-    val = _atr_from_df(df, length)
-    _cache[key] = (val, now + cache_sec)
-    return val
-
-
-def atr_targets(symbol: str,
-                side: str,
-                ref_price: Optional[float] = None,
-                mult_tp: float = float(os.getenv("ATR_MULT_TP_ENTRY", os.getenv("ATR_MULT_TP", "1.2"))),
-                mult_sl: float = float(os.getenv("ATR_MULT_SL_ENTRY", os.getenv("ATR_MULT_SL", "1.0"))),
-                timeframe: str = os.getenv("ATR_TIMEFRAME", "5Min"),
-                length: int = int(os.getenv("ATR_LENGTH", "14"))) -> Tuple[float, float]:
+def compute_atr(symbol: str, timeframe: str = "5Min", period: int = ATR_PERIOD) -> Tuple[Optional[float], Optional[float]]:
     """
-    Compute (tp, sl) off a reference price using ATR multiples.
-    Returns tick-quantized prices (0.01).
+    Returns (atr, last_price). If not enough bars, atr is None.
     """
-    if ref_price is None:
-        ref_price = get_last_price(symbol)
-    atr = get_atr(symbol, timeframe=timeframe, length=length)
+    bars = _bars(symbol, timeframe=timeframe, limit=max(2*period+2, 60))
+    if len(bars) < period + 1:
+        return (None, _last_trade_price(symbol))
+    tr = _true_ranges(bars)
+    if len(tr) < period:
+        return (None, _last_trade_price(symbol))
+    # Wilder's ATR (simple moving average over TR works fine for live usage)
+    atr = sum(tr[-period:]) / float(period)
+    last = float(bars[-1]["c"])
+    return (atr, last)
+
+def atr_tp_sl(entry: float, side: Literal["buy","sell"], atr: float,
+              tp_mult: float = ATR_TP_MULT, sl_mult: float = ATR_SL_MULT) -> Tuple[float, float]:
+    """
+    Compute (take_profit, stop_loss) from entry and ATR.
+    For BUY: TP=entry+atr*tp_mult, SL=entry-atr*sl_mult
+    For SELL: TP=entry-atr*tp_mult, SL=entry+atr*sl_mult
+    """
     if side == "buy":
-        tp = ref_price + mult_tp * atr
-        sl = ref_price - mult_sl * atr
-    else:  # 'sell' short
-        tp = ref_price - mult_tp * atr
-        sl = ref_price + mult_sl * atr
-    return _quantize(tp), _quantize(sl)
+        return (entry + atr*tp_mult, entry - atr*sl_mult)
+    else:
+        return (entry - atr*tp_mult, entry + atr*sl_mult)
+
+def round_to_tick(px: float, tick: float = 0.01) -> float:
+    if tick <= 0:
+        return px
+    return round(px / tick) * tick
