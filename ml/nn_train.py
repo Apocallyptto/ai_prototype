@@ -17,13 +17,14 @@ from ml.nn_model import MLP, TrainConfig, train_loop
 # ----------------- Config -----------------
 SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
 TIMEFRAME = os.getenv("NN_TIMEFRAME", "5Min")
-LOOKBACK_DAYS = int(os.getenv("NN_LOOKBACK_DAYS", "60"))   # history to fetch
-RET_HORIZON = int(os.getenv("NN_RET_HORIZON", "3"))        # bars ahead for label (e.g., 3 * 5m = 15m)
-RET_THRESH_BP = float(os.getenv("NN_RET_THRESH_BP", "5"))  # threshold in basis points for label
+LOOKBACK_DAYS = int(os.getenv("NN_LOOKBACK_DAYS", "60"))
+RET_HORIZON = int(os.getenv("NN_RET_HORIZON", "3"))
+RET_THRESH_BP = float(os.getenv("NN_RET_THRESH_BP", "5"))
 OUTDIR = os.getenv("NN_OUTDIR", "models")
 MODEL_PATH = os.path.join(OUTDIR, "nn_5m.pt")
 SCALER_PATH = os.path.join(OUTDIR, "nn_5m_scaler.pkl")
 FEAT_JSON = os.path.join(OUTDIR, "nn_5m_features.json")
+USE_YF = os.getenv("USE_YFINANCE_TRAIN", "0").lower() in {"1","true","yes","y"}
 
 os.makedirs(OUTDIR, exist_ok=True)
 
@@ -49,10 +50,10 @@ def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr = pd.concat([(high-low).abs(), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
-def _macd(close: pd.Series, f: int = 12, s: int = 26, sig: int = 9) -> Tuple[pd.Series, pd.Series]:
+def _macd(close: pd.Series, f: int = 12, s: int = 26, sig: int = 9):
     macd = _ema(close, f) - _ema(close, s)
     signal = _ema(macd, sig)
-    return macd, macd - signal  # macd, histogram
+    return macd, macd - signal
 
 def make_features(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
@@ -72,7 +73,6 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def label_forward_returns(df: pd.DataFrame, horizon: int, thresh_bp: float) -> pd.Series:
     fwd = df["close"].shift(-horizon) / df["close"] - 1.0
-    # label 1 if return > +thresh, 0 if < -thresh, drop otherwise (neutral zone)
     thr = thresh_bp / 10000.0
     y = pd.Series(np.nan, index=df.index)
     y[fwd > +thr] = 1.0
@@ -80,23 +80,43 @@ def label_forward_returns(df: pd.DataFrame, horizon: int, thresh_bp: float) -> p
     return y
 
 # ----------------- Data fetch -----------------
-def fetch_symbol_df(symbol: str) -> pd.DataFrame:
+def fetch_symbol_df_alpaca(symbol: str) -> pd.DataFrame:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=LOOKBACK_DAYS)
     bars = get_bars(symbol, TIMEFRAME, start, end, limit=10_000)
     df = pd.DataFrame(bars)
-    # broker_alpaca returns dicts with "t","o","h","l","c","v"
     df.rename(columns={"t":"timestamp","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df.set_index("timestamp", inplace=True)
     return df[["open","high","low","close","volume"]]
 
+def fetch_symbol_df_yf(symbol: str) -> pd.DataFrame:
+    import yfinance as yf
+    # 5m interval supports up to 60d history
+    df = yf.download(symbol, period=f"{LOOKBACK_DAYS}d", interval="5m", auto_adjust=False, progress=False)
+    if df.empty:
+        raise RuntimeError(f"yfinance returned empty data for {symbol}")
+    df = df.tz_localize("UTC") if df.index.tz is None else df.tz_convert("UTC")
+    df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}, inplace=True)
+    return df[["open","high","low","close","volume"]]
+
+def fetch_symbol_df(symbol: str) -> pd.DataFrame:
+    if USE_YF:
+        return fetch_symbol_df_yf(symbol)
+    try:
+        return fetch_symbol_df_alpaca(symbol)
+    except Exception as e:
+        print(f"[WARN] Alpaca fetch failed for {symbol}: {e}. Falling back to yfinance.")
+        return fetch_symbol_df_yf(symbol)
+
 def build_dataset(symbols: List[str]) -> tuple[np.ndarray, np.ndarray, list[str]]:
     X_list, y_list = [], []
+    # compute feature names from first symbol after fetching
+    first_df = fetch_symbol_df(symbols[0])
+    feat_names = list(make_features(first_df).columns)
     for sym in symbols:
         raw = fetch_symbol_df(sym)
         feats = make_features(raw)
-        # align labels to feats index
         y = label_forward_returns(raw.loc[feats.index], RET_HORIZON, RET_THRESH_BP)
         mask = y.notna()
         feats = feats[mask]
@@ -105,32 +125,24 @@ def build_dataset(symbols: List[str]) -> tuple[np.ndarray, np.ndarray, list[str]
         y_list.append(y.values.astype("float32"))
     X = np.vstack(X_list)
     y = np.concatenate(y_list)
-    feature_names = list(make_features(fetch_symbol_df(symbols[0])).columns)
-    return X, y, feature_names
+    return X, y, feat_names
 
 # ----------------- Train -----------------
 def main():
-    print(f"Training NN on {SYMBOLS} @ {TIMEFRAME}, lookback={LOOKBACK_DAYS}d, horizon={RET_HORIZON} bars")
+    print(f"Training NN on {SYMBOLS} @ {TIMEFRAME}, lookback={LOOKBACK_DAYS}d, horizon={RET_HORIZON} bars (USE_YF={USE_YF})")
     X, y, feat_names = build_dataset(SYMBOLS)
 
-    # scale
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X).astype("float32")
-
-    # drop NaNs if any crept in
     mask = np.isfinite(Xs).all(axis=1) & np.isfinite(y)
     Xs, y = Xs[mask], y[mask]
 
-    # balance info
     pos = float((y > 0.5).mean())
     print(f"class balance: pos={pos:.3f}, neg={1-pos:.3f}")
 
     Xtr, Xva, ytr, yva = train_test_split(Xs, y, test_size=0.2, random_state=42, stratify=(y>0.5))
-
-    Xtr_t = torch.from_numpy(Xtr)
-    ytr_t = torch.from_numpy(ytr)
-    Xva_t = torch.from_numpy(Xva)
-    yva_t = torch.from_numpy(yva)
+    Xtr_t = torch.from_numpy(Xtr); ytr_t = torch.from_numpy(ytr)
+    Xva_t = torch.from_numpy(Xva); yva_t = torch.from_numpy(yva)
 
     model = MLP(in_dim=Xtr_t.shape[1], dropout=0.10)
     cfg = TrainConfig(
@@ -142,6 +154,7 @@ def main():
     )
     train_loop(model, (Xtr_t, ytr_t), (Xva_t, yva_t), cfg)
 
+    os.makedirs(OUTDIR, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "in_dim": Xtr_t.shape[1]}, MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
     with open(FEAT_JSON, "w") as f:
