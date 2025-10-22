@@ -64,22 +64,18 @@ def _signal_columns() -> set[str]:
         with c.cursor() as cur:
             cur.execute(sql)
             rows = cur.fetchall()
-    # psycopg3 returns tuples, psycopg2 also returns tuples
     return {r[0] for r in rows}
 
 def _insert_signal(symbol: str, side: str, strength: float, ts: datetime):
     cols = _signal_columns()
-    # build column list dynamically
     col_names: list[str] = ["symbol", "side", "strength"]
     values: list[object] = [symbol, side, float(strength)]
 
-    # timestamp column name can vary
     ts_col = "ts" if "ts" in cols else ("created_at" if "created_at" in cols else None)
     if ts_col:
         col_names.append(ts_col)
         values.append(ts)
 
-    # optional portfolio_id
     if "portfolio_id" in cols:
         col_names.append("portfolio_id")
         values.append(PORTFOLIO_ID)
@@ -124,11 +120,15 @@ def _latest_features(symbol: str) -> Optional[np.ndarray]:
         return None
     return feats.iloc[-1:].values.astype("float32")
 
-# ---- Main ----
-def main():
-    from ml.nn_model import MLP
+# ---- Reusable predictor (NEW) ----
+def predict_for_symbols(symbols: Sequence[str]) -> dict[str, dict]:
+    """
+    Returns a dict like:
+       {'AAPL': {'side': 'buy', 'strength': 0.62}, ...}
+    Does NOT write to DB. Safe to import from other modules.
+    """
+    from ml.nn_model import MLP  # local import to keep module load light
 
-    # load artifacts
     ckpt = torch.load(MODEL_PATH, map_location="cpu")
     model = MLP(in_dim=ckpt["in_dim"])
     model.load_state_dict(ckpt["state_dict"])
@@ -136,13 +136,16 @@ def main():
 
     scaler = joblib.load(SCALER_PATH)
     if os.path.exists(FEAT_JSON):
-        with open(FEAT_JSON, "r") as f:
-            _ = json.load(f)  # reserved for future checks
+        try:
+            with open(FEAT_JSON, "r") as f:
+                _ = json.load(f)  # reserved for future validation
+        except Exception:
+            pass
 
-    for sym in SYMBOLS:
+    out: dict[str, dict] = {}
+    for sym in [s.strip().upper() for s in symbols if s and s.strip()]:
         x = _latest_features(sym)
         if x is None:
-            print(f"{sym}: no features")
             continue
         xs = scaler.transform(x).astype("float32")
         with torch.no_grad():
@@ -151,13 +154,23 @@ def main():
             side, strength = "buy", p_up
         else:
             side, strength = "sell", 1.0 - p_up
+        out[sym] = {"side": side, "strength": float(strength)}
+    return out
 
-        if strength >= MIN_STRENGTH:
+# ---- CLI main (kept as before) ----
+def main():
+    preds = predict_for_symbols(SYMBOLS)
+    for sym in SYMBOLS:
+        p = preds.get(sym)
+        if not p:
+            print(f"{sym}: no features")
+            continue
+        if p["strength"] >= MIN_STRENGTH:
             ts = datetime.now(timezone.utc)
-            _insert_signal(sym, side, strength, ts)
-            print(f"{sym}: {side} strength={strength:.2f} at {ts.isoformat()}")
+            _insert_signal(sym, p["side"], p["strength"], ts)
+            print(f"{sym}: {p['side']} strength={p['strength']:.2f} at {ts.isoformat()}")
         else:
-            print(f"{sym}: below MIN_STRENGTH ({strength:.2f} < {MIN_STRENGTH})")
+            print(f"{sym}: below MIN_STRENGTH ({p['strength']:.2f} < {MIN_STRENGTH})")
 
 if __name__ == "__main__":
     main()
