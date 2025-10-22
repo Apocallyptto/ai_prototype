@@ -3,8 +3,20 @@ Bracket helper
 
 - Builds and submits Alpaca bracket (parent + TP + SL).
 - Optional ATR-aware entry/TP/SL prices (env toggles).
-- Exposes a legacy-friendly `submit_bracket(...)` name so older
-  modules can `from services.bracket_helper import submit_bracket`.
+- Exposes a legacy-friendly `submit_bracket(...)` for older imports.
+
+Env of interest:
+  ALPACA_BASE_URL (default paper)
+  ALPACA_API_KEY / ALPACA_API_SECRET
+  EXTENDED_HOURS (true/false)
+
+  USE_ATR_ENTRY=1
+  ATR_MULT_TP_ENTRY, ATR_MULT_SL_ENTRY
+  ATR_TIMEFRAME (e.g., 5Min), ATR_LENGTH (e.g., 14)
+  ALPACA_DATA_URL (default https://data.alpaca.markets)
+  ALPACA_DATA_FEED (paper: iex)
+
+  PARENT_TYPE: 'limit' (default) or 'market'
 """
 
 from __future__ import annotations
@@ -13,7 +25,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
@@ -25,6 +37,9 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "false").lower() in {"1", "true", "yes", "y"}
+
+# Parent type default can be flipped via env
+DEFAULT_PARENT_TYPE = os.getenv("PARENT_TYPE", "limit").lower()  # 'limit' | 'market'
 
 # ATR knobs for entries (independent from exits manager)
 USE_ATR_ENTRY = os.getenv("USE_ATR_ENTRY", "0").lower() in {"1", "true", "yes", "y"}
@@ -46,7 +61,7 @@ _sess.headers.update(
 )
 
 def _http(method: str, url: str, **kwargs) -> requests.Response:
-    # small retry
+    # small retry for transient network/server hiccups
     for attempt in range(5):
         try:
             r = _sess.request(method, url, timeout=15, **kwargs)
@@ -65,14 +80,15 @@ def _q(x: float, tick: Decimal = Decimal("0.01")) -> float:
 # -------------------- (optional) ATR fetch --------------------
 
 def _recent_bars(symbol: str, timeframe: str, lookback_days: int = 10):
-    now = datetime.now(timezone.utc)
-    start = now.replace(microsecond=0)  # iso without micro-mess
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    start = (now - timedelta(days=lookback_days)).isoformat()
+    end = now.isoformat()
 
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
     params = {
         "timeframe": timeframe,
-        "start": (now.replace(microsecond=0) - 86400 * lookback_days).isoformat(),
-        "end": start.isoformat(),
+        "start": start,
+        "end": end,
         "limit": 400,
         "adjustment": "split",
         "feed": ALPACA_DATA_FEED,
@@ -83,7 +99,6 @@ def _recent_bars(symbol: str, timeframe: str, lookback_days: int = 10):
     bars = js.get("bars", [])
     if not bars:
         raise RuntimeError(f"No bars for {symbol}")
-    # convert to simple lists for ATR
     o = [float(b["o"]) for b in bars]
     h = [float(b["h"]) for b in bars]
     l = [float(b["l"]) for b in bars]
@@ -91,9 +106,7 @@ def _recent_bars(symbol: str, timeframe: str, lookback_days: int = 10):
     return o, h, l, c
 
 def _atr_from_ohlc(h, l, c, length: int) -> float:
-    # Wilder ATR (ema of True Range)
-    import math
-
+    # Wilder ATR (EMA of True Range)
     tr = []
     prev_c = None
     for hi, lo, cls in zip(h, l, c):
@@ -103,7 +116,6 @@ def _atr_from_ohlc(h, l, c, length: int) -> float:
             tr.append(max(hi - lo, abs(hi - prev_c), abs(lo - prev_c)))
         prev_c = cls
 
-    # EMA alpha = 1/length
     alpha = 1.0 / float(length)
     ema = None
     for v in tr:
@@ -125,7 +137,6 @@ class BracketIntent:
 
 def _infer_prices_with_atr(symbol: str, side: str):
     """Return (base, tp, sl) using ATR multiples off the latest close."""
-    # Get bars & ATR
     _o, h, l, c = _recent_bars(symbol, ATR_TIMEFRAME)
     atr = _atr_from_ohlc(h, l, c, ATR_LENGTH)
     last = float(c[-1])
@@ -150,7 +161,7 @@ def submit_bracket_entry(
     sl_price: Optional[float] = None,
     limit_price: Optional[float] = None,
     client_id: Optional[str] = None,
-    parent_type: str = "limit",  # 'market' or 'limit'
+    parent_type: str = None,  # 'market' or 'limit'
 ):
     """
     Core submitter. If USE_ATR_ENTRY=1 and any of tp/sl/limit are None,
@@ -158,6 +169,9 @@ def submit_bracket_entry(
     """
     if qty <= 0:
         raise ValueError("qty must be > 0")
+
+    if parent_type is None:
+        parent_type = DEFAULT_PARENT_TYPE
 
     base_q = None
     tp_q = tp_price
@@ -170,7 +184,6 @@ def submit_bracket_entry(
         sl_q = sl_q if sl_q is not None else sl_q2
         lim_q = lim_q if lim_q is not None else base_q
     else:
-        # when prices are provided, quantize to 0.01
         if tp_q is None or sl_q is None:
             raise ValueError("tp_price and sl_price are required when USE_ATR_ENTRY=0")
         tp_q = _q(tp_q)
@@ -228,7 +241,6 @@ def submit_bracket(
         client_id=client_id,
     )
 
-# Optional: tiny utility some modules import
 def list_open_orders(symbol: Optional[str] = None):
     url = f"{ALPACA_BASE_URL}/v2/orders?status=open&nested=true"
     if symbol:
