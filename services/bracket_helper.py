@@ -193,6 +193,28 @@ def submit_bracket_entry(
                 raise ValueError("limit_price required for parent_type='limit'")
             lim_q = _q(lim_q)
 
+            # ----- Enforce Alpaca constraints around the parent base price -----
+            if parent_type == "market":
+                parent_px = _latest_price(symbol)
+            else:
+                parent_px = float(lim_q)
+
+            tick = 0.01  # US equities
+            if side == "buy":
+                # SL must be <= base - 0.01 ; TP must be >= base + 0.01
+                sl_q = min(sl_q, parent_px - tick)
+                tp_q = max(tp_q, parent_px + tick)
+            else:  # sell/short
+                # SL must be >= base + 0.01 ; TP must be <= base - 0.01
+                sl_q = max(sl_q, parent_px + tick)
+                tp_q = min(tp_q, parent_px - tick)
+
+            # round to tick after clamping
+            sl_q = _q(sl_q)
+            tp_q = _q(tp_q)
+            if parent_type == "limit":
+                lim_q = _q(lim_q)
+
     payload = {
         "symbol": symbol.upper(),
         "side": side,
@@ -248,3 +270,30 @@ def list_open_orders(symbol: Optional[str] = None):
     r = _http("GET", url)
     r.raise_for_status()
     return r.json()
+
+def _latest_price(symbol: str) -> float:
+    """Return a reasonable 'base' price for constraint checks."""
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/quotes/latest"
+    params = {"feed": ALPACA_DATA_FEED}
+    r = _http("GET", url, params=params)
+    r.raise_for_status()
+    js = r.json()
+    q = js.get("quote") or {}
+    # Prefer midpoint when both sides exist; fall back to ask/bid/last close
+    bid = q.get("bp")
+    ask = q.get("ap")
+    if bid and ask:
+        return (float(bid) + float(ask)) / 2.0
+    if ask:
+        return float(ask)
+    if bid:
+        return float(bid)
+    # Last trade fallback:
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest"
+    r = _http("GET", url, params={"feed": ALPACA_DATA_FEED})
+    r.raise_for_status()
+    t = r.json().get("trade", {})
+    px = t.get("p")
+    if px is None:
+        raise RuntimeError(f"No price available for {symbol}")
+    return float(px)
