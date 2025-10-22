@@ -1,112 +1,199 @@
-# services/bracket_helper.py
+"""
+Bracket helper
+
+- Builds and submits Alpaca bracket (parent + TP + SL).
+- Optional ATR-aware entry/TP/SL prices (env toggles).
+- Exposes a legacy-friendly `submit_bracket(...)` name so older
+  modules can `from services.bracket_helper import submit_bracket`.
+"""
+
 from __future__ import annotations
-import os, json, time
-from datetime import datetime
+
+import json
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 import requests
 
-from lib.atr_utils import atr_targets, get_last_price  # ATR-based targets
+# -------------------- Config --------------------
 
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 API_KEY = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "APCA-API-KEY-ID": API_KEY,
-    "APCA-API-SECRET-KEY": API_SECRET,
-    "Content-Type": "application/json",
-})
-
-ENTRY_TYPE = os.getenv("BRACKET_ENTRY_TYPE", "limit").lower()  # 'market' or 'limit'
 EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "false").lower() in {"1", "true", "yes", "y"}
 
-# ATR controls (enabled by default)
-ATR_USE = os.getenv("USE_ATR_ENTRY", "1").lower() in {"1", "true", "yes", "y"}
-ATR_TF = os.getenv("ATR_TIMEFRAME", "5Min")
-ATR_LEN = int(os.getenv("ATR_LENGTH", "14"))
-ATR_MULT_TP_ENTRY = float(os.getenv("ATR_MULT_TP_ENTRY", os.getenv("ATR_MULT_TP", "1.2")))
-ATR_MULT_SL_ENTRY = float(os.getenv("ATR_MULT_SL_ENTRY", os.getenv("ATR_MULT_SL", "1.0")))
+# ATR knobs for entries (independent from exits manager)
+USE_ATR_ENTRY = os.getenv("USE_ATR_ENTRY", "0").lower() in {"1", "true", "yes", "y"}
+ATR_MULT_TP_ENTRY = float(os.getenv("ATR_MULT_TP_ENTRY", "1.2"))
+ATR_MULT_SL_ENTRY = float(os.getenv("ATR_MULT_SL_ENTRY", "1.0"))
+ATR_TIMEFRAME = os.getenv("ATR_TIMEFRAME", "5Min")
+ATR_LENGTH = int(os.getenv("ATR_LENGTH", "14"))
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")  # free/paper: 'iex'
 
+# request session
+_sess = requests.Session()
+_sess.headers.update(
+    {
+        "APCA-API-KEY-ID": API_KEY,
+        "APCA-API-SECRET-KEY": API_SECRET,
+        "Content-Type": "application/json",
+    }
+)
+
+def _http(method: str, url: str, **kwargs) -> requests.Response:
+    # small retry
+    for attempt in range(5):
+        try:
+            r = _sess.request(method, url, timeout=15, **kwargs)
+            if r.status_code >= 500:
+                raise requests.HTTPError(f"{r.status_code} {r.text}")
+            return r
+        except Exception as e:
+            wait = min(2**attempt, 8)
+            print(f"{datetime.utcnow().isoformat()}Z WARN bracket_helper | HTTP {e} -> retrying {wait}s")
+            time.sleep(wait)
+    raise RuntimeError(f"HTTP failed after retries: {method} {url}")
 
 def _q(x: float, tick: Decimal = Decimal("0.01")) -> float:
     return float(Decimal(str(x)).quantize(tick, rounding=ROUND_HALF_UP))
 
+# -------------------- (optional) ATR fetch --------------------
 
-def _http(method: str, url: str, **kwargs):
-    for attempt in range(5):
-        try:
-            r = SESSION.request(method, url, timeout=15, **kwargs)
-            if r.status_code >= 500:
-                raise requests.HTTPError(f"{r.status_code} {r.text}")
-            return r
-        except Exception:
-            time.sleep(min(2 ** attempt, 8))
-    raise RuntimeError(f"HTTP failed after retries: {method} {url}")
+def _recent_bars(symbol: str, timeframe: str, lookback_days: int = 10):
+    now = datetime.now(timezone.utc)
+    start = now.replace(microsecond=0)  # iso without micro-mess
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
 
-
-def list_open_orders(symbol: Optional[str] = None) -> List[dict]:
-    """Return open orders; if symbol is provided, filter on server side."""
-    url = f"{ALPACA_BASE_URL}/v2/orders?status=open&nested=true"
-    if symbol:
-        url += f"&symbols={symbol}"
-    r = _http("GET", url)
+    params = {
+        "timeframe": timeframe,
+        "start": (now.replace(microsecond=0) - 86400 * lookback_days).isoformat(),
+        "end": start.isoformat(),
+        "limit": 400,
+        "adjustment": "split",
+        "feed": ALPACA_DATA_FEED,
+    }
+    r = _http("GET", url, params=params)
     r.raise_for_status()
-    return r.json()
+    js = r.json()
+    bars = js.get("bars", [])
+    if not bars:
+        raise RuntimeError(f"No bars for {symbol}")
+    # convert to simple lists for ATR
+    o = [float(b["o"]) for b in bars]
+    h = [float(b["h"]) for b in bars]
+    l = [float(b["l"]) for b in bars]
+    c = [float(b["c"]) for b in bars]
+    return o, h, l, c
 
+def _atr_from_ohlc(h, l, c, length: int) -> float:
+    # Wilder ATR (ema of True Range)
+    import math
 
-def submit_bracket_entry(symbol: str,
-                         side: str,                 # 'buy' or 'sell'
-                         qty: int,
-                         tp_price: Optional[float], # can be None -> ATR
-                         sl_price: Optional[float], # can be None -> ATR
-                         limit_price: Optional[float] = None,  # parent limit if ENTRY_TYPE='limit'
-                         client_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    If USE_ATR_ENTRY=1, compute TP/SL from ATR w.r.t reference price (limit or last trade).
-    Enforces Alpaca base_price rules to avoid 422 errors.
-    """
-    parent_type = "market" if ENTRY_TYPE == "market" else "limit"
+    tr = []
+    prev_c = None
+    for hi, lo, cls in zip(h, l, c):
+        if prev_c is None:
+            tr.append(hi - lo)
+        else:
+            tr.append(max(hi - lo, abs(hi - prev_c), abs(lo - prev_c)))
+        prev_c = cls
 
-    # Reference price for both ATR targets and parent limit (if 'limit' entry)
-    base_price = limit_price if limit_price is not None else get_last_price(symbol)
-    base_q = _q(base_price)
+    # EMA alpha = 1/length
+    alpha = 1.0 / float(length)
+    ema = None
+    for v in tr:
+        ema = v if ema is None else (alpha * v + (1 - alpha) * ema)
+    return float(ema)
 
-    if ATR_USE:
-        tp_price, sl_price = atr_targets(
-            symbol=symbol,
-            side=side,
-            ref_price=base_q,
-            mult_tp=ATR_MULT_TP_ENTRY,
-            mult_sl=ATR_MULT_SL_ENTRY,
-            timeframe=ATR_TF,
-            length=ATR_LEN,
-        )
+# -------------------- Public API --------------------
 
-    # Directional constraints vs base price to satisfy Alpaca validations
+@dataclass
+class BracketIntent:
+    symbol: str
+    side: str  # 'buy' | 'sell'
+    qty: int
+    parent_type: str  # 'market' | 'limit'
+    limit_price: Optional[float]
+    tp_price: float
+    sl_price: float
+    client_id: Optional[str] = None
+
+def _infer_prices_with_atr(symbol: str, side: str):
+    """Return (base, tp, sl) using ATR multiples off the latest close."""
+    # Get bars & ATR
+    _o, h, l, c = _recent_bars(symbol, ATR_TIMEFRAME)
+    atr = _atr_from_ohlc(h, l, c, ATR_LENGTH)
+    last = float(c[-1])
+
     if side == "buy":
-        tp_price = max(tp_price, base_q + 0.01)
-        sl_price = min(sl_price, base_q - 0.01)
+        base = last
+        tp = last + ATR_MULT_TP_ENTRY * atr
+        sl = last - ATR_MULT_SL_ENTRY * atr
     else:
-        tp_price = min(tp_price, base_q - 0.01)
-        sl_price = max(sl_price, base_q + 0.01)
+        base = last
+        tp = last - ATR_MULT_TP_ENTRY * atr
+        sl = last + ATR_MULT_SL_ENTRY * atr
+
+    return _q(base), _q(tp), _q(sl)
+
+def submit_bracket_entry(
+    symbol: str,
+    side: str,
+    qty: int,
+    *,
+    tp_price: Optional[float] = None,
+    sl_price: Optional[float] = None,
+    limit_price: Optional[float] = None,
+    client_id: Optional[str] = None,
+    parent_type: str = "limit",  # 'market' or 'limit'
+):
+    """
+    Core submitter. If USE_ATR_ENTRY=1 and any of tp/sl/limit are None,
+    we infer them via ATR from latest close.
+    """
+    if qty <= 0:
+        raise ValueError("qty must be > 0")
+
+    base_q = None
+    tp_q = tp_price
+    sl_q = sl_price
+    lim_q = limit_price
+
+    if USE_ATR_ENTRY and (tp_q is None or sl_q is None or (parent_type == "limit" and lim_q is None)):
+        base_q, tp_q2, sl_q2 = _infer_prices_with_atr(symbol, side)
+        tp_q = tp_q if tp_q is not None else tp_q2
+        sl_q = sl_q if sl_q is not None else sl_q2
+        lim_q = lim_q if lim_q is not None else base_q
+    else:
+        # when prices are provided, quantize to 0.01
+        if tp_q is None or sl_q is None:
+            raise ValueError("tp_price and sl_price are required when USE_ATR_ENTRY=0")
+        tp_q = _q(tp_q)
+        sl_q = _q(sl_q)
+        if parent_type == "limit":
+            if lim_q is None:
+                raise ValueError("limit_price required for parent_type='limit'")
+            lim_q = _q(lim_q)
 
     payload = {
-        "symbol": symbol,
+        "symbol": symbol.upper(),
         "side": side,
         "qty": str(int(qty)),
         "time_in_force": "day",
         "order_class": "bracket",
-        "take_profit": {"limit_price": f"{_q(tp_price):.2f}"},
-        "stop_loss": {"stop_price": f"{_q(sl_price):.2f}"},
+        "take_profit": {"limit_price": f"{tp_q:.2f}"},
+        "stop_loss": {"stop_price": f"{sl_q:.2f}"},
         "extended_hours": EXTENDED_HOURS,
         "client_order_id": client_id or f"BRK-{symbol}-{int(time.time())}",
         "type": parent_type,
     }
     if parent_type == "limit":
-        payload["limit_price"] = f"{_q(base_q):.2f}"
+        payload["limit_price"] = f"{lim_q:.2f}"
 
     print(f"{datetime.utcnow().isoformat()}Z INFO bracket_helper | submit bracket: {payload}")
     url = f"{ALPACA_BASE_URL}/v2/orders"
@@ -114,4 +201,38 @@ def submit_bracket_entry(symbol: str,
     if r.status_code >= 300:
         print(f"{datetime.utcnow().isoformat()}Z ERROR bracket_helper | submit failed: {r.status_code} {r.text}")
         r.raise_for_status()
+    return r.json()
+
+# ---------- Legacy-friendly shim (keep older imports working) ----------
+
+def submit_bracket(
+    symbol: str,
+    side: str,
+    qty: int,
+    tp_price: Optional[float] = None,
+    sl_price: Optional[float] = None,
+    limit_price: Optional[float] = None,
+    client_id: Optional[str] = None,
+):
+    """
+    Back-compat wrapper used by older callers:
+        from services.bracket_helper import submit_bracket
+    """
+    return submit_bracket_entry(
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        tp_price=tp_price,
+        sl_price=sl_price,
+        limit_price=limit_price,
+        client_id=client_id,
+    )
+
+# Optional: tiny utility some modules import
+def list_open_orders(symbol: Optional[str] = None):
+    url = f"{ALPACA_BASE_URL}/v2/orders?status=open&nested=true"
+    if symbol:
+        url += f"&symbols={symbol}"
+    r = _http("GET", url)
+    r.raise_for_status()
     return r.json()
