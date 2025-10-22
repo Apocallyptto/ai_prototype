@@ -3,6 +3,7 @@ from __future__ import annotations
 import os, json
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
+from jobs.train_nn import make_features
 
 import numpy as np
 import pandas as pd
