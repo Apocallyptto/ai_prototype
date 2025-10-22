@@ -33,6 +33,7 @@ DROPOUT          = float(os.getenv("NN_DROPOUT", "0.25"))
 EARLY_STOP       = int(os.getenv("NN_EARLY_STOP_EPOCHS", "6"))
 VAL_SPLIT        = float(os.getenv("NN_VAL_SPLIT", "0.2"))
 SEED             = int(os.getenv("NN_SEED", "17"))
+FORCE_REFIT_SCALER = os.getenv("FORCE_REFIT_SCALER","0").lower() in {"1","true","yes","y"}
 
 os.makedirs(OUTDIR, exist_ok=True)
 torch.manual_seed(SEED)
@@ -84,14 +85,9 @@ def fetch_bars(symbol: str, days: int) -> pd.DataFrame:
 # Feature engineering
 # =========================
 def _col(df: pd.DataFrame, name: str) -> pd.Series:
-    """
-    Robust 1-D float Series extractor.
-    Handles cases where df[name] is a DataFrame with shape (N,1) or object arrays.
-    """
     s = df[name]
     if isinstance(s, pd.DataFrame):
         s = s.iloc[:, 0]
-    # make sure it's 1-D numeric
     arr = np.asarray(s).reshape(-1)
     return pd.Series(pd.to_numeric(arr, errors="coerce"), index=df.index, dtype="float64")
 
@@ -126,7 +122,7 @@ def _session_flags(index: pd.DatetimeIndex) -> pd.Series:
     hour = idx.hour
     minute = idx.minute
     hm = hour*60 + minute
-    return ((hm >= 13*60+30) & (hm <= 20*60)).astype(float)  # 1.0 RTH, 0.0 ETH
+    return ((hm >= 13*60+30) & (hm <= 20*60)).astype(float)
 
 def _time_sin_cos(index: pd.DatetimeIndex) -> pd.DataFrame:
     idx = index.tz_convert("UTC")
@@ -135,7 +131,6 @@ def _time_sin_cos(index: pd.DatetimeIndex) -> pd.DataFrame:
     return pd.DataFrame({"tod_sin": np.sin(angle), "tod_cos": np.cos(angle)}, index=index)
 
 def make_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Robustly extract columns as 1-D Series
     open_  = _col(df, "open")
     high   = _col(df, "high")
     low    = _col(df, "low")
@@ -144,12 +139,10 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(index=df.index)
 
-    # returns
     out["ret1"] = close.pct_change(1)
     out["ret3"] = close.pct_change(3)
     out["ret6"] = close.pct_change(6)
 
-    # EMAs
     ema9  = _ema(close, 9)
     ema21 = _ema(close, 21)
     ema50 = _ema(close, 50)
@@ -157,37 +150,31 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     out["ema21"] = ema21
     out["ema50"] = ema50
 
-    # EMA gaps
     safe_close = close.replace(0, np.nan)
     out["ema_gap_9"]  = (close - ema9) / safe_close
     out["ema_gap_21"] = (close - ema21) / safe_close
 
-    # RSI + norm
     rsi14 = _rsi(close, 14)
     out["rsi14"] = rsi14
     out["rsi_norm"] = (rsi14 - 50.0) / 50.0
 
-    # ATR, ATR%
     atr = _atr(high, low, close, 14)
     out["atr"] = atr
     out["atr_pct"] = atr / (close.abs() + 1e-9)
 
-    # Volume zscore
     vmean = volume.rolling(50, min_periods=10).mean()
     vstd  = volume.rolling(50, min_periods=10).std()
     out["vol_z"] = (volume - vmean) / (vstd + 1e-9)
 
-    # Time encodings & session
     tod = _time_sin_cos(df.index)
     out = out.join(tod, how="left")
     out["is_rth"] = _session_flags(df.index)
 
-    # Tidy
     out = out.replace([np.inf, -np.inf], np.nan).dropna().astype("float32")
     return out
 
 # =========================
-# Labeling (+HORIZON)
+# Labeling
 # =========================
 def build_xy(df: pd.DataFrame, feats: pd.DataFrame, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
     close = _col(df, "close").reindex(feats.index)
@@ -305,11 +292,39 @@ def main():
     Xtr, Xva = X[:cut], X[cut:]
     ytr, yva = y[:cut], y[cut:]
 
-    # scale
-    scaler = joblib.load(SCALER_PATH) if os.path.exists(SCALER_PATH) else None
+    # ----- scaler: reuse if and only if features match, else refit -----
+    from sklearn.preprocessing import StandardScaler
+    need_refit = FORCE_REFIT_SCALER
+    old_meta = None
+    if os.path.exists(FEAT_JSON):
+        try:
+            with open(FEAT_JSON, "r") as f:
+                old_meta = json.load(f)
+        except Exception:
+            old_meta = None
+    if old_meta:
+        old_feats = old_meta.get("features") or []
+        if len(old_feats) != Xtr.shape[1] or old_meta.get("horizon") != HORIZON:
+            need_refit = True
+
+    scaler = None
+    if not need_refit and os.path.exists(SCALER_PATH):
+        try:
+            scaler = joblib.load(SCALER_PATH)
+            # double-check n_features
+            if getattr(scaler, "n_features_in_", Xtr.shape[1]) != Xtr.shape[1]:
+                need_refit = True
+                scaler = None
+        except Exception:
+            scaler = None
+            need_refit = True
+
     if scaler is None:
-        from sklearn.preprocessing import StandardScaler
         scaler = StandardScaler().fit(Xtr)
+        print("Fitted NEW StandardScaler (features or force flag changed).")
+    else:
+        print("Reusing existing StandardScaler.")
+
     Xtr_s = scaler.transform(Xtr)
     Xva_s = scaler.transform(Xva)
 
@@ -324,7 +339,7 @@ def main():
 
     model = train_loop(model, tr_dl, va_dl, EPOCHS, LR, WEIGHT_DECAY, EARLY_STOP, device)
 
-    # quick validation metrics
+    # validation metric
     model.eval()
     with torch.no_grad():
         logits = []
@@ -337,7 +352,7 @@ def main():
     acc = float((preds == yva).mean())
     print(f"Validation accuracy (horizon +{HORIZON} bars): {acc:.3f}")
 
-    # save artifacts
+    # save artifacts (overwrite)
     torch.save({"in_dim": X.shape[1], "state_dict": model.state_dict()}, MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
     with open(FEAT_JSON, "w") as f:
