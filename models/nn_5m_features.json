@@ -1,1 +1,1 @@
-{"feature_names": ["ret_1", "sma_10", "sma_50", "ema_20", "rsi_14", "atr_14", "macd", "macd_hist", "vol", "hl_spread", "sma_ratio"]}
+{"features": ["ret1", "ret3", "ret6", "ema9", "ema21", "ema50", "ema_gap_9", "ema_gap_21", "rsi14", "rsi_norm", "atr", "atr_pct", "vol_z", "tod_sin", "tod_cos", "is_rth"], "horizon": 3}
