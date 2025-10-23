@@ -1,92 +1,144 @@
 # jobs/make_signals_ensemble.py
 from __future__ import annotations
-
-import os, sys
+import os
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple
+
 import psycopg2
+import numpy as np
 
-# Import your existing models (paths from your repo)
-from jobs.make_signals_nn import predict_for_symbols as nn_predict   # re-use your nn path
-from jobs.make_signals_ml import predict_for_symbols as ml_predict   # you already have ML variant
+# ---- Config from env ----
+SYMBOLS       = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+MIN_STRENGTH  = float(os.getenv("MIN_STRENGTH", "0.60"))
+DATABASE_URL  = os.getenv("DATABASE_URL")  # required for DB writes
+PORTFOLIO_ID  = os.getenv("PORTFOLIO_ID")  # optional tag
 
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
-PORTFOLIO_ID = int(os.getenv("PORTFOLIO_ID", "1"))
+# ---- Import model predictors ----
+# NN is required; ML is optional (fallback to NN only if ML artifacts missing).
+from jobs.make_signals_nn import nn_predict as nn_predict  # returns {SYM: {"side","strength"}}
 
-def _pg_conn():
-    dsn = os.getenv("DATABASE_URL")
-    if dsn:
-        return psycopg2.connect(dsn)
-    return psycopg2.connect(
-        host=os.getenv("PGHOST","localhost"),
-        user=os.getenv("PGUSER","postgres"),
-        password=os.getenv("PGPASSWORD","postgres"),
-        dbname=os.getenv("PGDATABASE","ai_prototype"),
-        port=int(os.getenv("PGPORT","5432")),
-    )
+def _try_ml_predict(symbols: List[str]) -> Dict[str, Dict[str, float]]:
+    """
+    Try to import and run ML predictor. If model files are missing or import fails,
+    return an empty dict so we can fall back to NN-only.
+    """
+    try:
+        from jobs.make_signals_ml import predict_for_symbols as ml_predict
+        preds = ml_predict(symbols)  # same shape as NN
+        return preds or {}
+    except FileNotFoundError:
+        # models/ml_5m.pkl not found
+        return {}
+    except Exception as e:
+        # Any other issue: be robust, run NN-only
+        print(f"[WARN] ML predictor unavailable: {e}")
+        return {}
 
-def _ensure_columns(cur):
+# ---- DB helpers ----
+def _ensure_signals_table(cur) -> None:
     cur.execute("""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='signals'
+    CREATE TABLE IF NOT EXISTS public.signals (
+        id SERIAL PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        strength DOUBLE PRECISION NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        portfolio_id TEXT
+    );
     """)
-    cols = {r[0] for r in cur.fetchall()}
-    # ensure basic columns; schema migration is normally separate
-    needed = ["symbol","side","strength","created_at","portfolio_id","source"]
-    for c in needed:
-        if c not in cols:
-            if c in ("created_at",):
-                cur.execute("ALTER TABLE public.signals ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()")
-            elif c in ("portfolio_id",):
-                cur.execute("ALTER TABLE public.signals ADD COLUMN IF NOT EXISTS portfolio_id INT DEFAULT 1")
-            elif c in ("source",):
-                cur.execute("ALTER TABLE public.signals ADD COLUMN IF NOT EXISTS source TEXT")
-            else:
-                cur.execute(f"ALTER TABLE public.signals ADD COLUMN IF NOT EXISTS {c} TEXT")
 
-def _insert_signal(cur, symbol: str, side: str, strength: float, ts: datetime):
-    cur.execute(
-        "INSERT INTO public.signals (symbol, side, strength, created_at, portfolio_id, source) VALUES (%s,%s,%s,%s,%s,%s)",
-        (symbol, side, float(strength), ts, PORTFOLIO_ID, "ensemble")
-    )
+def _insert_signal(symbol: str, side: str, strength: float, ts: datetime, portfolio_id: str | None) -> None:
+    if not DATABASE_URL:
+        return
+    with psycopg2.connect(dsn=DATABASE_URL) as conn, conn.cursor() as cur:
+        _ensure_signals_table(cur)
+        cur.execute(
+            """INSERT INTO public.signals (symbol, side, strength, created_at, portfolio_id)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (symbol, side, float(strength), ts, portfolio_id)
+        )
 
+# ---- Blending logic ----
+def _blend(nn_val: float | None, ml_val: float | None) -> float | None:
+    """
+    Blend two probabilities/strengths (0..1). If one is None, return the other.
+    Simple arithmetic mean for robustness.
+    """
+    vals = [v for v in (nn_val, ml_val) if v is not None]
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
+
+def _to_buy_prob(side: str, strength: float) -> float:
+    """
+    Convert (side, strength) into probability of 'buy'.
+    If side=='buy': prob_up = strength
+    If side=='sell': prob_up = 1 - strength
+    """
+    return float(strength) if side == "buy" else float(1.0 - strength)
+
+def _from_buy_prob(prob_up: float) -> Tuple[str, float]:
+    """
+    Convert probability of 'buy' back to (side, strength).
+    """
+    if prob_up >= 0.5:
+        return "buy", float(prob_up)
+    else:
+        return "sell", float(1.0 - prob_up)
+
+# ---- Public API: predict (no DB writes) ----
+def predict_for_symbols(symbols: List[str]) -> Dict[str, Dict[str, float]]:
+    """
+    Returns: { "AAPL": {"side":"buy","strength":0.62}, ... } from blended NN+ML.
+    """
+    nn = nn_predict(symbols)                   # required
+    ml = _try_ml_predict(symbols)              # optional
+
+    out: Dict[str, Dict[str, float]] = {}
+    for sym in symbols:
+        nn_r = nn.get(sym)
+        ml_r = ml.get(sym) if ml else None
+
+        nn_prob = _to_buy_prob(nn_r["side"], nn_r["strength"]) if nn_r else None
+        ml_prob = _to_buy_prob(ml_r["side"], ml_r["strength"]) if ml_r else None
+
+        blended_prob = _blend(nn_prob, ml_prob)
+        if blended_prob is None:
+            continue
+
+        side, strength = _from_buy_prob(blended_prob)
+        out[sym] = {"side": side, "strength": strength}
+    return out
+
+# ---- CLI entrypoint: predict + INSERT into DB ----
 def main():
     now = datetime.now(timezone.utc)
-    # Get predictions from both models
-    nn = nn_predict(SYMBOLS)   # expected: { "AAPL": {"side":"buy","strength":0.62}, ...}
-    ml = ml_predict(SYMBOLS)   # expected: same shape
+    preds = predict_for_symbols(SYMBOLS)
 
-    merged = {}
+    any_inserted = False
     for sym in SYMBOLS:
-        n = nn.get(sym); m = ml.get(sym)
-        if not n and not m:
+        r = preds.get(sym)
+        if not r:
             continue
-        # Average strengths when both exist; otherwise use existing one
-        if n and m:
-            # If sides disagree, take the one with higher strength; else average
-            if n["side"] != m["side"]:
-                pick = n if n["strength"] >= m["strength"] else m
-                merged[sym] = pick
-            else:
-                s = (n["strength"] + m["strength"]) / 2.0
-                merged[sym] = {"side": n["side"], "strength": s}
-        else:
-            merged[sym] = (n or m)
+        side, strength = r["side"], float(r["strength"])
 
-    # Gate by MIN_STRENGTH
-    gated = {k:v for k,v in merged.items() if v["strength"] >= MIN_STRENGTH}
+        if strength < MIN_STRENGTH:
+            # Verbose and clear in logs:
+            print(f"{sym}: below MIN_STRENGTH ({strength:.2f} < {MIN_STRENGTH}) (ensemble)")
+            continue
 
-    if not gated:
+        # Print exactly what we insert:
+        print(f"{sym}: {side} strength={strength:.2f} at {now.isoformat()} (ensemble)")
+
+        # Persist to DB so executor_bracket reads the latest side
+        try:
+            _insert_signal(sym, side, strength, now, PORTFOLIO_ID)
+            any_inserted = True
+        except Exception as e:
+            print(f"[WARN] failed to insert signal for {sym}: {e}")
+
+    if not any_inserted:
         print("ensemble: no signals above threshold.")
-        return
-
-    with _pg_conn() as conn, conn.cursor() as cur:
-        _ensure_columns(cur)
-        for sym, sig in gated.items():
-            _insert_signal(cur, sym, sig["side"], sig["strength"], now)
-        conn.commit()
-        for sym, sig in gated.items():
-            print(f"{sym}: {sig['side']} strength={sig['strength']:.2f} at {now.isoformat()} (ensemble)")
 
 if __name__ == "__main__":
     main()
