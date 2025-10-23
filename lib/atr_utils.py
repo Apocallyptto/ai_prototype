@@ -1,92 +1,92 @@
 # lib/atr_utils.py
 from __future__ import annotations
-
 import os
-import math
-from typing import List, Tuple, Optional, Literal
-from datetime import datetime, timezone
-import requests
+from typing import Optional
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, timezone
 
-ALPACA_MARKET_BASE = "https://data.alpaca.markets"
-FEED = os.getenv("ALPACA_DATA_FEED", "iex")  # 'iex' (default) or 'sip'
-
-# Risk knobs (can be overridden by env)
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "1.2"))  # take-profit = entry +- ATR*mult
-ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.0"))  # stop-loss  = entry +- ATR*mult
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "Content-Type": "application/json",
-    # market data is public for free feed, but set keys if you have them to avoid rate limits
-    "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
-    "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "")
-})
-
-def _bars(symbol: str, timeframe: str = "5Min", limit: int = 200) -> List[dict]:
-    """
-    Fetch recent bars. timeframe one of: 1Min, 5Min, 15Min, 1Hour, 1Day.
-    Returns list of bars (each has t, o, h, l, c, v).
-    """
-    url = f"{ALPACA_MARKET_BASE}/v2/stocks/{symbol}/bars"
-    params = {"timeframe": timeframe, "limit": str(limit), "feed": FEED, "adjustment": "split"}
-    r = SESSION.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    js = r.json()
-    return js.get("bars", []) or []
-
-def _last_trade_price(symbol: str) -> Optional[float]:
+# Try yfinance first (easy), then Alpaca as fallback if available
+def _fetch_yf(symbol: str, days: int, interval: str = "5m") -> Optional[pd.DataFrame]:
     try:
-        url = f"{ALPACA_MARKET_BASE}/v2/stocks/{symbol}/trades/latest"
-        r = SESSION.get(url, params={"feed": FEED}, timeout=10)
-        r.raise_for_status()
-        t = r.json().get("trade")
-        if not t:
+        import yfinance as yf
+    except Exception:
+        return None
+    try:
+        period = f"{days}d" if days <= 59 else "60d"  # yfinance cap for 5m
+        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or df.empty:
             return None
-        return float(t.get("p", 0) or 0)
+        if df.index.tz is None:
+            df = df.tz_localize("UTC")
+        else:
+            df = df.tz_convert("UTC")
+        df = df.rename(
+            columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}
+        )[["open","high","low","close","volume"]].astype("float64")
+        df = df[~df.index.duplicated(keep="last")]
+        return df
     except Exception:
         return None
 
-def _true_ranges(bars: List[dict]) -> List[float]:
-    tr: List[float] = []
-    prev_close: Optional[float] = None
-    for b in bars:
-        h = float(b["h"]); l = float(b["l"]); c = float(b["c"])
-        if prev_close is None:
-            tr.append(h - l)
-        else:
-            tr.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
-        prev_close = c
-    return tr
+def _fetch_alpaca(symbol: str, days: int, timeframe: str = "5Min") -> Optional[pd.DataFrame]:
+    try:
+        from lib.broker_alpaca import get_bars
+    except Exception:
+        return None
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        rows = get_bars(symbol, timeframe, start, end, limit=20000)
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        df = df.rename(columns={"t":"ts","o":"open","h":"high","l":"low","c":"close","v":"volume"})
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        df = df.set_index("ts")[["open","high","low","close","volume"]].astype("float64")
+        df = df[~df.index.duplicated(keep="last")]
+        return df
+    except Exception:
+        return None
 
-def compute_atr(symbol: str, timeframe: str = "5Min", period: int = ATR_PERIOD) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Returns (atr, last_price). If not enough bars, atr is None.
-    """
-    bars = _bars(symbol, timeframe=timeframe, limit=max(2*period+2, 60))
-    if len(bars) < period + 1:
-        return (None, _last_trade_price(symbol))
-    tr = _true_ranges(bars)
-    if len(tr) < period:
-        return (None, _last_trade_price(symbol))
-    # Wilder's ATR (simple moving average over TR works fine for live usage)
-    atr = sum(tr[-period:]) / float(period)
-    last = float(bars[-1]["c"])
-    return (atr, last)
+def fetch_bars(symbol: str, lookback_days: int = 30, interval_5m: bool = True) -> pd.DataFrame:
+    df = _fetch_yf(symbol, lookback_days, "5m" if interval_5m else "15m")
+    if df is None or df.empty:
+        df = _fetch_alpaca(symbol, lookback_days, "5Min" if interval_5m else "15Min")
+    if df is None or df.empty:
+        raise RuntimeError(f"ATR fetch: no data for {symbol}")
+    return df
 
-def atr_tp_sl(entry: float, side: Literal["buy","sell"], atr: float,
-              tp_mult: float = ATR_TP_MULT, sl_mult: float = ATR_SL_MULT) -> Tuple[float, float]:
-    """
-    Compute (take_profit, stop_loss) from entry and ATR.
-    For BUY: TP=entry+atr*tp_mult, SL=entry-atr*sl_mult
-    For SELL: TP=entry-atr*tp_mult, SL=entry+atr*sl_mult
-    """
-    if side == "buy":
-        return (entry + atr*tp_mult, entry - atr*sl_mult)
-    else:
-        return (entry - atr*tp_mult, entry + atr*sl_mult)
+def true_range(high: pd.Series, low: pd.Series, close_prev: pd.Series) -> pd.Series:
+    a = (high - low).abs()
+    b = (high - close_prev).abs()
+    c = (low  - close_prev).abs()
+    return pd.concat([a, b, c], axis=1).max(axis=1)
 
-def round_to_tick(px: float, tick: float = 0.01) -> float:
-    if tick <= 0:
-        return px
-    return round(px / tick) * tick
+def atr_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Wilder ATR (RMA). Requires at least period+1 rows for a stable seed.
+    """
+    h, l, c = df["high"], df["low"], df["close"]
+    c_prev = c.shift(1)
+    tr = true_range(h, l, c_prev)
+    # First ATR seed = SMA of first 'period' TRs
+    atr = tr.rolling(window=period, min_periods=period).mean()
+    # Wilder smoothing from next point onwards
+    for i in range(period+1, len(tr)):
+        atr.iat[i] = (atr.iat[i-1] * (period - 1) + tr.iat[i]) / period
+    return atr
+
+def last_atr(symbol: str,
+             period: int = 14,
+             lookback_days: int = 30) -> float:
+    """
+    Get last ATR value (Wilder) from recent 5m bars. Raises if unavailable.
+    """
+    df = fetch_bars(symbol, lookback_days, interval_5m=True)
+    if len(df) < period + 5:
+        raise RuntimeError(f"ATR: insufficient bars for {symbol} (got {len(df)})")
+    atr = atr_wilder(df, period).dropna()
+    if atr.empty:
+        raise RuntimeError(f"ATR: nan for {symbol}")
+    return float(atr.iloc[-1])
