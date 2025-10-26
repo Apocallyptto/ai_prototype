@@ -2,51 +2,63 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
-import shlex
 import subprocess
 from datetime import datetime, timezone
 
-PY = os.getenv("PYTHON", os.getenv("PYTHON_EXE", "python"))
+# Always use the exact interpreter running this process
+PY = sys.executable
 
-SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
-SLEEP = int(os.getenv("CRON_SLEEP_SECONDS", "180"))
-MIN_STRENGTH = os.getenv("MIN_STRENGTH", "0.60")
-SIGNAL_JOB = os.getenv("SIGNAL_JOB", "jobs.make_signals_ensemble")
-EXEC_WINDOW_MIN = os.getenv("EXECUTOR_SIGNAL_WINDOW_MIN", "20")  # <<< window in minutes
+def _env(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None and v != "" else default
 
-def _utcnow():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
-
-def _run(cmd: list[str]):
-    print(f"{_utcnow()} cron_nn | run: {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
+def _run(cmd: list[str]) -> int:
+    # Log command (shortened)
+    print(f"{_ts()} cron_nn | run:", " ".join(cmd))
     return subprocess.call(cmd)
 
-def main():
-    print(f"{_utcnow()} cron_nn | start loop symbols={SYMBOLS} sleep={SLEEP}s", flush=True)
-    print(f"{_utcnow()} cron_nn | signals via {SIGNAL_JOB} (MIN_STRENGTH={MIN_STRENGTH})", flush=True)
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
 
-    while True:
-        # 1) Make signals
-        _run([PY, "-m", SIGNAL_JOB])
+def main() -> None:
+    symbols = _env("SYMBOLS", "AAPL,MSFT,SPY")
+    min_strength = _env("MIN_STRENGTH", "0.60")
+    sleep_s = int(_env("CRON_SLEEP_SECONDS", "180"))
+    signal_job = _env("SIGNAL_JOB", "jobs.make_signals_ensemble")
 
-        # 2) Place orders from recent signals (use --since-min)
-        _run([
-            PY, "-m", "services.executor_bracket",
-            "--since-min", str(EXEC_WINDOW_MIN),
-            "--min-strength", str(MIN_STRENGTH),
-        ])
+    # executor window (minutes) – matches your newer CLI (--since-min)
+    window_min = _env("EXECUTOR_SIGNAL_WINDOW_MIN", "20")
+    portfolio_id = _env("PORTFOLIO_ID", "")  # optional; "" means any/ignore
 
-        # 3) Manage exits
-        _run([PY, "-m", "jobs.manage_exits", "--symbols", SYMBOLS])
+    print(f"{_ts()} cron_nn | start loop symbols={symbols} sleep={sleep_s}s")
+    print(f"{_ts()} cron_nn | signals via {signal_job} (MIN_STRENGTH={min_strength})")
 
-        # 4) Reprice stale (if any)
-        _run([PY, "-m", "jobs.manage_stale_orders", "--symbols", SYMBOLS])
+    try:
+        while True:
+            # 1) Generate signals
+            _run([PY, "-m", signal_job])
 
-        # 5) Sync orders table
-        _run([PY, "-m", "tools.sync_orders"])
+            # 2) Place new brackets from recent signals
+            exec_cmd = [
+                PY, "-m", "services.executor_bracket",
+                "--since-min", window_min,
+                "--min-strength", min_strength,
+            ]
+            if portfolio_id:
+                exec_cmd += ["--portfolio-id", portfolio_id]
+            _run(exec_cmd)
 
-        time.sleep(SLEEP)
+            # 3) Manage exits / stale orders / sync
+            _run([PY, "-m", "jobs.manage_exits", "--symbols", symbols])
+            _run([PY, "-m", "jobs.manage_stale_orders", "--symbols", symbols])
+            _run([PY, "-m", "tools.sync_orders"])
+
+            time.sleep(sleep_s)
+
+    except KeyboardInterrupt:
+        print(f"{_ts()} cron_nn | stopped by user")
 
 if __name__ == "__main__":
     main()
