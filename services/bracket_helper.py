@@ -2,339 +2,335 @@
 from __future__ import annotations
 
 import os
-import math
 import time
+import math
+import json
+import uuid
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional
 
 import requests
+import pandas as pd
 
-# Optional yfinance fallback for ATR/last price
-try:
-    import yfinance as yf
-except Exception:  # pragma: no cover
-    yf = None
+LOG = logging.getLogger("bracket_helper")
+LOG.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setFormatter(logging.Formatter("%(levelname)s %(name)s | %(message)s"))
+if not LOG.handlers:
+    LOG.addHandler(ch)
 
+# -----------------------
+# Environment / constants
+# -----------------------
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
-API_KEY    = os.getenv("ALPACA_API_KEY", "")
-API_SECRET = os.getenv("ALPACA_API_SECRET", "")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
+TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()  # paper | live
 
-# ---- ATR / exits configuration (env) ----
-ATR_EXITS = os.getenv("ATR_EXITS", "1") == "1"
+TIMEFRAME = os.getenv("TIMEFRAME", "5Min")
+
+# ATR exits
+USE_ATR = os.getenv("ATR_EXITS", "1") == "1"
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_LOOKBACK_DAYS = int(os.getenv("ATR_LOOKBACK_DAYS", "30"))
 ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "1.5"))
 ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.0"))
-MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.015"))  # cap 1.5%
-MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.015"))
-ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()  # 'iex' fixes SIP 403 on paper keys
-ATR_DATA_SOURCE = os.getenv("ATR_DATA_SOURCE", "alpaca,yf").lower().split(",")
+MAX_TP_PCT = float(os.getenv("MAX_TP_PCT", "0.015"))  # 1.5%
+MAX_SL_PCT = float(os.getenv("MAX_SL_PCT", "0.015"))  # 1.5%
 
-# ---- Dynamic sizing ----
+# Dynamic sizing (risk-based)
 USE_DYNAMIC_SIZE = os.getenv("USE_DYNAMIC_SIZE", "0") == "1"
-RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.0025"))  # 0.25% default
+RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.0025"))  # 0.25%
 MIN_QTY = int(os.getenv("MIN_QTY", "1"))
 MAX_QTY = int(os.getenv("MAX_QTY", "10"))
 
-S = requests.Session()
-if API_KEY and API_SECRET:
-    S.headers.update({
-        "APCA-API-KEY-ID": API_KEY,
-        "APCA-API-SECRET-KEY": API_SECRET,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    })
+# Confidence-weighted sizing
+USE_SIZE_BY_STRENGTH = os.getenv("USE_SIZE_BY_STRENGTH", "0") == "1"
+SIZE_MIN_STRENGTH = float(os.getenv("SIZE_MIN_STRENGTH", "0.58"))
+SIZE_MAX_STRENGTH = float(os.getenv("SIZE_MAX_STRENGTH", "0.75"))
+SIZE_EXP = float(os.getenv("SIZE_EXP", "2.0"))
+SIZE_MIN_MULT = float(os.getenv("SIZE_MIN_MULT", "0.50"))  # 50% of base qty at lower bound
+SIZE_MAX_MULT = float(os.getenv("SIZE_MAX_MULT", "1.00"))  # 100% at/above upper bound
 
-def _utcnow() -> datetime:
+# Data source fallback for ATR (Alpaca first, yfinance fallback)
+ATR_DATA_SOURCE = os.getenv("ATR_DATA_SOURCE", "auto").lower()  # auto | iex | yf
+
+# -----------------------
+# Helpers (HTTP)
+# -----------------------
+def _alpaca_headers() -> Dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+        "Content-Type": "application/json",
+    }
+
+def _alpaca_get(path: str, params: Optional[dict] = None) -> requests.Response:
+    url = f"{ALPACA_BASE_URL}{path}"
+    return requests.get(url, headers=_alpaca_headers(), params=params or {}, timeout=15)
+
+def _alpaca_post(path: str, payload: dict) -> requests.Response:
+    url = f"{ALPACA_BASE_URL}{path}"
+    return requests.post(url, headers=_alpaca_headers(), data=json.dumps(payload), timeout=15)
+
+def _data_get(path: str, params: Optional[dict] = None) -> requests.Response:
+    url = f"{ALPACA_DATA_URL}{path}"
+    return requests.get(url, headers=_alpaca_headers(), params=params or {}, timeout=20)
+
+# -----------------------
+# Market utilities
+# -----------------------
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-# ------------------------ Data helpers ------------------------
-
-def get_last_price(symbol: str) -> float:
-    """
-    Public helper: last trade price. Tries Alpaca (feed=iex), falls back to yfinance.
-    """
-    # 1) Alpaca latest trade (IEX)
+def _is_market_open() -> bool:
     try:
-        r = S.get(
-            f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest",
-            params={"feed": ALPACA_DATA_FEED},
-            timeout=7,
-        )
+        r = _alpaca_get("/v2/clock")
         r.raise_for_status()
         j = r.json()
-        px = float(j["trade"]["p"])
+        return bool(j.get("is_open"))
+    except Exception:
+        # If unsure, treat as closed to be conservative
+        return False
+
+def _get_last_price(symbol: str) -> float:
+    """
+    Fetch last trade price (prefer Alpaca /last/stocks, fallback to yfinance).
+    """
+    # Try Alpaca last trade (works on paper/live with proper data entitlement)
+    try:
+        r = _data_get(f"/v2/stocks/{symbol}/trades/latest")
+        if r.status_code == 403:
+            raise requests.HTTPError("Forbidden", response=r)
+        r.raise_for_status()
+        px = float(r.json()["trade"]["p"])
         return px
     except Exception:
-        pass
+        # Fallback to yfinance
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        info = t.fast_info
+        last = info.get("last_price")
+        if last is None:
+            # final fallback: close
+            hist = t.history(period="1d", interval="1m")
+            if len(hist) == 0:
+                raise RuntimeError(f"Cannot fetch price for {symbol}")
+            last = float(hist["Close"].iloc[-1])
+        return float(last)
 
-    # 2) yfinance fallback
-    if yf is not None:
+# -----------------------
+# ATR computation
+# -----------------------
+def _fetch_bars(symbol: str, lookback_days: int, timeframe: str) -> pd.DataFrame:
+    start = (_now_utc() - timedelta(days=lookback_days)).isoformat()
+    end = _now_utc().isoformat()
+    params = {
+        "timeframe": timeframe,
+        "start": start,
+        "end": end,
+        "limit": 10000,
+        "adjustment": "all",
+    }
+    # Alpaca data (IEX feed)
+    if ATR_DATA_SOURCE in ("auto", "iex"):
         try:
-            hist = yf.Ticker(symbol).history(period="1d", interval="1m")
-            if len(hist) > 0:
-                return float(hist["Close"].iloc[-1])
+            r = _data_get(f"/v2/stocks/{symbol}/bars", params)
+            if r.status_code == 403:
+                raise requests.HTTPError("Forbidden", response=r)
+            r.raise_for_status()
+            bars = r.json().get("bars", [])
+            if bars:
+                df = pd.DataFrame(bars)
+                # normalize naming
+                df.rename(
+                    columns={"t": "time", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"},
+                    inplace=True,
+                )
+                df["time"] = pd.to_datetime(df["time"], utc=True)
+                df.set_index("time", inplace=True)
+                return df
         except Exception:
-            pass
+            if ATR_DATA_SOURCE == "iex":  # do not fallback if explicitly forced
+                raise
 
-    raise RuntimeError(f"get_last_price: unable to fetch price for {symbol}")
+    # yfinance fallback
+    import yfinance as yf
+    t = yf.Ticker(symbol)
+    hist = t.history(period=f"{lookback_days}d", interval="5m", auto_adjust=False)
+    if hist is None or len(hist) == 0:
+        raise RuntimeError(f"No bars for {symbol} from yfinance")
+    # Standardize columns
+    df = hist[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df.index = pd.to_datetime(df.index, utc=True)
+    return df
 
-def _fetch_bars_alpaca(symbol: str, lookback_days: int, timeframe: str = "5Min"):
-    start = (_utcnow() - timedelta(days=lookback_days)).isoformat()
-    end = _utcnow().isoformat()
-    r = S.get(
-        f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars",
-        params={
-            "timeframe": timeframe,
-            "start": start,
-            "end": end,
-            "limit": 10000,
-            "adjustment": "all",
-            "feed": ALPACA_DATA_FEED,  # <- critical to avoid SIP 403 on paper
-        },
-        timeout=10,
-    )
-    r.raise_for_status()
-    j = r.json()
-    bars = j.get("bars", [])
-    # Normalize to list of dicts with o,h,l,c
-    out = []
-    for b in bars:
-        out.append(
-            {"o": float(b["o"]), "h": float(b["h"]), "l": float(b["l"]), "c": float(b["c"])}
-        )
-    return out
-
-def _fetch_bars_yf(symbol: str, lookback_days: int, interval: str = "5m"):
-    if yf is None:
-        raise RuntimeError("yfinance not installed")
-    import pandas as pd
-    df = yf.download(symbol, period=f"{lookback_days}d", interval=interval, progress=False)
-    if df is None or len(df) == 0:
-        return []
-    # Ensure single row access uses .iloc[...]
-    out = []
-    for idx in range(len(df)):
-        row = df.iloc[idx]
-        out.append(
-            {
-                "o": float(row["Open"]),
-                "h": float(row["High"]),
-                "l": float(row["Low"]),
-                "c": float(row["Close"]),
-            }
-        )
-    return out
-
-def _fetch_bars(symbol: str, lookback_days: int, timeframe: str = "5Min"):
-    """
-    Tries sources in ATR_DATA_SOURCE (e.g., 'alpaca,yf').
-    """
-    first_err = None
-    for src in ATR_DATA_SOURCE:
-        src = src.strip()
-        try:
-            if src == "alpaca":
-                return _fetch_bars_alpaca(symbol, lookback_days, timeframe)
-            elif src in ("yf", "yfinance"):
-                interval = "5m" if timeframe.lower().startswith("5") else "1h"
-                return _fetch_bars_yf(symbol, lookback_days, interval)
-        except Exception as e:
-            first_err = first_err or e
-            continue
-    if first_err:
-        raise first_err
-    return []
-
-# ------------------------ ATR & exits ------------------------
-
-def _atr_from_bars(bars: List[Dict], period: int) -> float:
-    """
-    Wilder ATR over provided bar list (expects o,h,l,c). Returns last ATR value.
-    """
-    if len(bars) < period + 1:
-        raise RuntimeError(f"Not enough bars for ATR: have={len(bars)} need>={period+1}")
-
-    trs: List[float] = []
-    prev_close = bars[0]["c"]
-    for b in bars[1:]:
-        h, l, c = b["h"], b["l"], b["c"]
-        tr = max(
-            h - l,
-            abs(h - prev_close),
-            abs(l - prev_close),
-        )
-        trs.append(tr)
-        prev_close = c
-
-    # Wilder smoothing
-    atr = sum(trs[:period]) / period
-    for t in trs[period:]:
-        atr = (atr * (period - 1) + t) / period
+def _atr(symbol: str, period: int, lookback_days: int) -> float:
+    df = _fetch_bars(symbol, lookback_days, TIMEFRAME)
+    hl = (df["High"] - df["Low"]).abs()
+    hc = (df["High"] - df["Close"].shift(1)).abs()
+    lc = (df["Low"] - df["Close"].shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean().iloc[-1]
     return float(atr)
 
-def _atr(symbol: str, period: int, lookback_days: int, timeframe: str = "5Min") -> float:
-    bars = _fetch_bars(symbol, lookback_days, timeframe)
-    return _atr_from_bars(bars, period)
-
-def _cap_by_pct(base: float, target: float, cap_pct: float, up: bool) -> float:
-    """
-    Cap distance from base by +/- cap_pct.
-    up=True caps to base * (1+cap_pct), else base * (1-cap_pct).
-    """
-    if cap_pct <= 0:
-        return target
-    if up:
-        return min(target, base * (1.0 + cap_pct))
-    return max(target, base * (1.0 - cap_pct))
-
 def _atr_exits(symbol: str, side: str, base_price: float) -> Tuple[float, float]:
-    """
-    Return (tp_price, sl_price) using ATR. Ensures stop is at least $0.01 away
-    to satisfy Alpaca bracket validation.
-    """
+    if not USE_ATR:
+        # fallback to small static brackets if ATR disabled
+        tp = base_price * (1.0 + (0.004 if side == "buy" else -0.004))
+        sl = base_price * (1.0 - (0.004 if side == "buy" else -0.004))
+        return (tp, sl)
+
     atr = _atr(symbol, ATR_PERIOD, ATR_LOOKBACK_DAYS)
+    # clamp ATR-based distances with safety % caps
+    tp_off = min(ATR_MULT_TP * atr, MAX_TP_PCT * base_price)
+    sl_off = min(ATR_MULT_SL * atr, MAX_SL_PCT * base_price)
+
     if side == "buy":
-        tp = base_price + ATR_MULT_TP * atr
-        sl = base_price - ATR_MULT_SL * atr
-        # safety caps
-        tp = _cap_by_pct(base_price, tp, MAX_TP_PCT, up=True)
-        sl = _cap_by_pct(base_price, sl, MAX_SL_PCT, up=False)
-        # bracket rule: stop must be <= base - 0.01
-        sl = min(sl, base_price - 0.01)
+        tp = base_price + tp_off
+        sl = base_price - sl_off
     else:
-        tp = base_price - ATR_MULT_TP * atr
-        sl = base_price + ATR_MULT_SL * atr
-        tp = _cap_by_pct(base_price, tp, MAX_TP_PCT, up=False)
-        sl = _cap_by_pct(base_price, sl, MAX_SL_PCT, up=True)
-        # bracket rule: stop must be >= base + 0.01
-        sl = max(sl, base_price + 0.01)
-    return (float(round(tp, 2)), float(round(sl, 2)))
+        tp = base_price - tp_off
+        sl = base_price + sl_off
 
-# ------------------------ Dynamic sizing ------------------------
+    # Alpaca requires stop_price <= base - 0.01 for buys, >= base + 0.01 for sells
+    penny = 0.01
+    if side == "buy":
+        sl = min(sl, base_price - penny)
+    else:
+        sl = max(sl, base_price + penny)
 
-def _account_equity_fallback() -> float:
-    """
-    Try Alpaca account equity; fallback to env or 100k.
-    """
+    return (float(tp), float(sl))
+
+# -----------------------
+# Sizing
+# -----------------------
+def _account_equity() -> float:
     try:
-        r = S.get(f"{ALPACA_BASE_URL}/v2/account", timeout=7)
+        r = _alpaca_get("/v2/account")
         r.raise_for_status()
-        j = r.json()
-        return float(j.get("equity") or j.get("last_equity") or j.get("cash") or 100000.0)
+        eq = float(r.json().get("equity", 0.0))
+        return eq
     except Exception:
-        return float(os.getenv("EQUITY_FALLBACK", "100000"))
+        # last resort: use 100k default
+        return 100000.0
 
 def _risk_per_share(symbol: str, side: str, base_price: float) -> float:
     """
-    Estimated $ risk per share = distance between base and stop.
+    Use ATR stop distance as risk-per-share.
     """
-    if ATR_EXITS:
-        tp, sl = _atr_exits(symbol, side, base_price)
-        return abs(base_price - sl)
-    # fallback fixed 1% stop
-    return base_price * 0.01
+    tp, sl = _atr_exits(symbol, side, base_price)
+    if side == "buy":
+        rps = base_price - sl
+    else:
+        rps = sl - base_price
+    return max(float(rps), 0.01)  # avoid division by zero
 
-def _compute_dynamic_qty(symbol: str, side: str, base_price: float) -> int:
+def _strength_scale(strength: Optional[float]) -> float:
     """
-    Position size by fixed-fraction risk budgeting.
+    Convert signal strength -> [SIZE_MIN_MULT, SIZE_MAX_MULT] using
+    a curved mapping with exponent SIZE_EXP.
     """
-    equity = _account_equity_fallback()
-    risk_budget = equity * RISK_PCT_PER_TRADE
-    rps = _risk_per_share(symbol, side, base_price)
-    if rps <= 0:
+    if not USE_SIZE_BY_STRENGTH or strength is None:
+        return 1.0
+
+    s = max(min(float(strength), 1.0), 0.0)
+    lo, hi = SIZE_MIN_STRENGTH, SIZE_MAX_STRENGTH
+    if hi <= lo:
+        return 1.0
+    # normalize and curve
+    t = (s - lo) / (hi - lo)
+    t = max(0.0, min(1.0, t))
+    curved = t ** SIZE_EXP
+    mult = SIZE_MIN_MULT + (SIZE_MAX_MULT - SIZE_MIN_MULT) * curved
+    return float(max(0.0, mult))
+
+def _compute_dynamic_qty(symbol: str, side: str, base_price: float, strength: Optional[float] = None) -> int:
+    if not USE_DYNAMIC_SIZE:
         return max(MIN_QTY, 1)
-    qty = int(max(math.floor(risk_budget / rps), 0))
-    qty = max(MIN_QTY, min(qty, MAX_QTY))
-    return qty
 
-# ------------------------ Submit ------------------------
+    equity = _account_equity()
+    per_trade_risk = max(equity * RISK_PCT_PER_TRADE, 1.0)
+    rps = _risk_per_share(symbol, side, base_price)
+    if rps <= 0.0:
+        return MIN_QTY
 
-def _market_is_open() -> bool:
-    """
-    Quick read of clock. If clock says trading_on=True we consider open.
-    """
-    try:
-        r = S.get(f"{ALPACA_BASE_URL}/v2/clock", timeout=5)
-        r.raise_for_status()
-        j = r.json()
-        return bool(j.get("is_open") or j.get("trading_on"))
-    except Exception:
-        # assume open; the worst case we submit DAY orders (brackets only support RTH anyway)
-        return True
+    raw_qty = per_trade_risk / rps
+    # strength weighting
+    mult = _strength_scale(strength)
+    raw_qty *= mult
 
+    # clamp + round
+    qty = int(max(MIN_QTY, min(MAX_QTY, math.floor(raw_qty))))
+    return max(qty, 1)
+
+# -----------------------
+# Public: submit_bracket
+# -----------------------
 def submit_bracket(
     symbol: str,
     side: str,
     qty: Optional[int] = None,
-    strength: Optional[float] = None,
-    client_id: Optional[str] = None,
     time_in_force: str = "day",
-    order_type: str = "market",
-    extended_hours: bool = False,  # brackets do not support ETH on Alpaca
+    order_type: str = "market",  # "market" | "limit"
+    client_id: Optional[str] = None,
+    strength: Optional[float] = None,
 ) -> Dict:
     """
-    Place an ATR-aware bracket. If qty is None and USE_DYNAMIC_SIZE=1, compute qty dynamically.
+    Centralized bracket submitter. Applies:
+      - ATR exits (if enabled)
+      - Dynamic sizing (if enabled)
+      - Confidence-weighted sizing (if enabled and strength provided)
+      - Auto RTH/ETH rules for Alpaca brackets (brackets are RTH-only -> use 'limit' if market closed)
     """
+    symbol = symbol.upper()
     side = side.lower()
-    if side not in ("buy", "sell"):
-        raise ValueError("side must be 'buy' or 'sell'")
+    assert side in ("buy", "sell")
 
-    base_price = get_last_price(symbol)
+    is_open = _is_market_open()
+    last_price = _get_last_price(symbol)
 
-    # ATR exits if enabled
-    if ATR_EXITS:
-        tp, sl = _atr_exits(symbol, side, base_price)
-        atr_tag = f"atr(period={ATR_PERIOD},tp×{ATR_MULT_TP},sl×{ATR_MULT_SL}), dyn={USE_DYNAMIC_SIZE}"
-    else:
-        # fixed 1% exits fallback
-        if side == "buy":
-            tp = round(base_price * (1 + 0.01), 2)
-            sl = round(base_price * (1 - 0.01), 2)
-        else:
-            tp = round(base_price * (1 - 0.01), 2)
-            sl = round(base_price * (1 + 0.01), 2)
-        atr_tag = "fixed1%, dyn={USE_DYNAMIC_SIZE}"
+    # Choose entry type:
+    # - If market is open and user asked "market", use market
+    # - Else force a tight limit around last_price to emulate "marketable" after-hours
+    use_limit = (order_type == "limit") or (not is_open)
+    entry_type = "limit" if use_limit else "market"
 
-    # qty
-    if qty is None and USE_DYNAMIC_SIZE:
-        qty = _compute_dynamic_qty(symbol, side, base_price)
-    qty = int(qty or 1)
+    base_price = float(last_price)
+    take_profit, stop_loss = _atr_exits(symbol, side, base_price)
 
-    # Entry order type — DAY only (brackets require RTH)
-    is_open = _market_is_open()
-    entry_type = order_type
-    entry_limit = None
-    if not is_open and entry_type == "market":
-        # place a tight limit near last price (±$0.02) to avoid post-close market entry attempt
-        entry_type = "limit"
-        entry_limit = round(base_price + (0.02 if side == "buy" else -0.02), 2)
+    # quantity
+    if qty is None:
+        qty = _compute_dynamic_qty(symbol, side, base_price, strength=strength)
 
     payload = {
         "symbol": symbol,
         "side": side,
-        "qty": str(qty),
+        "qty": str(int(qty)),
         "time_in_force": time_in_force,
         "order_class": "bracket",
-        "take_profit": {"limit_price": f"{tp:.2f}"},
-        "stop_loss": {"stop_price": f"{sl:.2f}"},
-        "extended_hours": False,  # brackets: must be RTH
+        "take_profit": {"limit_price": f"{take_profit:.2f}"},
+        "stop_loss": {"stop_price": f"{stop_loss:.2f}"},
+        "extended_hours": False,  # Alpaca restriction for brackets
         "client_order_id": client_id or f"BRK-{symbol}-{int(time.time())}",
+        "type": entry_type,
     }
 
-    if entry_type == "market":
-        payload["type"] = "market"
-    else:
-        payload["type"] = "limit"
-        payload["limit_price"] = f"{entry_limit:.2f}"
+    if entry_type == "limit":
+        payload["limit_price"] = f"{base_price:.2f}"
 
-    print(f"INFO bracket_helper | submit bracket ({atr_tag}) -> {payload}")
+    LOG.info(
+        "submit bracket (atr(period=%s,tp×%s,sl×%s), dyn=%s) -> %s",
+        ATR_PERIOD, ATR_MULT_TP, ATR_MULT_SL, str(USE_DYNAMIC_SIZE),
+        payload,
+    )
 
-    r = S.post(f"{ALPACA_BASE_URL}/v2/orders", json=payload, timeout=10)
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as he:
-        print(f"INFO bracket_helper | submit failed: {r.text}")
-        raise
+    r = _alpaca_post("/v2/orders", payload)
+    if r.status_code >= 400:
+        try:
+            LOG.info("submit failed: %s", r.text)
+        finally:
+            r.raise_for_status()
     return r.json()
