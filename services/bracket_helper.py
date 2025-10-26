@@ -13,7 +13,7 @@ import pandas as pd
 
 # ---------- ENV ----------
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets/v2/stocks")  # fallback for IEX
 API_KEY    = os.getenv("ALPACA_API_KEY", "")
 API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
