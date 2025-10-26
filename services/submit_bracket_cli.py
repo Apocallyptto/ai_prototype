@@ -1,29 +1,38 @@
 # services/submit_bracket_cli.py
 from __future__ import annotations
-import argparse, json, sys
+import argparse
+import os
+import sys
+from services.bracket_helper import submit_bracket
 
-from services.bracket_helper import submit_bracket  # alias submit_bracket_entry also available
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Submit a single ATR-aware bracket order via Alpaca."
+    )
+    p.add_argument("--symbol", required=True, help="Ticker, e.g., MSFT")
+    p.add_argument("--side", required=True, choices=["buy", "sell"], help="buy or sell")
+    p.add_argument("--qty", type=int, default=None, help="Quantity (omit to use dynamic sizing if enabled)")
+    p.add_argument("--time-in-force", default="day", choices=["day", "gtc"], help="Time in force (brackets are day-only on Alpaca RTH)")
+    p.add_argument("--type", dest="order_type", default="market", choices=["market", "limit"], help="Entry order type")
+    p.add_argument("--client-id", default=None, help="Optional client_order_id")
+    return p
 
 def main():
-    ap = argparse.ArgumentParser(description="Submit a single ATR-aware bracket order.")
-    ap.add_argument("--symbol", required=True, help="Ticker, e.g., AAPL")
-    ap.add_argument("--side", required=True, choices=["buy","sell"], help="Entry side")
-    ap.add_argument("--qty", type=int, default=1, help="Share quantity (default: 1)")
-    ap.add_argument("--prefer-limit-when-closed", action="store_true",
-                    help="If market is closed, use limit entry near last trade (default True)")
-    args = ap.parse_args()
-
-    resp = submit_bracket(
-        args.symbol.upper(),
-        args.side.lower(),
-        args.qty,
-        prefer_limit_when_closed=True if args.prefer_limit_when_closed else True,
-    )
-    print(json.dumps(resp, indent=2))
+    args = build_parser().parse_args()
+    try:
+        resp = submit_bracket(
+            symbol=args.symbol.upper(),
+            side=args.side.lower(),
+            qty=args.qty,
+            time_in_force=args.time_in_force,
+            order_type=args.order_type,
+            client_id=args.client_id,
+        )
+        oid = resp.get("id") or resp.get("order", {}).get("id")
+        print(f"OK placed {args.symbol} {args.side} qty={args.qty or '(dynamic)'} id={oid}")
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
