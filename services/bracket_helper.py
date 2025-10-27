@@ -50,51 +50,54 @@ def _alpaca_headers() -> Dict[str, str]:
     return {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_API_SECRET}
 
 def _fetch_bars(symbol: str, lookback_days: int, timeframe: str) -> pd.DataFrame:
-    """Fetch bars using Alpaca data API. Fallback to Yahoo if 403 (SIP restriction)."""
+    """Fetch bars from Alpaca or Yahoo (if USE_YF_DATA=1 or SIP restricted)."""
+    import yfinance as yf
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=lookback_days)
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": timeframe,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "limit": 10000,
-        "adjustment": "all",
-    }
-    r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
+    use_yf = os.getenv("USE_YF_DATA", "0") == "1"
 
-    if r.status_code == 403 or r.status_code == 429:
-        # === yfinance fallback ===
-        import yfinance as yf
-        max_days = 55 if timeframe.lower() in ("5min", "5m") else 365
-        safe_start = max(end - timedelta(days=max_days), start)
+    if not use_yf:
         try:
-            df = yf.download(
-                symbol,
-                start=safe_start.date(),
-                end=end.date(),
-                interval="5m",
-                progress=False
-            )
+            url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+            params = {
+                "timeframe": timeframe,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "limit": 10000,
+                "adjustment": "all",
+            }
+            r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
+            if r.status_code == 403 or r.status_code == 429:
+                use_yf = True
+            else:
+                r.raise_for_status()
+                js = r.json()
+                bars = js.get("bars", [])
+                if not bars:
+                    raise RuntimeError("No bars from Alpaca")
+                df = pd.DataFrame(bars)
+                df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+                return df
         except Exception as e:
-            raise RuntimeError(f"yfinance download failed: {e}")
-        if df.empty:
-            raise RuntimeError("No bars from yfinance fallback")
-        df = df.rename(columns=str.capitalize).rename(columns={"Adj Close": "AdjClose"})
-        df = df.reset_index().rename(columns={"Datetime": "t"})
-        return df
+            print(f"WARN: Alpaca data failed ({e}), using Yahoo fallback.")
+            use_yf = True
 
-    r.raise_for_status()
-    js = r.json()
-    bars = js.get("bars", [])
-    if not bars:
-        raise RuntimeError("No bars from Alpaca")
-    df = pd.DataFrame(bars)
-    if {"o", "h", "l", "c", "v", "t"}.issubset(df.columns):
-        df = df[["t", "o", "h", "l", "c", "v"]].rename(
-            columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"}
-        )
+    # === Yahoo fallback ===
+    max_days = 55 if timeframe.lower() in ("5min", "5m") else 365
+    safe_start = max(end - timedelta(days=max_days), start)
+    df = yf.download(
+        symbol,
+        start=safe_start.date(),
+        end=end.date(),
+        interval="5m",
+        progress=False,
+    )
+    if df.empty:
+        raise RuntimeError("No bars from Yahoo fallback")
+    df = df.reset_index().rename(columns={"Datetime": "t"})
+    df = df.rename(columns={"Open": "Open", "High": "High", "Low": "Low", "Close": "Close", "Volume": "Volume"})
     return df
+
 
 
 def _atr(symbol: str, period: int, lookback_days: int) -> float:
