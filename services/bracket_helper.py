@@ -50,7 +50,7 @@ def _alpaca_headers() -> Dict[str, str]:
     return {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_API_SECRET}
 
 def _fetch_bars(symbol: str, lookback_days: int, timeframe: str) -> pd.DataFrame:
-    """Fetch bars using Alpaca data API. We keep this for ATR only; if 403 due to SIP, fallback to yfinance."""
+    """Fetch bars using Alpaca data API. Fallback to Yahoo if 403 (SIP restriction)."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=lookback_days)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
@@ -62,26 +62,40 @@ def _fetch_bars(symbol: str, lookback_days: int, timeframe: str) -> pd.DataFrame
         "adjustment": "all",
     }
     r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
-    if r.status_code == 403:
-        # Fallback to yfinance (no recent SIP restriction)
+
+    if r.status_code == 403 or r.status_code == 429:
+        # === yfinance fallback ===
         import yfinance as yf
-        df = yf.download(symbol, start=(end - timedelta(days=lookback_days*2)).date(), end=end.date(), interval="5m", progress=False)
+        max_days = 55 if timeframe.lower() in ("5min", "5m") else 365
+        safe_start = max(end - timedelta(days=max_days), start)
+        try:
+            df = yf.download(
+                symbol,
+                start=safe_start.date(),
+                end=end.date(),
+                interval="5m",
+                progress=False
+            )
+        except Exception as e:
+            raise RuntimeError(f"yfinance download failed: {e}")
         if df.empty:
             raise RuntimeError("No bars from yfinance fallback")
         df = df.rename(columns=str.capitalize).rename(columns={"Adj Close": "AdjClose"})
         df = df.reset_index().rename(columns={"Datetime": "t"})
         return df
+
     r.raise_for_status()
     js = r.json()
-    rows = js.get("bars", [])
-    if not rows:
+    bars = js.get("bars", [])
+    if not bars:
         raise RuntimeError("No bars from Alpaca")
-    df = pd.DataFrame(rows)
-    # Normalize to typical OHLC names if needed
-    if {"o","h","l","c","v","t"}.issubset(df.columns):
-        df = df[["t","o","h","l","c","v"]]
-        df = df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
+    df = pd.DataFrame(bars)
+    if {"o", "h", "l", "c", "v", "t"}.issubset(df.columns):
+        df = df[["t", "o", "h", "l", "c", "v"]].rename(
+            columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"}
+        )
     return df
+
 
 def _atr(symbol: str, period: int, lookback_days: int) -> float:
     df = _fetch_bars(symbol, lookback_days, TIMEFRAME)
