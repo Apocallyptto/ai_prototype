@@ -1,110 +1,63 @@
 # services/executor_bracket.py
 from __future__ import annotations
 
-import os
-import sys
-import json
-import logging
+import os, sys, argparse, logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
-
 import psycopg2
-from psycopg2.extras import RealDictCursor
 
 from services.bracket_helper import submit_bracket
 
-LOG = logging.getLogger("executor_bracket")
-LOG.setLevel(logging.INFO)
-ch = logging.StreamHandler()
-ch.setFormatter(logging.Formatter("%(levelname)s %(name)s | %(message)s"))
-if not LOG.handlers:
-    LOG.addHandler(ch)
+log = logging.getLogger("executor_bracket")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_DSN = os.getenv("DATABASE_URL")
 
-EXECUTOR_SIGNAL_WINDOW_MIN = int(os.getenv("EXECUTOR_SIGNAL_WINDOW_MIN", "20"))
-DEFAULT_MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
 
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _fetch_recent_signals(
-    since_min: int,
-    min_strength: float,
-    portfolio_id: Optional[int] = None,
-) -> List[Dict]:
-    """
-    Return latest signal per symbol within window, >= min_strength.
-    """
-    window_since = _now() - timedelta(minutes=since_min)
+def fetch_recent_signals(window_min: int) -> list[tuple[str,str,float,datetime]]:
+    """Return most recent signal per symbol within window."""
+    since = datetime.now(timezone.utc) - timedelta(minutes=window_min)
     sql = """
-    with ranked as (
-        select s.*
-             , row_number() over (partition by s.symbol order by s.created_at desc) as rn
-        from public.signals s
-        where s.created_at >= %s
-          and s.strength >= %s
-          and (%s is null or s.portfolio_id = %s)
-    )
-    select symbol, side, strength, created_at, source
-    from ranked
-    where rn = 1
-    order by created_at desc
+        SELECT DISTINCT ON (symbol)
+               symbol, side, strength, created_at
+        FROM public.signals
+        WHERE created_at >= %s
+          AND strength >= %s
+          AND symbol = ANY(%s)
+        ORDER BY symbol, created_at DESC;
     """
-    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, (window_since, float(min_strength), portfolio_id, portfolio_id))
+    with psycopg2.connect(DB_DSN) as c, c.cursor() as cur:
+        cur.execute(sql, (since, MIN_STRENGTH, SYMBOLS))
         rows = cur.fetchall()
-    # Keep only symbols we care about
-    rows = [r for r in rows if r["symbol"].upper() in SYMBOLS]
     return rows
 
-def _place_from_rows(rows: List[Dict]) -> int:
-    placed = 0
-    for r in rows:
-        sym = r["symbol"].upper()
-        side = r["side"].lower()
-        strength = float(r.get("strength", 0.0))
-        try:
-            resp = submit_bracket(
-                symbol=sym,
-                side=side,
-                qty=None,                 # let dynamic sizing + strength decide (if enabled)
-                time_in_force="day",
-                order_type="market",      # auto-limit if market closed
-                client_id=None,
-                strength=strength,
-            )
-            oid = resp.get("id") or resp.get("order", {}).get("id")
-            LOG.info("Placed %s %s (strength=%.2f) id=%s source=%s at=%s",
-                     sym, side, strength, oid, r.get("source", "unknown"), r.get("created_at"))
-            placed += 1
-        except Exception as e:
-            LOG.error("%s %s: submit failed -> %s", sym, side, str(e))
-    return placed
-
 def main():
-    import argparse
-    ap = argparse.ArgumentParser(description="Place bracket orders from recent signals.")
-    ap.add_argument("--since-min", type=int, default=EXECUTOR_SIGNAL_WINDOW_MIN, help="Window (minutes) to read signals")
-    ap.add_argument("--min-strength", type=float, default=DEFAULT_MIN_STRENGTH, help="Minimum strength to consider")
-    ap.add_argument("--portfolio-id", type=int, default=None, help="Optional portfolio filter")
-    ap.add_argument("--max-positions", type=int, default=None, help="(reserved) Max positions")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--since-min", type=int, default=int(os.getenv("EXECUTOR_SIGNAL_WINDOW_MIN","20")))
+    ap.add_argument("--min-strength", type=float, default=MIN_STRENGTH)
+    ap.add_argument("--portfolio-id", type=str, default=None)
+    ap.add_argument("--max-positions", type=int, default=None)
     args = ap.parse_args()
 
-    LOG.info(
-        "symbols=%s min_strength=%.2f window_min=%d portfolio_id=%s",
-        SYMBOLS, args.min_strength, args.since_min, "ANY" if args.portfolio_id is None else args.portfolio_id,
-    )
+    log.info("symbols=%s min_strength=%.2f window_min=%d portfolio_id=%s",
+             SYMBOLS, args.min_strength, args.since_min, args.portfolio_id or "ANY")
 
-    rows = _fetch_recent_signals(args.since_min, args.min_strength, args.portfolio_id)
+    rows = fetch_recent_signals(args.since_min)
     if not rows:
-        LOG.info("No signals within window.")
+        log.info("No signals within window.")
         return
 
-    placed = _place_from_rows(rows)
-    LOG.info("Done. Placed %d bracket order(s).", placed)
+    placed = 0
+    for sym, side, strength, created_at in rows:
+        try:
+            resp = submit_bracket(sym, side, qty=None, strength=float(strength))
+            log.info("Placed %s %s (strength=%.2f) id=%s source=%s at=%s",
+                     sym, side, strength, resp.get("id"), None, created_at)
+            placed += 1
+        except Exception as e:
+            log.error("%s %s: submit failed -> %s", sym, side, e)
+    log.info("Done. Placed %d bracket order(s).", placed)
 
 if __name__ == "__main__":
     main()
