@@ -20,7 +20,7 @@ def _utcnow() -> str:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Submit one bracket order with guards.")
+    p = argparse.ArgumentParser(description="Submit one bracket order with guards + notifications.")
     p.add_argument("--symbol", required=True, help="Ticker, e.g., MSFT")
     p.add_argument("--side", required=True, choices=["buy", "sell"])
     p.add_argument("--qty", type=int, help="Optional fixed quantity (else dynamic sizing)")
