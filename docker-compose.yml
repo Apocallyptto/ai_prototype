@@ -40,7 +40,7 @@ services:
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
       ALPACA_BASE_URL: https://paper-api.alpaca.markets
       ALPACA_DATA_URL: https://data.alpaca.markets
-    command: ["python", "-m", "jobs.executor_bracket"]
+    command: ["python", "-m", "services.executor_bracket"]
     depends_on:
       - postgres
 
