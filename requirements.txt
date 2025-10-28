@@ -1,12 +1,32 @@
-requests
+#requests
 alpaca-trade-api
-streamlit>=1.30
-pandas>=2.0
-numpy>=1.26
+#streamlit>=1.30
+#pandas>=2.0
+#numpy>=1.26
 sqlalchemy>=2.0
-psycopg2-binary>=2.9.9
+#psycopg2-binary>=2.9.9
 alembic>=1.13
-yfinance>=0.2.40
+#yfinance>=0.2.40
 plotly>=5.22            # optional, used by charts
 pytest>=7.4
 testcontainers>=4.6,<5
+
+# === Core ===
+numpy==1.26.4
+pandas==2.2.2
+requests==2.32.3
+yfinance==0.2.43
+matplotlib==3.9.2
+
+# === ML / Signals ===
+scikit-learn==1.5.2
+joblib==1.4.2
+
+# === DB ===
+psycopg2-binary==2.9.9
+
+# === Apps / Dashboard ===
+streamlit==1.39.0
+
+# === Optional (keep if you already use them) ===
+python-dotenv==1.0.1
