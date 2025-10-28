@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Optional, List
 
-# Stable helper API (with your shim + fallbacks)
+# Stable helper API (shim + fallbacks)
 from services.bracket_public import (
     get_last_price,
     compute_dynamic_qty,
@@ -16,12 +16,19 @@ from services.bracket_public import (
 from services.position_guard import has_same_side_position
 from services.risk_budget import can_open
 
+# Notifications
+from services.notify import (
+    notify_trade_opened,
+    notify_trade_blocked,
+    notify_trade_skipped,
+)
+
 
 @dataclass
 class Signal:
     """
     Minimal signal model used by this executor.
-    Adapt/extend if your pipeline adds fields.
+    Extend if your pipeline adds fields.
     """
     symbol: str
     side: str                   # 'buy' or 'sell'
@@ -41,29 +48,30 @@ def place_bracket_for_signal(signal: Signal, logger) -> Optional[dict]:
       1) same-side position guard
       2) portfolio risk-budget guard
       3) submit bracket order
-
+      4) send notifications
     Returns broker response dict (if any), or None when skipped/blocked.
     """
     symbol = signal.symbol.upper().strip()
-    side = str(signal.side).lower().strip()  # 'buy' or 'sell'
+    side = str(signal.side).lower().strip()
     if side not in ("buy", "sell"):
         logger.error(f"[{_utcnow()}] invalid side '{signal.side}' for {symbol}; skipping")
         return None
 
-    # Determine entry price and qty
     last_price = signal.price if signal.price is not None else get_last_price(symbol)
     qty = signal.qty if signal.qty is not None else compute_dynamic_qty(symbol, side, last_price)
 
     # ---- Guard 1: prevent same-side duplicates ----
     if has_same_side_position(symbol, side):
-        logger.info(f"[{_utcnow()}] skip {symbol} {side}: same-side position already open")
+        why = "same-side position already open"
+        logger.info(f"[{_utcnow()}] skip {symbol} {side}: {why}")
+        notify_trade_skipped(symbol, side, why)
         return None
 
     # ---- Guard 2: portfolio risk-budget cap ----
     ok, reason = can_open(symbol, side, qty)
     logger.info(f"[{_utcnow()}] risk-budget check for {symbol} {side} qty={qty}: {reason}")
     if not ok:
-        # Optionally: mark skipped in DB here if you track signals
+        notify_trade_blocked(symbol, side, qty, reason)
         return None
 
     # ---- Submit the bracket order ----
@@ -71,19 +79,39 @@ def place_bracket_for_signal(signal: Signal, logger) -> Optional[dict]:
         symbol=symbol,
         side=side,               # 'buy' or 'sell'
         qty=qty,
-        last_price=last_price,   # or use your own limit/entry calc
+        last_price=last_price,   # mapped by shim to your helper's expected kw
     )
     logger.info(
         f"[{_utcnow()}] alpaca order -> {symbol} {side} qty={qty} "
         f"last={last_price:.4f} | response={resp}"
     )
+
+    # Extract TP/SL best-effort for the notify
+    tp = None
+    sl = None
+    try:
+        legs = resp.get("legs") or []
+        for leg in legs:
+            if str(leg.get("type")) == "limit" and str(leg.get("side")) == "sell":
+                tp = float(leg.get("limit_price"))
+            if str(leg.get("type")) == "stop" and str(leg.get("side")) == "sell":
+                sl = float(leg.get("stop_price"))
+    except Exception:
+        pass
+
+    reason_txt = (signal.source or "executor")
+    if signal.strength is not None:
+        try:
+            reason_txt += f" (strength {float(signal.strength):.2f})"
+        except Exception:
+            pass
+
+    notify_trade_opened(symbol, side, int(qty), last_price, tp, sl, reason_txt)
     return resp
 
 
 def place_brackets_for_signals(signals: Iterable[Signal], logger) -> List[Optional[dict]]:
-    """
-    Convenience runner for a batch of signals.
-    """
+    """Batch runner."""
     results: List[Optional[dict]] = []
     for sig in signals:
         try:
