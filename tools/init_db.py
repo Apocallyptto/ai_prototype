@@ -1,67 +1,53 @@
 # tools/init_db.py
 from __future__ import annotations
-import os, sys
-from datetime import datetime, timezone
+import os, sys, logging
+import psycopg2
+from psycopg2.extras import execute_batch
 
-# prefer psycopg3; fallback psycopg2
-try:
-    import psycopg  # type: ignore
-    HAVE3 = True
-except Exception:
-    HAVE3 = False
-    import psycopg2  # type: ignore
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO").upper(),
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("init_db")
 
-DDL = """
-CREATE TABLE IF NOT EXISTS signals (
-  id           BIGSERIAL PRIMARY KEY,
-  symbol       TEXT NOT NULL,
-  side         TEXT NOT NULL CHECK (side IN ('buy','sell')),
-  strength     DOUBLE PRECISION NOT NULL,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  portfolio_id INT NOT NULL DEFAULT 1
-);
-CREATE INDEX IF NOT EXISTS idx_signals_created ON signals (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_signals_symbol_created ON signals (symbol, created_at DESC);
-"""
+DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
 
-SAMPLE = """
-INSERT INTO signals (symbol, side, strength, created_at, portfolio_id)
-VALUES ('AAPL','buy',0.65, NOW(), 1),
-       ('MSFT','buy',0.58, NOW(), 1)
-RETURNING id, symbol, side, strength, created_at, portfolio_id;
-"""
+CORE_DDL = [
+    # signals table (simple superset; safe if already exists)
+    """
+    CREATE TABLE IF NOT EXISTS signals (
+        id SERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('buy','sell')),
+        strength NUMERIC,
+        source TEXT DEFAULT 'rule',
+        portfolio_id TEXT NULL
+    );
+    """,
+    # daily_pnl (coarse; migrations may add columns later)
+    """
+    CREATE TABLE IF NOT EXISTS daily_pnl (
+        id SERIAL PRIMARY KEY,
+        day DATE UNIQUE NOT NULL,
+        equity NUMERIC,
+        realized NUMERIC DEFAULT 0,
+        unrealized NUMERIC DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    """
+]
 
-def main():
-    dsn = os.getenv("DATABASE_URL")
-    if not dsn:
-        host = os.getenv("PGHOST","localhost")
-        user = os.getenv("PGUSER","postgres")
-        pw   = os.getenv("PGPASSWORD","postgres")
-        db   = os.getenv("PGDATABASE","ai_prototype")
-        port = os.getenv("PGPORT","5432")
-        if HAVE3:
-            conn = psycopg.connect(host=host, user=user, password=pw, dbname=db, port=port, autocommit=True)
-        else:
-            conn = psycopg2.connect(host=host, user=user, password=pw, dbname=db, port=port)
-            conn.autocommit = True
-    else:
-        if HAVE3:
-            conn = psycopg.connect(dsn, autocommit=True)
-        else:
-            conn = psycopg2.connect(dsn)
-            conn.autocommit = True
-
-    with conn.cursor() as cur:
-        cur.execute(DDL)
-        print("Ensured table 'signals'.")
-        cur.execute(SAMPLE)
-        rows = cur.fetchall()
-        print("Inserted sample signals:")
-        for r in rows:
-            print(r)
-
-    conn.close()
-    print("OK")
+def main() -> None:
+    log.info("INIT_DB | connecting %s", DB_URL)
+    with psycopg2.connect(DB_URL) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            for stmt in CORE_DDL:
+                cur.execute(stmt)
+    log.info("INIT_DB | done.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.exception("INIT_DB failed: %s", e)
+        sys.exit(1)
