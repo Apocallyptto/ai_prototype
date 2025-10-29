@@ -1,144 +1,122 @@
 # jobs/make_signals_ensemble.py
 from __future__ import annotations
 import os
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+import logging
+import subprocess
+from typing import Dict, Any
 
-import psycopg2
-import numpy as np
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("make_signals_ensemble")
 
-# ---- Config from env ----
-SYMBOLS       = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-MIN_STRENGTH  = float(os.getenv("MIN_STRENGTH", "0.60"))
-DATABASE_URL  = os.getenv("DATABASE_URL")  # required for DB writes
-PORTFOLIO_ID  = os.getenv("PORTFOLIO_ID")  # optional tag
+# ---- Optional libs (guarded) ----
+_HAS_JOBLIB = False
+_HAS_TORCH = False
 
-# ---- Import model predictors ----
-# NN is required; ML is optional (fallback to NN only if ML artifacts missing).
-from jobs.make_signals_nn import nn_predict as nn_predict  # returns {SYM: {"side","strength"}}
+try:
+    import joblib  # noqa: F401
+    _HAS_JOBLIB = True
+except Exception as e:
+    log.warning("NN ensemble: joblib not available (%s) → NN path will be skipped.", e)
 
-def _try_ml_predict(symbols: List[str]) -> Dict[str, Dict[str, float]]:
+try:
+    import torch  # noqa: F401
+    _HAS_TORCH = True
+except Exception as e:
+    log.warning("NN ensemble: torch not available (%s) → NN path will be skipped.", e)
+
+DISABLE_NN = os.getenv("DISABLE_NN", "0") == "1"
+USE_NN = (not DISABLE_NN) and _HAS_JOBLIB and _HAS_TORCH
+
+
+def _symbols_env() -> str:
+    return os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
+
+
+def _run_module(mod: str, *args: str) -> int:
     """
-    Try to import and run ML predictor. If model files are missing or import fails,
-    return an empty dict so we can fall back to NN-only.
+    Run a Python module in a subprocess within this container image, inheriting env.
+    Returns the process return code.
     """
-    try:
-        from jobs.make_signals_ml import predict_for_symbols as ml_predict
-        preds = ml_predict(symbols)  # same shape as NN
-        return preds or {}
-    except FileNotFoundError:
-        # models/ml_5m.pkl not found
+    cmd = ["python", "-m", mod, *args]
+    log.info("run: %s", " ".join(cmd))
+    return subprocess.call(cmd)
+
+
+def _maybe_nn_predict(symbols_csv: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Optional NN predictor hook.
+    Returns {} when NN is disabled or libs are missing.
+    """
+    if not USE_NN:
+        why = "disabled via DISABLE_NN=1" if DISABLE_NN else "missing libs (torch/joblib)"
+        log.info("NN path is OFF (%s). Ensemble will use rule/technicals only.", why)
         return {}
-    except Exception as e:
-        # Any other issue: be robust, run NN-only
-        print(f"[WARN] ML predictor unavailable: {e}")
-        return {}
+    # Import here (late) so missing libs don’t break the module import
+    from jobs.make_signals_nn import nn_predict  # type: ignore
+    return nn_predict(symbols_csv)
 
-# ---- DB helpers ----
-def _ensure_signals_table(cur) -> None:
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS public.signals (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,
-        strength DOUBLE PRECISION NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        portfolio_id TEXT
-    );
-    """)
 
-def _insert_signal(symbol: str, side: str, strength: float, ts: datetime, portfolio_id: str | None) -> None:
-    if not DATABASE_URL:
-        return
-    with psycopg2.connect(dsn=DATABASE_URL) as conn, conn.cursor() as cur:
-        _ensure_signals_table(cur)
-        cur.execute(
-            """INSERT INTO public.signals (symbol, side, strength, created_at, portfolio_id)
-               VALUES (%s, %s, %s, %s, %s)""",
-            (symbol, side, float(strength), ts, portfolio_id)
-        )
-
-# ---- Blending logic ----
-def _blend(nn_val: float | None, ml_val: float | None) -> float | None:
+def _weighted_ensemble(
+    rule_rows: Dict[str, Dict[str, Any]],
+    nn_rows: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
     """
-    Blend two probabilities/strengths (0..1). If one is None, return the other.
-    Simple arithmetic mean for robustness.
+    Combine rule + NN strengths.
+    Row format: {SYM: {"side": "buy|sell", "strength": float}}
+    On side conflict, keep record with larger |strength|.
     """
-    vals = [v for v in (nn_val, ml_val) if v is not None]
-    if not vals:
-        return None
-    return float(sum(vals) / len(vals))
+    out: Dict[str, Dict[str, Any]] = {}
+    w_rule = float(os.getenv("W_RULE", "0.7"))
+    w_nn = float(os.getenv("W_NN", "0.3"))
 
-def _to_buy_prob(side: str, strength: float) -> float:
-    """
-    Convert (side, strength) into probability of 'buy'.
-    If side=='buy': prob_up = strength
-    If side=='sell': prob_up = 1 - strength
-    """
-    return float(strength) if side == "buy" else float(1.0 - strength)
+    # seed with rule
+    for sym, rec in rule_rows.items():
+        out[sym] = dict(rec)
 
-def _from_buy_prob(prob_up: float) -> Tuple[str, float]:
-    """
-    Convert probability of 'buy' back to (side, strength).
-    """
-    if prob_up >= 0.5:
-        return "buy", float(prob_up)
-    else:
-        return "sell", float(1.0 - prob_up)
-
-# ---- Public API: predict (no DB writes) ----
-def predict_for_symbols(symbols: List[str]) -> Dict[str, Dict[str, float]]:
-    """
-    Returns: { "AAPL": {"side":"buy","strength":0.62}, ... } from blended NN+ML.
-    """
-    nn = nn_predict(symbols)                   # required
-    ml = _try_ml_predict(symbols)              # optional
-
-    out: Dict[str, Dict[str, float]] = {}
-    for sym in symbols:
-        nn_r = nn.get(sym)
-        ml_r = ml.get(sym) if ml else None
-
-        nn_prob = _to_buy_prob(nn_r["side"], nn_r["strength"]) if nn_r else None
-        ml_prob = _to_buy_prob(ml_r["side"], ml_r["strength"]) if ml_r else None
-
-        blended_prob = _blend(nn_prob, ml_prob)
-        if blended_prob is None:
+    # blend NN
+    for sym, rec in nn_rows.items():
+        if sym not in out:
+            out[sym] = {"side": rec.get("side"), "strength": float(rec.get("strength", 0.0))}
             continue
 
-        side, strength = _from_buy_prob(blended_prob)
-        out[sym] = {"side": side, "strength": strength}
+        nn_side = rec.get("side")
+        nn_str = float(rec.get("strength", 0.0))
+        rule_side = out[sym].get("side")
+        rule_str = float(out[sym].get("strength", 0.0))
+
+        if nn_side == rule_side:
+            out[sym]["strength"] = w_rule * rule_str + w_nn * nn_str
+        else:
+            if abs(nn_str) > abs(rule_str):
+                out[sym] = {"side": nn_side, "strength": nn_str}
+
     return out
 
-# ---- CLI entrypoint: predict + INSERT into DB ----
+
 def main():
-    now = datetime.now(timezone.utc)
-    preds = predict_for_symbols(SYMBOLS)
+    symbols = _symbols_env()
+    log.info("make_signals_ensemble | symbols=%s", symbols)
 
-    any_inserted = False
-    for sym in SYMBOLS:
-        r = preds.get(sym)
-        if not r:
-            continue
-        side, strength = r["side"], float(r["strength"])
+    # 1) Produce rule/technical signals into DB by running the existing module.
+    #    (No import of jobs.make_signals needed.)
+    rc = _run_module("jobs.make_signals")
+    if rc != 0:
+        log.error("jobs.make_signals failed (rc=%s). Aborting ensemble step.", rc)
+        return
 
-        if strength < MIN_STRENGTH:
-            # Verbose and clear in logs:
-            print(f"{sym}: below MIN_STRENGTH ({strength:.2f} < {MIN_STRENGTH}) (ensemble)")
-            continue
+    # 2) Optionally compute NN opinions (in-memory)
+    nn_rows = _maybe_nn_predict(symbols)
 
-        # Print exactly what we insert:
-        print(f"{sym}: {side} strength={strength:.2f} at {now.isoformat()} (ensemble)")
+    if nn_rows:
+        log.info("NN opinions present for %d symbols; ensemble blending ready.", len(nn_rows))
+        # If you later want to persist blended values, fetch the just-written rule rows
+        # from the DB and upsert a blended record. Keeping logging only for now.
+    else:
+        log.info("No NN opinions; using rule/technicals only.")
 
-        # Persist to DB so executor_bracket reads the latest side
-        try:
-            _insert_signal(sym, side, strength, now, PORTFOLIO_ID)
-            any_inserted = True
-        except Exception as e:
-            print(f"[WARN] failed to insert signal for {sym}: {e}")
-
-    if not any_inserted:
-        print("ensemble: no signals above threshold.")
 
 if __name__ == "__main__":
     main()
