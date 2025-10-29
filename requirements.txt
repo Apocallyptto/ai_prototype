@@ -23,7 +23,7 @@ numpy==2.1.2
 pandas==2.2.3
 
 # market data
-yfinance==0.2.44
+yfinance==0.2.48
 requests==2.32.3
 
 # ML (CPU) for the GBC model
@@ -42,3 +42,4 @@ pytz==2024.2
 
 # broker (if you use Alpaca python client anywhere)
 alpaca-trade-api==3.2.0
+alpaca-py==0.29.0
