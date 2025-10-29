@@ -1,15 +1,30 @@
-# Lean image; no apt-get needed
+# Use lightweight Python image
 FROM python:3.12-slim
 
+# Install system deps for SSL, timezone, and science stack
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    curl \
+    tzdata \
+    ca-certificates \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set timezone
+ENV TZ=UTC
+
+# Set working directory
 WORKDIR /app
 
-# Copy only reqs first for better caching
+# Copy dependency list
 COPY requirements.txt /app/requirements.txt
+
+# Install Python deps
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
-# Now copy the rest of the repo
+# Copy project files
 COPY . /app
 
-# Env & default
-ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app
-CMD ["python", "-m", "jobs.cron_nn"]
+# Default command (can be overridden by compose)
+CMD ["python", "-m", "jobs.cron_v2"]
