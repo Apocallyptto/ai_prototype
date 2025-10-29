@@ -10,6 +10,8 @@ alembic>=1.13
 plotly>=5.22            # optional, used by charts
 pytest>=7.4
 testcontainers>=4.6,<5
+torch==2.4.1
+
 
 # === Core ===
 numpy==1.26.4
