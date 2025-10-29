@@ -1,30 +1,22 @@
-# Use lightweight Python image
 FROM python:3.12-slim
 
-# Install system deps for SSL, timezone, and science stack
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    curl \
-    tzdata \
-    ca-certificates \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+# Fix for slow / blocked Debian mirrors
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list
 
-# Set timezone
-ENV TZ=UTC
+# Retry install 3x to avoid transient network failures
+RUN for i in 1 2 3; do \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        tzdata ca-certificates curl libpq-dev && \
+      update-ca-certificates && \
+      break || sleep 5; \
+    done && \
+    rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
-
-# Copy dependency list
 COPY requirements.txt /app/requirements.txt
-
-# Install Python deps
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
-
-# Copy project files
 COPY . /app
 
-# Default command (can be overridden by compose)
+ENV TZ=UTC
 CMD ["python", "-m", "jobs.cron_v2"]
