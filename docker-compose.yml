@@ -35,19 +35,18 @@ services:
       MAX_QTY: "10"
       EQUITY: "100000"
       MAX_PORTFOLIO_RISK_PCT: "0.01"
-      # symbols & cadence (cron_v2 / cron_nn)
+      # symbols & cadence (cron_nn)
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "180"
       MIN_STRENGTH: "0.60"
       LOG_LEVEL: INFO
-      # alpaca
+      # Alpaca
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
       ALPACA_BASE_URL: https://paper-api.alpaca.markets
       ALPACA_DATA_URL: https://data.alpaca.markets
-      # DB (use Docker service name 'postgres', NOT localhost)
+      # DB for all Python code (tools/sync_orders, etc.)
       DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-    # You said you switched to cron_nn — keep whichever you prefer:
     command: ["python", "-m", "jobs.cron_nn"]
     depends_on:
       postgres:
@@ -67,7 +66,6 @@ services:
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
       ALPACA_BASE_URL: https://paper-api.alpaca.markets
       ALPACA_DATA_URL: https://data.alpaca.markets
-      # DB available if you later read/write here too
       DB_URL: postgresql://postgres:postgres@postgres:5432/trader
     command: ["python", "-m", "jobs.trailing_guard"]
     depends_on:
