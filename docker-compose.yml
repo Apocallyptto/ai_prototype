@@ -1,4 +1,4 @@
-version: "3.9"
+name: ai_prototype
 
 services:
   postgres:
@@ -9,81 +9,98 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: trader
-    ports: ["5432:5432"]
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
   executor:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: trader_executor
+    depends_on:
+      postgres:
+        condition: service_started
+        required: true
+    command: ["python", "-m", "jobs.cron_v2"]
     restart: always
     environment:
-      PYTHONPATH: /app
-      TRADING_MODE: paper
+      # --- DB ---
+      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/trader
+
+      # --- Trading / symbols ---
+      SYMBOLS: "AAPL,MSFT,SPY"
+      MIN_STRENGTH: "0.60"
+      CRON_SLEEP_SECONDS: "180"
+      LOG_LEVEL: "INFO"
+      TRADING_MODE: "paper"
+
+      # --- Broker (load from .env if you prefer) ---
+      ALPACA_API_KEY: "${ALPACA_API_KEY:-change_me}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET:-change_me}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+
+      # --- ATR / sizing defaults ---
       USE_YF_DATA: "1"
-      ATR_EXITS: "1"
+      USE_DYNAMIC_SIZE: "1"
+      EQUITY: "100000"
+      RISK_PCT_PER_TRADE: "0.0025"
+      MAX_PORTFOLIO_RISK_PCT: "0.01"
+      MIN_QTY: "1"
+      MAX_QTY: "10"
       ATR_PERIOD: "14"
       ATR_LOOKBACK_DAYS: "30"
       ATR_MULT_TP: "1.5"
       ATR_MULT_SL: "1.0"
-      USE_DYNAMIC_SIZE: "1"
-      RISK_PCT_PER_TRADE: "0.0025"
-      MIN_QTY: "1"
-      MAX_QTY: "10"
-      EQUITY: "100000"
-      MAX_PORTFOLIO_RISK_PCT: "0.01"
-      SYMBOLS: "AAPL,MSFT,SPY"
-      CRON_SLEEP_SECONDS: "180"
-      MIN_STRENGTH: "0.60"
-      LOG_LEVEL: INFO
-      # 🧠 keep NN off until torch is installed
-      DISABLE_NN: "1"
-      # Alpaca
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_BASE_URL: https://paper-api.alpaca.markets
-      ALPACA_DATA_URL: https://data.alpaca.markets
-      # DB
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-    command: ["python", "-m", "scripts.bootstrap"]
+      ATR_EXITS: "1"
+
+      # --- ML/Nn path flag ---
+      DISABLE_NN: "1"   # keep ON unless your image has torch+joblib
+
+      # Python path inside image
+      PYTHONPATH: /app
+
+  trailing_guard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trader_trailing_guard
     depends_on:
       postgres:
         condition: service_started
         required: true
-
-  trailing_guard:
-    build: .
-    container_name: trader_trailing_guard
+    command: ["python", "-m", "jobs.trailing_guard"]
     restart: always
     environment:
       PYTHONPATH: /app
-      TRAIL_INTERVAL: "120"
+      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
+      ALPACA_API_KEY: "${ALPACA_API_KEY:-change_me}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET:-change_me}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
       ATR_PERIOD: "14"
       ATR_LOOKBACK_DAYS: "30"
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_BASE_URL: https://paper-api.alpaca.markets
-      ALPACA_DATA_URL: https://data.alpaca.markets
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-    command: ["python", "-m", "jobs.trailing_guard"]
+      TRAIL_INTERVAL: "120"
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trader_dashboard
     depends_on:
       postgres:
         condition: service_started
         required: true
-
-  dashboard:
-    build: .
-    container_name: trader_dashboard
+    command: ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
     restart: unless-stopped
     environment:
       PYTHONPATH: /app
       DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-    command: ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-    ports: ["8501:8501"]
-    depends_on:
-      postgres:
-        condition: service_started
-        required: true
+    ports:
+      - "8501:8501"
 
 volumes:
   pgdata:
