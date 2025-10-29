@@ -2,10 +2,10 @@
 from __future__ import annotations
 import os
 import psycopg2
-from typing import Any, Dict, List, Iterable
+from typing import Any, Dict, Iterable
 
-# Prefer a single env var DB_URL; fall back to PG* variables; finally localhost.
 def _dsn_from_env() -> str:
+    # Prefer a single DB_URL, else PG* vars, else localhost (last resort)
     db_url = os.getenv("DB_URL")
     if db_url:
         return db_url
@@ -19,7 +19,7 @@ def _dsn_from_env() -> str:
 def _pg_conn():
     return psycopg2.connect(_dsn_from_env())
 
-# ----------------- Example upsert logic (unchanged API) -----------------
+# --- Example upsert; keep API stable for callers ---
 def upsert_orders(orders: Iterable[Dict[str, Any]]) -> int:
     sql = """
     INSERT INTO orders (
