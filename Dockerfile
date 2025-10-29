@@ -1,24 +1,15 @@
-# ===== Base Image =====
+# Lean image; no apt-get needed
 FROM python:3.12-slim
 
-# ===== Working Directory =====
 WORKDIR /app
 
-# ===== System Dependencies =====
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc curl && \
-    rm -rf /var/lib/apt/lists/*
+# Copy only reqs first for better caching
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
-# ===== Copy App =====
+# Now copy the rest of the repo
 COPY . /app
 
-# ===== Install Python Packages =====
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
-
-# ===== Environment =====
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
-
-# ===== Default command (overridden by compose) =====
-CMD ["python", "-m", "jobs.executor_bracket"]
+# Env & default
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app
+CMD ["python", "-m", "jobs.cron_nn"]
