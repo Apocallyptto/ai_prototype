@@ -1,122 +1,82 @@
 # jobs/make_signals_ensemble.py
-from __future__ import annotations
-import os
-import logging
-import subprocess
-from typing import Dict, Any
+import os, logging, subprocess, json, sys
+from datetime import datetime, timezone
+from typing import Dict, List
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-log = logging.getLogger("make_signals_ensemble")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ---- Optional libs (guarded) ----
-_HAS_JOBLIB = False
-_HAS_TORCH = False
-
-try:
-    import joblib  # noqa: F401
-    _HAS_JOBLIB = True
-except Exception as e:
-    log.warning("NN ensemble: joblib not available (%s) → NN path will be skipped.", e)
-
-try:
-    import torch  # noqa: F401
-    _HAS_TORCH = True
-except Exception as e:
-    log.warning("NN ensemble: torch not available (%s) → NN path will be skipped.", e)
-
+SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
 DISABLE_NN = os.getenv("DISABLE_NN", "0") == "1"
-USE_NN = (not DISABLE_NN) and _HAS_JOBLIB and _HAS_TORCH
 
-
-def _symbols_env() -> str:
-    return os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
-
-
-def _run_module(mod: str, *args: str) -> int:
-    """
-    Run a Python module in a subprocess within this container image, inheriting env.
-    Returns the process return code.
-    """
-    cmd = ["python", "-m", mod, *args]
-    log.info("run: %s", " ".join(cmd))
+def _run(cmd: List[str]) -> int:
+    logging.info("run: " + " ".join(cmd))
     return subprocess.call(cmd)
 
-
-def _maybe_nn_predict(symbols_csv: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Optional NN predictor hook.
-    Returns {} when NN is disabled or libs are missing.
-    """
-    if not USE_NN:
-        why = "disabled via DISABLE_NN=1" if DISABLE_NN else "missing libs (torch/joblib)"
-        log.info("NN path is OFF (%s). Ensemble will use rule/technicals only.", why)
+def _maybe_nn_predict(symbols_csv: str) -> Dict[str, Dict[str, float]]:
+    if DISABLE_NN:
+        logging.info("NN path is OFF (disabled via DISABLE_NN=1). Ensemble will use rule/technicals only.")
         return {}
-    # Import here (late) so missing libs don’t break the module import
-    from jobs.make_signals_nn import nn_predict  # type: ignore
-    return nn_predict(symbols_csv)
+    try:
+        from jobs.make_signals_nn import nn_predict
+        return nn_predict(symbols_csv)  # <-- accepts optional symbols_csv now
+    except Exception as e:
+        logging.warning(f"NN path failed: {e}; continuing without NN.")
+        return {}
 
-
-def _weighted_ensemble(
-    rule_rows: Dict[str, Dict[str, Any]],
-    nn_rows: Dict[str, Dict[str, Any]],
-) -> Dict[str, Dict[str, Any]]:
+def _merge(rule_rows: Dict[str, Dict[str, float]],
+           nn_rows: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
     """
-    Combine rule + NN strengths.
-    Row format: {SYM: {"side": "buy|sell", "strength": float}}
-    On side conflict, keep record with larger |strength|.
+    Simple weighted ensemble: 60% rule/technicals, 40% NN.
+    Each row like {"side": "buy|sell|hold", "strength": float in [0,1]}.
     """
-    out: Dict[str, Dict[str, Any]] = {}
-    w_rule = float(os.getenv("W_RULE", "0.7"))
-    w_nn = float(os.getenv("W_NN", "0.3"))
+    weights = {"rule": 0.6, "nn": 0.4}
+    out: Dict[str, Dict[str, float]] = {}
+    syms = set(rule_rows.keys()) | set(nn_rows.keys())
+    for s in syms:
+        r = rule_rows.get(s, {"side": "hold", "strength": 0.0})
+        n = nn_rows.get(s, {"side": "hold", "strength": 0.0})
 
-    # seed with rule
-    for sym, rec in rule_rows.items():
-        out[sym] = dict(rec)
+        # map side -> signed score
+        def score(row):
+            if row["side"] == "buy":  return +row["strength"]
+            if row["side"] == "sell": return -row["strength"]
+            return 0.0
 
-    # blend NN
-    for sym, rec in nn_rows.items():
-        if sym not in out:
-            out[sym] = {"side": rec.get("side"), "strength": float(rec.get("strength", 0.0))}
-            continue
-
-        nn_side = rec.get("side")
-        nn_str = float(rec.get("strength", 0.0))
-        rule_side = out[sym].get("side")
-        rule_str = float(out[sym].get("strength", 0.0))
-
-        if nn_side == rule_side:
-            out[sym]["strength"] = w_rule * rule_str + w_nn * nn_str
+        blend = weights["rule"] * score(r) + weights["nn"] * score(n)
+        if blend > +0.10:
+            out[s] = {"side": "buy",  "strength": round(min(1.0, abs(blend)), 3)}
+        elif blend < -0.10:
+            out[s] = {"side": "sell", "strength": round(min(1.0, abs(blend)), 3)}
         else:
-            if abs(nn_str) > abs(rule_str):
-                out[sym] = {"side": nn_side, "strength": nn_str}
-
+            out[s] = {"side": "hold", "strength": round(abs(blend), 3)}
     return out
 
+def _insert_rows(rows: Dict[str, Dict[str, float]]) -> None:
+    """
+    Reuse your existing rules inserter by calling jobs.make_signals with env or
+    (optionally) write a small DB inserter. For now we just log.
+    """
+    for s, r in rows.items():
+        logging.info(f"Ensemble -> {s}: {r['side']} ({r['strength']})")
 
 def main():
-    symbols = _symbols_env()
-    log.info("make_signals_ensemble | symbols=%s", symbols)
-
-    # 1) Produce rule/technical signals into DB by running the existing module.
-    #    (No import of jobs.make_signals needed.)
-    rc = _run_module("jobs.make_signals")
+    logging.info(f"make_signals_ensemble | symbols={SYMBOLS}")
+    # Always generate baseline rule/technical signals
+    rc = _run([sys.executable, "-m", "jobs.make_signals"])
     if rc != 0:
-        log.error("jobs.make_signals failed (rc=%s). Aborting ensemble step.", rc)
-        return
+        logging.error("jobs.make_signals failed")
+        sys.exit(rc)
 
-    # 2) Optionally compute NN opinions (in-memory)
-    nn_rows = _maybe_nn_predict(symbols)
+    # Load rule signals back from DB if you have an accessor; to keep this simple,
+    # we’ll read the latest decision from jobs.make_signals_nn adapter as proxy.
+    # In your current flow we just combine opinions at runtime:
+    # assume rule recommends HOLD with strength 0.5 baseline -> you can replace with actual DB read.
+    rule_rows = {s: {"side": "hold", "strength": 0.5} for s in SYMBOLS.split(",")}
 
-    if nn_rows:
-        log.info("NN opinions present for %d symbols; ensemble blending ready.", len(nn_rows))
-        # If you later want to persist blended values, fetch the just-written rule rows
-        # from the DB and upsert a blended record. Keeping logging only for now.
-    else:
-        log.info("No NN opinions; using rule/technicals only.")
+    nn_rows = _maybe_nn_predict(SYMBOLS)
 
+    merged = _merge(rule_rows, nn_rows)
+    _insert_rows(merged)
 
 if __name__ == "__main__":
     main()
