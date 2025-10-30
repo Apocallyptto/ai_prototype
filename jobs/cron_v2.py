@@ -1,69 +1,64 @@
-# cron_v2.py
-# Loop runner for signals → scaling → (auto)retrain → execution → maintenance
-import os, time, logging, subprocess, shlex
+# services/cron_v2.py
+import os, time, logging, subprocess
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 log = logging.getLogger("cron_v2")
 
-SLEEP = int(os.getenv("CRON_SLEEP_SECONDS", "180"))
+DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
+SLEEP_SEC = int(os.getenv("CRON_SLEEP_SECONDS", "180"))
 SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
 
 def run(cmd: str):
+    """Run a subprocess and log result."""
     log.info("run: %s", cmd)
     try:
-        subprocess.run(shlex.split(cmd), check=True)
+        subprocess.run(cmd.split(), check=True)
     except subprocess.CalledProcessError as e:
         log.error("command failed: %s", e)
 
 def main():
-    log.info("cron_v2 | start loop symbols=%s sleep=%ss", SYMBOLS, SLEEP)
-    log.info("cron_v2 | DB_URL=%s", os.getenv("DB_URL", "(missing)"))
-
-    # one-time idempotent migrations each boot
-    run("python -m tools.init_db")
-    run("python -m tools.init_orders_db")
-    run("python -m tools.db_migrate_equity")
-    run("python -m tools.db_migrate_pnl")
-    run("python -m tools.db_migrate_models")
-    # keep signals schema in shape (px column etc.)
-    try:
-        run("python -m tools.db_migrate_signals_px")
-    except Exception:
-        pass  # tool may not exist in older images; ok to skip
+    log.info("cron_v2 | start loop symbols=%s sleep=%ss", SYMBOLS, SLEEP_SEC)
+    log.info("cron_v2 | DB_URL=%s", DB_URL)
 
     while True:
         try:
-            # 1) make rule-based signals
-            run("python -m jobs.make_signals")
+            # --- ensure DB schema ---
+            run("python -m tools.init_db")
+            run("python -m tools.init_orders_db")
+            run("python -m tools.db_migrate_equity")
+            run("python -m tools.db_migrate_pnl")
+            run("python -m tools.db_migrate_models")
+            run("python -m tools.db_migrate_signals_px")
 
-            # 2) ensemble (adds NN opinions, logs final picks)
-            #    keep your existing ensemble call; if you prefer, you can swap to make_signals_nn
+            # --- signal generation (ensemble only; replaces make_signals) ---
             run("python -m jobs.make_signals_ensemble")
 
-            # 3) normalize strengths per symbol (z-score → [0,1])  🧠
-            run("python -m jobs.scale_strength")
+            # --- normalization / auto-retrain / execution pipeline ---
+            run("python -m jobs.scale_strength")     # normalize strengths (z-score)
+            run("python -m jobs.auto_retrain")       # weekly retrain check
+            run("python -m services.executor_bracket")  # bracket orders (uses env thresholds)
 
-            # 4) kick weekly retrain if in schedule window (idempotent)  🔁
-            run("python -m jobs.auto_retrain")
-
-            # 5) place ATR bracket orders from recent strong signals
-            run("python -m services.executor_bracket --since-min 20 --min-strength 0.60")
-
-            # 6) trailing stop upgrades (profit lock-in)  🧲
+            # --- risk management / maintenance ---
             run("python -m jobs.trailing_guard")
-
-            # 7) manage open positions & exits
             run(f"python -m jobs.manage_exits --symbols {SYMBOLS}")
             run(f"python -m jobs.manage_stale_orders --symbols {SYMBOLS}")
 
-            # 8) sync broker orders back into DB
+            # --- housekeeping ---
             run("python -m tools.sync_orders")
 
-        except Exception as e:
-            log.exception("loop error: %s", e)
+            log.info("cron_v2 | sleeping %ds …", SLEEP_SEC)
+            time.sleep(SLEEP_SEC)
 
-        log.info("cron_v2 | sleeping %ss …", SLEEP)
-        time.sleep(SLEEP)
+        except KeyboardInterrupt:
+            log.warning("manual stop")
+            break
+        except Exception as e:
+            log.error("cron_v2 loop error: %s", e)
+            time.sleep(SLEEP_SEC)
 
 if __name__ == "__main__":
     main()
