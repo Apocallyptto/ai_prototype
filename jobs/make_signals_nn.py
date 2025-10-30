@@ -30,26 +30,43 @@ def _active_model_path() -> str:
 # compute features directly from price history in signals table
 def _latest_features_for(symbol: str) -> pd.DataFrame:
     with psycopg2.connect(_dsn()) as conn, conn.cursor() as cur:
+        # try to detect which price column your signals table uses
         cur.execute("""
-            SELECT created_at, price
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name='signals';
+        """)
+        cols = [r[0] for r in cur.fetchall()]
+        if "price" in cols:
+            price_col = "price"
+        elif "px" in cols:
+            price_col = "px"
+        elif "price_close" in cols:
+            price_col = "price_close"
+        else:
+            raise RuntimeError(f"No known price column found in 'signals' table. Columns={cols}")
+
+        query = f"""
+            SELECT created_at, {price_col}
             FROM public.signals
             WHERE symbol=%s
             ORDER BY created_at DESC
             LIMIT 200;
-        """, (symbol,))
+        """
+        cur.execute(query, (symbol,))
         rows = cur.fetchall()
 
     if not rows:
         raise RuntimeError(f"No recent signals for {symbol}")
 
-    df = pd.DataFrame(rows, columns=["ts","close"]).sort_values("ts").reset_index(drop=True)
+    df = pd.DataFrame(rows, columns=["ts", "close"]).sort_values("ts").reset_index(drop=True)
     df["ret1"] = df["close"].pct_change()
     df["ret5"] = df["close"].pct_change(5)
     df["ret10"] = df["close"].pct_change(10)
-    df["vol_z"] = (df["ret1"].rolling(50).std())  # approximate volatility
+    df["vol_z"] = (df["ret1"].rolling(50).std())
     df["rsi14"] = _rsi(df["close"], 14)
-    df["atr14"] = df["ret1"].rolling(14).std()    # simple ATR proxy
-    return df.dropna().iloc[-1:][["ret1","ret5","ret10","vol_z","rsi14","atr14"]]
+    df["atr14"] = df["ret1"].rolling(14).std()
+    return df.dropna().iloc[-1:][["ret1", "ret5", "ret10", "vol_z", "rsi14", "atr14"]]
 
 def _rsi(s: pd.Series, period: int) -> pd.Series:
     delta = s.diff()
