@@ -11,6 +11,7 @@ DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trade
 SQL = """
 DO $$
 BEGIN
+    -- Add px if it's missing
     IF NOT EXISTS (
         SELECT 1
         FROM information_schema.columns
@@ -20,14 +21,6 @@ BEGIN
     ) THEN
         ALTER TABLE public.signals ADD COLUMN px NUMERIC;
     END IF;
-
-    -- optional: if you also want a fast ts index (some repos already have)
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-        WHERE schemaname='public' AND tablename='signals' AND indexname='idx_signals_ts'
-    ) THEN
-        CREATE INDEX idx_signals_ts ON public.signals(ts);
-    END IF;
 END$$;
 """
 
@@ -36,7 +29,6 @@ def main():
     with psycopg2.connect(DB_URL) as conn, conn.cursor() as cur:
         cur.execute(SQL)
         conn.commit()
-    log.info("OK: signals table now has 'px' column (and index if missing).")
-
+    log.info("OK: signals table now has 'px' column.")
 if __name__ == "__main__":
     main()
