@@ -1,95 +1,71 @@
 # services/notify.py
-from __future__ import annotations
-import os
-import json
-import urllib.request
-from typing import Optional, Dict, Any
+import os, json, logging, time
+from typing import Optional, Dict, Any, Iterable
+import requests
 
-# --- Env knobs (set only what you use) ---
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID", "")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("notify")
 
-TIMEOUT_SEC = 8
+ENABLE = os.getenv("ENABLE_TELEGRAM", "0") == "1"
+BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
+def _send_telegram(text: str) -> bool:
+    if not ENABLE:
+        return False
+    if not BOT or not CHAT:
+        log.warning("Telegram enabled but BOT/CHAT not set; skipping")
+        return False
+    url = f"https://api.telegram.org/bot{BOT}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": CHAT, "text": text, "parse_mode": "HTML"}, timeout=10)
+        if r.status_code != 200:
+            log.warning("Telegram non-200: %s %s", r.status_code, r.text[:200])
+            return False
+        return True
+    except Exception as e:
+        log.warning("Telegram send failed: %s", e)
+        return False
 
-def _post_json(url: str, payload: Dict[str, Any]) -> None:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def fmt_money(x: Optional[float]) -> str:
+    if x is None: return "—"
+    try: return f"${float(x):.2f}"
+    except: return str(x)
+
+def notify_signal(p: Dict[str, Any]) -> None:
+    """
+    p = {"symbol":"AAPL","side":"buy","strength":0.72,"px":268.45,"source":"ensemble"}
+    """
+    text = (
+        f"🧠 <b>Signal</b> [{p.get('source','?')}]\n"
+        f"• {p.get('symbol','?')}  • side: <b>{p.get('side','?').upper()}</b>\n"
+        f"• strength: {p.get('strength','?')}  • px: {fmt_money(p.get('px'))}"
     )
-    # stdlib only; fail-soft upstream
-    with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:  # noqa: S310
-        _ = resp.read()
+    _send_telegram(text)
 
-
-def _telegram_send(text: str) -> None:
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHATID):
-        return  # no-op if not configured
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHATID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        _post_json(url, payload)
-    except Exception:
-        pass  # never raise from notifier
-
-
-def _discord_send(text: str) -> None:
-    if not DISCORD_WEBHOOK:
-        return
-    payload = {"content": text}
-    try:
-        _post_json(DISCORD_WEBHOOK, payload)
-    except Exception:
-        pass
-
-
-def notify(text: str) -> None:
-    """Broadcast a plain line to configured channels (if any)."""
-    _telegram_send(text)
-    _discord_send(text)
-
-
-# ===== Convenience wrappers =====
-def notify_info(text: str) -> None:
-    notify(f"ℹ️ {text}")
-
-def notify_warn(text: str) -> None:
-    notify(f"⚠️ {text}")
-
-def notify_error(text: str) -> None:
-    notify(f"🛑 {text}")
-
-def _fmt_price(x: Optional[float]) -> str:
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return str(x)
-
-def notify_trade_opened(symbol: str, side: str, qty: int,
-                        entry: Optional[float],
-                        tp: Optional[float],
-                        sl: Optional[float],
-                        reason: str = "") -> None:
-    msg = (
-        f"📈 <b>TRADE OPENED</b>\n"
-        f"{symbol} {side} qty={qty}\n"
-        f"entry={_fmt_price(entry)}  TP={_fmt_price(tp)}  SL={_fmt_price(sl)}"
+def notify_order_submitted(p: Dict[str, Any]) -> None:
+    """
+    p = {"symbol":"AAPL","side":"buy","qty":1,"limit":268.5,"tp":269.8,"sl":267.9,"id":"..."}
+    """
+    text = (
+        f"📥 <b>Submitted</b> bracket\n"
+        f"• {p.get('symbol')} {p.get('side','').upper()} qty {p.get('qty')}\n"
+        f"• LMT {fmt_money(p.get('limit'))} | TP {fmt_money(p.get('tp'))} | SL {fmt_money(p.get('sl'))}\n"
+        f"id: <code>{p.get('id','?')}</code>"
     )
-    if reason:
-        msg += f"\nReason: {reason}"
-    notify(msg)
+    _send_telegram(text)
 
-def notify_trade_blocked(symbol: str, side: str, qty: int, reason: str) -> None:
-    notify_warn(f"BLOCKED {symbol} {side} qty={qty}\n{reason}")
+def notify_fill(p: Dict[str, Any]) -> None:
+    """
+    p = {"symbol":"AAPL","side":"buy","qty":1,"price":268.5,"avg":268.45,"order_id":"..."}
+    """
+    text = (
+        f"✅ <b>Fill</b>\n"
+        f"• {p.get('symbol')} {p.get('side','').upper()} qty {p.get('qty')} @ {fmt_money(p.get('price') or p.get('avg'))}\n"
+        f"order: <code>{p.get('order_id','?')}</code>"
+    )
+    _send_telegram(text)
 
-def notify_trade_skipped(symbol: str, side: str, why: str) -> None:
-    notify_info(f"SKIP {symbol} {side}: {why}")
+def notify_info(msg: str) -> None:
+    _send_telegram(f"ℹ️ {msg}")
