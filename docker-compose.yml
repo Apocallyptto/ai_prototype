@@ -1,6 +1,9 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:16
+    container_name: trader_postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -10,6 +13,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    ports:
+      - "5432:5432"
     volumes:
       - ai_prototype_pgdata:/var/lib/postgresql/data
 
@@ -17,27 +22,40 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: trader_executor
     depends_on:
       postgres:
         condition: service_healthy
+
+    # 👇 Automatically load all environment variables from your .env file
+    env_file:
+      - .env
+
     environment:
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-      # symbols + cron cadence
+      # Symbols & cadence
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "180"
-      # NN/ML
+
+      # Neural network (ML) parameters
       DISABLE_NN: "0"
       MODEL_DIR: "/app/models"
       ML_LOOKBACK_DAYS: "30"
       ML_BAR_INTERVAL: "5m"
       ML_TARGET_HORIZON_BARS: "6"
-      # Alpaca (paper)
-      APCA_API_KEY_ID: "${APCA_API_KEY_ID}"
-      APCA_API_SECRET_KEY: "${APCA_API_SECRET_KEY}"
-      APCA_API_BASE_URL: "https://paper-api.alpaca.markets"
-      # risk knobs
+
+      # Risk control
       MIN_STRENGTH: "0.60"
+
+      # (You can optionally override these manually — but .env already sets them)
+      # APCA_API_KEY_ID: ${APCA_API_KEY_ID}
+      # APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY}
+      # APCA_API_BASE_URL: ${APCA_API_BASE_URL}
+      # DATABASE_URL: ${DATABASE_URL}
+      # DB_URL: ${DB_URL}
+
+    # The cron loop that runs the entire pipeline (make_signals → ensemble → executor → exits → sync)
     command: ["python", "-m", "jobs.cron_v2"]
+
     volumes:
       - ai_prototype_models:/app/models
     restart: unless-stopped
