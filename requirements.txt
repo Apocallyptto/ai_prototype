@@ -1,46 +1,16 @@
-alpaca
-sqlalchemy>=2.0
-alembic>=1.13
-plotly>=5.22            # optional, used by charts
-pytest>=7.4
-testcontainers>=4.6,<5
-torch==2.4.1
+# core
+pandas
+numpy
+psycopg2-binary
 
-# === Core ===
-
-matplotlib==3.9.2
-
-# === ML / Signals ===
-scikit-learn==1.5.2
-joblib==1.4.2
-
-
-
-# === Optional (keep if you already use them) ===
-python-dotenv==1.0.1
-
-# core scientific
-numpy==2.1.2
-pandas==2.2.3
+# ML
+scikit-learn
+joblib
 
 # market data
-yfinance==0.2.48
-requests==2.32.3
+yfinance
+alpaca-py
 
-# ML (CPU) for the GBC model
-scikit-learn==1.5.2
-joblib==1.4.2
-
-# database (prebuilt wheels, no gcc needed)
-psycopg2-binary==2.9.9
-
-# streaming / dashboard bits used by cron_v2 caching
-streamlit==1.39.0
-
-# convenience
-python-dateutil==2.9.0.post0
-pytz==2024.2
-
-# broker (if you use Alpaca python client anywhere)
-alpaca-trade-api==3.2.0
-alpaca-py==0.29.0
+# runtime / misc (only if you actually use them; otherwise drop)
+streamlit
+plotly
