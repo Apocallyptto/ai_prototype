@@ -49,11 +49,14 @@ def main():
             # 5) place ATR bracket orders from recent strong signals
             run("python -m services.executor_bracket --since-min 20 --min-strength 0.60")
 
-            # 6) manage open positions & exits
+            # 6) trailing stop upgrades (profit lock-in)  🧲
+            run("python -m jobs.trailing_guard")
+
+            # 7) manage open positions & exits
             run(f"python -m jobs.manage_exits --symbols {SYMBOLS}")
             run(f"python -m jobs.manage_stale_orders --symbols {SYMBOLS}")
 
-            # 7) sync broker orders back into DB
+            # 8) sync broker orders back into DB
             run("python -m tools.sync_orders")
 
         except Exception as e:
