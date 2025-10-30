@@ -1,23 +1,21 @@
 # jobs/make_signals_nn.py
 import os, logging, json
+import pandas as pd, numpy as np, psycopg2, joblib
 from typing import Dict, Any, List
-import numpy as np
-import pandas as pd
-import psycopg2
-import joblib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("make_signals_nn")
 
 MODEL_DIR = os.getenv("MODEL_DIR", "/app/models")
-LOOKBACK_DAYS = int(os.getenv("ML_LOOKBACK_DAYS", "30"))
 
 def _dsn():
     dsn = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
     if dsn:
         return dsn
-    host = os.getenv("DB_HOST","postgres"); user = os.getenv("DB_USER","postgres")
-    pw = os.getenv("DB_PASSWORD","postgres"); db = os.getenv("DB_NAME","trader")
+    host = os.getenv("DB_HOST","postgres")
+    user = os.getenv("DB_USER","postgres")
+    pw   = os.getenv("DB_PASSWORD","postgres")
+    db   = os.getenv("DB_NAME","trader")
     port = os.getenv("DB_PORT","5432")
     return f"postgresql://{user}:{pw}@{host}:{port}/{db}"
 
@@ -29,57 +27,60 @@ def _active_model_path() -> str:
             raise RuntimeError("No ACTIVE model found in models_meta.")
         return row[0]
 
+# compute features directly from price history in signals table
 def _latest_features_for(symbol: str) -> pd.DataFrame:
-    """
-    Build a single-row feature vector from most recent signals/bars.
-    Simple approach: reuse your technical features from jobs.make_signals
-    by querying last N bars from your bars table if you have one; if not,
-    derive from last signals row. For now, derive from last 50 signals rows.
-    """
     with psycopg2.connect(_dsn()) as conn, conn.cursor() as cur:
-        # expect you already insert rule/technical signals into 'signals'
         cur.execute("""
-            SELECT ts, price, rsi14, atr14, ret1, ret5, ret10, vol_z
-            FROM signals
+            SELECT created_at, price
+            FROM public.signals
             WHERE symbol=%s
-            ORDER BY ts DESC
-            LIMIT 50;
+            ORDER BY created_at DESC
+            LIMIT 200;
         """, (symbol,))
         rows = cur.fetchall()
-    if not rows:
-        raise RuntimeError(f"No recent signals for {symbol} to build features.")
 
-    df = pd.DataFrame(rows, columns=["ts","price","rsi14","atr14","ret1","ret5","ret10","vol_z"]).sort_values("ts")
-    # Use last row as current feature snapshot
-    f = df.iloc[-1][["ret1","ret5","ret10","vol_z","rsi14","atr14"]].to_frame().T
-    f.index = [pd.Timestamp.utcnow()]
-    return f
+    if not rows:
+        raise RuntimeError(f"No recent signals for {symbol}")
+
+    df = pd.DataFrame(rows, columns=["ts","close"]).sort_values("ts").reset_index(drop=True)
+    df["ret1"] = df["close"].pct_change()
+    df["ret5"] = df["close"].pct_change(5)
+    df["ret10"] = df["close"].pct_change(10)
+    df["vol_z"] = (df["ret1"].rolling(50).std())  # approximate volatility
+    df["rsi14"] = _rsi(df["close"], 14)
+    df["atr14"] = df["ret1"].rolling(14).std()    # simple ATR proxy
+    return df.dropna().iloc[-1:][["ret1","ret5","ret10","vol_z","rsi14","atr14"]]
+
+def _rsi(s: pd.Series, period: int) -> pd.Series:
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_u = up.ewm(alpha=1/period, min_periods=period).mean()
+    ma_d = down.ewm(alpha=1/period, min_periods=period).mean()
+    rs = ma_u / (ma_d + 1e-9)
+    return 100 - (100 / (1 + rs))
 
 def nn_predict(symbols_csv: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Return {SYM: {"side": "buy|sell|hold", "strength": float}}
-    """
+    syms = [s.strip().upper() for s in symbols_csv.split(",")]
     try:
-        model_art = joblib.load(_active_model_path())
-        model = model_art["model"]
-        feats: List[str] = model_art["features"]
+        blob = joblib.load(_active_model_path())
+        model = blob["model"]
+        feats = blob["features"]
     except Exception as e:
-        log.warning("No ACTIVE model found; returning HOLD for all symbols.")
-        syms = [s.strip().upper() for s in symbols_csv.split(",")] if symbols_csv else ["AAPL","MSFT","SPY"]
-        return {s: {"side":"hold","strength":0.0} for s in syms}
+        log.warning(f"No ACTIVE model found: {e}")
+        return {s: {"side": "hold", "strength": 0.0} for s in syms}
 
-    results: Dict[str, Dict[str, Any]] = {}
-    syms = [s.strip().upper() for s in symbols_csv.split(",")] if symbols_csv else ["AAPL","MSFT","SPY"]
+    results = {}
     for sym in syms:
         try:
             X = _latest_features_for(sym)[feats].values
-            prob_up = float(model.predict_proba(X)[0][1])  # class 1 == up
-            side = "buy" if prob_up >= 0.55 else ("sell" if prob_up <= 0.45 else "hold")
-            strength = abs(prob_up - 0.5) * 2  # 0..1
+            proba = float(model.predict_proba(X)[0][1])
+            side = "buy" if proba > 0.55 else ("sell" if proba < 0.45 else "hold")
+            strength = abs(proba - 0.5) * 2
             results[sym] = {"side": side, "strength": round(strength, 3)}
         except Exception as e:
-            log.warning("NN failed for %s: %s; default HOLD.", sym, e)
-            results[sym] = {"side":"hold","strength":0.0}
+            log.warning(f"{sym}: NN inference failed: {e}; HOLD")
+            results[sym] = {"side": "hold", "strength": 0.0}
     return results
 
 if __name__ == "__main__":
