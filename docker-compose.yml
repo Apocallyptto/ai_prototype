@@ -1,56 +1,42 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16
-    container_name: trader_postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: trader
-    ports:
-      - "5432:5432"
-    volumes:
-      - ai_prototype_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d trader || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 10
+    volumes:
+      - ai_prototype_pgdata:/var/lib/postgresql/data
 
   executor:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: trader_executor
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      # --- DB ---
       DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/trader
-
-      # --- core control ---
+      # symbols + cron cadence
       SYMBOLS: "AAPL,MSFT,SPY"
-      MIN_STRENGTH: "0.60"
       CRON_SLEEP_SECONDS: "180"
-
-      # --- ML path (ON) ---
+      # NN/ML
       DISABLE_NN: "0"
       MODEL_DIR: "/app/models"
       ML_LOOKBACK_DAYS: "30"
       ML_BAR_INTERVAL: "5m"
       ML_TARGET_HORIZON_BARS: "6"
-
-      # --- Data sources ---
-      # Set these (free plan works for IEX historical 1m):
-      ALPACA_API_KEY: "${ALPACA_API_KEY}"
-      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
-
-      # Optional: if Yahoo rate-limits, we still try multiple times
-      YF_MAX_RETRIES: "5"
-
+      # Alpaca (paper)
+      APCA_API_KEY_ID: "${APCA_API_KEY_ID}"
+      APCA_API_SECRET_KEY: "${APCA_API_SECRET_KEY}"
+      APCA_API_BASE_URL: "https://paper-api.alpaca.markets"
+      # risk knobs
+      MIN_STRENGTH: "0.60"
     command: ["python", "-m", "jobs.cron_v2"]
     volumes:
       - ai_prototype_models:/app/models
