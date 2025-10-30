@@ -1,16 +1,16 @@
-# core
+# --- core ---
 pandas
 numpy
 psycopg2-binary
 
-# ML
+# --- ML (no torch needed) ---
 scikit-learn
 joblib
 
-# market data
-yfinance
+# --- data sources ---
 alpaca-py
+yfinance
 
-# runtime / misc (only if you actually use them; otherwise drop)
+# --- optional UI/tools (keep if you use them) ---
 streamlit
 plotly
