@@ -1,3 +1,4 @@
+alpaca
 sqlalchemy>=2.0
 alembic>=1.13
 plotly>=5.22            # optional, used by charts
