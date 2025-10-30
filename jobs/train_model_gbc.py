@@ -17,7 +17,7 @@ log = logging.getLogger("train_model_gbc")
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")]
 MODEL_DIR = os.getenv("MODEL_DIR", "/app/models")
 LOOKBACK_DAYS = int(os.getenv("ML_LOOKBACK_DAYS", "30"))
-BAR_INTERVAL = os.getenv("ML_BAR_INTERVAL", "5m")  # 5m only here
+BAR_INTERVAL = os.getenv("ML_BAR_INTERVAL", "5m")  # fixed to 5m in this script
 HORIZON = int(os.getenv("ML_TARGET_HORIZON_BARS", "6"))  # 6 * 5m = 30m
 
 def _dsn():
@@ -35,17 +35,18 @@ def _have_alpaca():
     return bool(os.getenv("ALPACA_API_KEY") and os.getenv("ALPACA_API_SECRET"))
 
 def _fetch_alpaca(sym: str) -> pd.DataFrame:
-    # alpaca-py v3 (historical client)
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed
 
-    api = StockHistoricalDataClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"))
+    api = StockHistoricalDataClient(
+        os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET")
+    )
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=LOOKBACK_DAYS)
 
-    # Use IEX (free plan). SIP will 403 on free tier.
+    # IEX feed (free tier). SIP will 403 on free plan.
     req = StockBarsRequest(
         symbol_or_symbols=sym,
         timeframe=TimeFrame.Minute,
@@ -61,7 +62,7 @@ def _fetch_alpaca(sym: str) -> pd.DataFrame:
         raise RuntimeError(f"Alpaca returned no bars for {sym} (IEX)")
 
     bars = bars.tz_convert("UTC")
-    # resample to 5m OHLCV
+    # Resample to 5m OHLCV
     o = bars["open"].resample("5min").first()
     h = bars["high"].resample("5min").max()
     l = bars["low"].resample("5min").min()
@@ -72,12 +73,11 @@ def _fetch_alpaca(sym: str) -> pd.DataFrame:
 
 def _fetch_yahoo(sym: str) -> pd.DataFrame:
     import yfinance as yf
-    # 60d x 5m gives enough history for features
-    for attempt in range(5):
+    max_retries = int(os.getenv("YF_MAX_RETRIES", "5"))
+    for attempt in range(max_retries):
         df = yf.download(sym, period="60d", interval="5m", progress=False, auto_adjust=False, threads=False)
         if isinstance(df, pd.DataFrame) and not df.empty:
             df = df.rename(columns=str.lower)
-            # Ensure tz-aware UTC
             if getattr(df.index, "tz", None) is None:
                 df.index = df.index.tz_localize("UTC")
             else:
