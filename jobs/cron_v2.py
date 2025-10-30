@@ -1,3 +1,5 @@
+# cron_v2.py
+# Loop runner for signals → scaling → (auto)retrain → execution → maintenance
 import os, time, logging, subprocess, shlex
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -23,7 +25,7 @@ def main():
     run("python -m tools.db_migrate_equity")
     run("python -m tools.db_migrate_pnl")
     run("python -m tools.db_migrate_models")
-    # keep signals schema in shape
+    # keep signals schema in shape (px column etc.)
     try:
         run("python -m tools.db_migrate_signals_px")
     except Exception:
@@ -35,16 +37,23 @@ def main():
             run("python -m jobs.make_signals")
 
             # 2) ensemble (adds NN opinions, logs final picks)
+            #    keep your existing ensemble call; if you prefer, you can swap to make_signals_nn
             run("python -m jobs.make_signals_ensemble")
 
-            # 3) place bracket orders from recent strong signals
+            # 3) normalize strengths per symbol (z-score → [0,1])  🧠
+            run("python -m jobs.scale_strength")
+
+            # 4) kick weekly retrain if in schedule window (idempotent)  🔁
+            run("python -m jobs.auto_retrain")
+
+            # 5) place ATR bracket orders from recent strong signals
             run("python -m services.executor_bracket --since-min 20 --min-strength 0.60")
 
-            # 4) manage open positions & exits
+            # 6) manage open positions & exits
             run(f"python -m jobs.manage_exits --symbols {SYMBOLS}")
             run(f"python -m jobs.manage_stale_orders --symbols {SYMBOLS}")
 
-            # 5) sync broker orders back into DB
+            # 7) sync broker orders back into DB
             run("python -m tools.sync_orders")
 
         except Exception as e:
