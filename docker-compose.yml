@@ -1,113 +1,54 @@
-name: ai_prototype
+version: "3.9"
 
 services:
   postgres:
     image: postgres:16
     container_name: trader_postgres
     environment:
-      POSTGRES_DB: trader
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trader
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
       interval: 5s
       timeout: 3s
-      retries: 20
-    restart: unless-stopped
+      retries: 10
 
   executor:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: trader_executor
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      # ---- database ----
+      # --- DB ---
       DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/trader
 
-      # ---- broker (pick up from .env, or hardcode if you prefer) ----
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_BASE_URL: https://paper-api.alpaca.markets
-      ALPACA_DATA_URL: https://data.alpaca.markets
-
-      # ---- strategy / risk ----
-      EQUITY: "100000"
-      TRADING_MODE: paper
-      MIN_QTY: "1"
-      MAX_QTY: "10"
-      RISK_PCT_PER_TRADE: "0.0025"
-      MAX_PORTFOLIO_RISK_PCT: "0.01"
-
-      # ---- ATR exits / data ----
-      ATR_PERIOD: "14"
-      ATR_LOOKBACK_DAYS: "30"
-      ATR_MULT_TP: "1.5"
-      ATR_MULT_SL: "1.0"
-      ATR_EXITS: "1"
-      USE_DYNAMIC_SIZE: "1"
-      USE_YF_DATA: "1"
-
-      # ---- symbols / cron ----
+      # --- Symbols / cadence ---
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "180"
       MIN_STRENGTH: "0.60"
 
-      # ---- ML / Ensemble ----
-      DISABLE_NN: "0"                 # <— turns NN/ML path ON
+      # --- ML / NN path ---
+      DISABLE_NN: "0"                 # turn ML path ON
       ML_LOOKBACK_DAYS: "30"
       ML_BAR_INTERVAL: "5m"
       ML_TARGET_HORIZON_BARS: "6"
       MODEL_DIR: "/app/models"
 
-      # ---- logging ----
-      LOG_LEVEL: INFO
-      PYTHONPATH: /app
-    command: ["python", "-m", "jobs.cron_v2"]
-    restart: unless-stopped
-
-  trailing_guard:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: trader_trailing_guard
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      PYTHONPATH: /app
-      TRAIL_INTERVAL: "120"
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_BASE_URL: https://paper-api.alpaca.markets
-      ALPACA_DATA_URL: https://data.alpaca.markets
-      ATR_PERIOD: "14"
-      ATR_LOOKBACK_DAYS: "30"
-    command: ["python", "-m", "jobs.trailing_guard"]
-    restart: unless-stopped
-
-  # Optional: dashboard (leave it if you want a live UI at :8501)
-  dashboard:
-    build:
-      context: .
-    container_name: trader_dashboard
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-      PYTHONPATH: /app
-    command: ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-    ports:
-      - "8501:8501"
-    restart: unless-stopped
+      # --- Alpaca (optional but recommended to avoid Yahoo rate limits) ---
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+    env_file:
+      - .env
+    command: ["python", "-u", "services/executor.py"]
+    volumes:
+      - ./:/app
 
 volumes:
   pgdata:
