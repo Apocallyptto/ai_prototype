@@ -2,8 +2,9 @@
 pandas
 numpy
 psycopg2-binary
+sqlalchemy
 
-# --- ML (no torch needed) ---
+# --- ML ---
 scikit-learn
 joblib
 
@@ -11,6 +12,6 @@ joblib
 alpaca-py
 yfinance
 
-# --- optional UI/tools (keep if you use them) ---
+# --- optional UI/tools ---
 streamlit
 plotly
