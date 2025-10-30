@@ -16,7 +16,6 @@ WEIGHT_RULE = float(os.getenv("ENSEMBLE_W_RULE", "0.6"))
 WEIGHT_NN   = float(os.getenv("ENSEMBLE_W_NN", "0.4"))
 HOLD_THRESH = float(os.getenv("ENSEMBLE_HOLD_THRESHOLD", "0.10"))  # |score| <= HOLD -> hold
 
-# --- Rules side/strength (variable; not constant) ---
 def _rsi(s, n=14):
     d = s.diff()
     up = d.clip(lower=0).rolling(n).mean()
@@ -28,7 +27,6 @@ def _ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
 def _atr(h, l, c, n=14):
-    # robust ATR calc without to_frame()
     hl = (h - l).abs()
     hc = (h - c.shift(1)).abs()
     lc = (l - c.shift(1)).abs()
@@ -45,15 +43,19 @@ def _rule_one_symbol(sym: str) -> Dict[str, float]:
         ema20 = _ema(c, 20)
         ema50 = _ema(c, 50)
         atr14 = _atr(h, l, c, 14).fillna(0.0)
-        px    = float(c.iloc[-1])
 
-        up_trend   = px > float(ema50.iloc[-1])
-        down_trend = px < float(ema50.iloc[-1])
-        rsi_up     = float(rsi14.iloc[-1]) - 50.0
-        dist_ema   = (px - float(ema20.iloc[-1]))
+        px       = float(c.iloc[-1].item())
+        ema20_v  = float(ema20.iloc[-1].item())
+        ema50_v  = float(ema50.iloc[-1].item())
+        rsi_v    = float(rsi14.iloc[-1].item())
+        atr_v    = max(1e-6, float(atr14.iloc[-1].item()))
 
-        atr = max(1e-6, float(atr14.iloc[-1]))
-        score = 0.4*(rsi_up/20.0) + 0.6*(dist_ema/atr)
+        up_trend   = px > ema50_v
+        down_trend = px < ema50_v
+        rsi_up     = rsi_v - 50.0
+        dist_ema   = (px - ema20_v)
+
+        score = 0.4*(rsi_up/20.0) + 0.6*(dist_ema/atr_v)
         score = max(-1.0, min(1.0, score))
 
         if score > +0.05 and up_trend:
@@ -123,10 +125,8 @@ def main():
     rule_rows = _rules_all(SYMBOLS)
     nn_rows   = _nn_rows(",".join(SYMBOLS))
     merged    = _merge(rule_rows, nn_rows)
-
     for s, r in merged.items():
         log.info("Ensemble -> %s: %s (%.3f)", s, r["side"], r["strength"])
-
     _insert_rows(merged)
 
 if __name__ == "__main__":
