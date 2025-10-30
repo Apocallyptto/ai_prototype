@@ -2,7 +2,7 @@
 pandas
 numpy
 psycopg2-binary
-sqlalchemy
+SQLAlchemy>=2.0
 
 # --- ML ---
 scikit-learn
