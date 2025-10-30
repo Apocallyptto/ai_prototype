@@ -1,35 +1,21 @@
-# executor/Dockerfile
-FROM python:3.12-slim
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    DEBIAN_FRONTEND=noninteractive \
-    TZ=UTC
+FROM python:3.13-slim
 
 WORKDIR /app
 
-# Optional: if your base image uses debian.sources, flip to https safely (ignore if file’s absent)
-# RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources || true
+# System deps for psycopg2 and timezones
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    tzdata \
+ && rm -rf /var/lib/apt/lists/*
 
-# System deps (minimal): build tools for some wheels, libpq-dev for psycopg2, CA certs & tzdata
-RUN apt-get -o Acquire::Retries=3 update && \
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        gcc \
-        curl \
-        tzdata \
-        ca-certificates \
-        libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Python deps first (for layer caching)
-COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip && \
-    pip install -r /app/requirements.txt
+# Copy everything (compose mounts source too, but this bakes for CI/CD)
+COPY . .
 
-# App code
-COPY . /app
+ENV PYTHONUNBUFFERED=1
 
-# Default command is your cron_v2 loop (overridden by docker compose if you exec into the container)
-CMD ["python", "-m", "jobs.cron_v2"]
+# Default command can be overridden by compose
+CMD ["python", "-u", "services/executor.py"]
