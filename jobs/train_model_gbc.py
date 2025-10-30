@@ -37,26 +37,35 @@ def _fetch_alpaca(sym: str) -> pd.DataFrame:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import DataFeed
+
     api = StockHistoricalDataClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"))
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=LOOKBACK_DAYS)
-    tf = TimeFrame.Minute
-    if BAR_INTERVAL != "5m":
-        logger.warning("Only 5m supported in this example; defaulting to 5m.")
-    req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, start=start, end=end)
+
+    # Force IEX (free plan). SIP will throw: subscription does not permit querying recent SIP data
+    req = StockBarsRequest(
+        symbol_or_symbols=sym,
+        timeframe=TimeFrame.Minute,
+        start=start,
+        end=end,
+        feed=DataFeed.IEX,
+        adjustment=None,
+    )
     bars = api.get_stock_bars(req).df
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(sym, level=0).copy()
     if bars.empty:
-        raise RuntimeError(f"Alpaca returned no bars for {sym}")
-    # Resample to 5m
+        raise RuntimeError(f"Alpaca returned no bars for {sym} (IEX)")
+
     bars = bars.tz_convert("UTC")
+    # resample to 5m
     o = bars["open"].resample("5min").first()
     h = bars["high"].resample("5min").max()
     l = bars["low"].resample("5min").min()
     c = bars["close"].resample("5min").last()
     v = bars["volume"].resample("5min").sum()
-    df = pd.DataFrame({"open":o, "high":h, "low":l, "close":c, "volume":v}).dropna()
+    df = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v}).dropna()
     return df
 
 def _fetch_yahoo(sym: str) -> pd.DataFrame:
