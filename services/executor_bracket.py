@@ -1,5 +1,7 @@
 # services/executor_bracket.py
-import os, math, logging
+import os, logging, math
+from decimal import Decimal, ROUND_DOWN
+
 import yfinance as yf
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -13,18 +15,22 @@ log = logging.getLogger("executor_bracket")
 DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
 MIN_STRENGTH = float(os.getenv("EXEC_MIN_STRENGTH", os.getenv("MIN_STRENGTH", "0.60")))
 SINCE_MIN = int(os.getenv("EXEC_SINCE_MIN", os.getenv("SINCE_MIN", "20")))
+
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 RISK_PER_TRADE_USD = float(os.getenv("RISK_PER_TRADE_USD", "50"))
-MIN_ACCOUNT_BP_USD = float(os.getenv("MIN_ACCOUNT_BP_USD", "100"))  # ⬅ guard
+
+# fractional config
+FRACTIONAL = os.getenv("FRACTIONAL", "0") == "1"
+MIN_QTY = float(os.getenv("MIN_QTY", "0.01"))
+MIN_ACCOUNT_BP_USD = float(os.getenv("MIN_ACCOUNT_BP_USD", "100"))
 
 def _trading_client() -> TradingClient:
     return TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
 
 def _get_buying_power() -> float:
     try:
-        bp = float(getattr(_trading_client().get_account(), "buying_power", 0.0))
-        return bp
+        return float(getattr(_trading_client().get_account(), "buying_power", 0.0))
     except Exception as e:
         log.warning("buying power read failed: %s", e)
         return 0.0
@@ -44,16 +50,26 @@ def _get_atr(symbol: str, period="5d", interval="5m") -> float:
         log.warning("%s ATR failed: %s", symbol, e)
         return 0.0
 
-def _qty_from_risk(price: float, atr: float) -> int:
-    sl_dist = max(0.01, atr * SL_ATR_MULT)
-    qty_risk = max(1, int(RISK_PER_TRADE_USD / max(sl_dist, 1e-6)))
-    bp = _get_buying_power()
-    max_bp_shares = int(max(0, bp) // max(price, 0.01))
-    if max_bp_shares <= 0:
+def _round_qty(q: float) -> float:
+    if not FRACTIONAL:
+        return int(q)
+    # 2 decimal places is widely accepted for fractional equities
+    return float(Decimal(q).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+def _qty_from_risk(price: float, atr: float) -> float:
+    """Return qty (float when FRACTIONAL=1, otherwise int). 0 means 'don’t trade'."""
+    if price <= 0:
         return 0
-    qty = min(qty_risk, max_bp_shares)
-    if qty < qty_risk:
-        log.info("qty capped by BP: %s -> %s (bp=%.2f, px=%.2f)", qty_risk, qty, bp, price)
+    sl_dist = max(0.01, atr * SL_ATR_MULT)
+    # risk-based shares
+    qty_risk = max(MIN_QTY if FRACTIONAL else 1, RISK_PER_TRADE_USD / max(sl_dist, 1e-6))
+    # cap by BP
+    bp = _get_buying_power()
+    max_shares_by_bp = bp / price
+    qty = min(qty_risk, max_shares_by_bp)
+    qty = _round_qty(qty)
+    if qty < (MIN_QTY if FRACTIONAL else 1):
+        return 0
     return qty
 
 def _get_recent_signals():
@@ -74,8 +90,8 @@ def _get_recent_signals():
 
 def main():
     bp = _get_buying_power()
-    log.info("executor_bracket | since-min=%s min_strength=%.2f | buying_power=%.2f",
-             SINCE_MIN, MIN_STRENGTH, bp)
+    log.info("executor_bracket | since-min=%s min_strength=%.2f | buying_power=%.2f | fractional=%s",
+             SINCE_MIN, MIN_STRENGTH, bp, FRACTIONAL)
     if bp < MIN_ACCOUNT_BP_USD:
         log.info("account BP < MIN_ACCOUNT_BP_USD (%.2f < %.2f) — skipping this cycle",
                  bp, MIN_ACCOUNT_BP_USD)
@@ -99,19 +115,21 @@ def main():
         atr = _get_atr(sym)
         qty = _qty_from_risk(px, atr)
         if qty <= 0:
-            log.info("%s: no buying power for qty; skip", sym)
+            log.info("%s: no buying power for qty (px=%.2f, bp=%.2f); skip", sym, px, bp)
             continue
 
         tp_px = px + TP_ATR_MULT * atr if side == "buy" else px - TP_ATR_MULT * atr
         sl_px = px - SL_ATR_MULT * atr if side == "buy" else px + SL_ATR_MULT * atr
+
         try:
             req = LimitOrderRequest(
-                symbol=sym, qty=qty,
+                symbol=sym,
+                qty=qty,  # float allowed when fractional trading is enabled on Alpaca
                 side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
                 limit_price=round(px, 2),
                 time_in_force=TimeInForce.DAY
             )
-            o = _trading_client().submit_order(req)
+            o = cli.submit_order(req)
             log.info("submitted %s %s qty=%s px=%.2f tp=%.2f sl=%.2f id=%s",
                      sym, side, qty, px, tp_px, sl_px, o.id)
         except Exception as e:
