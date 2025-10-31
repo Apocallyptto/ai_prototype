@@ -11,21 +11,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("executor_bracket")
 
 DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
-# prefer EXEC_* envs; fallback to legacy
 MIN_STRENGTH = float(os.getenv("EXEC_MIN_STRENGTH", os.getenv("MIN_STRENGTH", "0.60")))
 SINCE_MIN = int(os.getenv("EXEC_SINCE_MIN", os.getenv("SINCE_MIN", "20")))
-
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 RISK_PER_TRADE_USD = float(os.getenv("RISK_PER_TRADE_USD", "50"))
+MIN_ACCOUNT_BP_USD = float(os.getenv("MIN_ACCOUNT_BP_USD", "100"))  # ⬅ guard
 
 def _trading_client() -> TradingClient:
     return TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
 
 def _get_buying_power() -> float:
     try:
-        acct = _trading_client().get_account()
-        return float(getattr(acct, "buying_power", 0.0))
+        bp = float(getattr(_trading_client().get_account(), "buying_power", 0.0))
+        return bp
     except Exception as e:
         log.warning("buying power read failed: %s", e)
         return 0.0
@@ -74,7 +73,14 @@ def _get_recent_signals():
         return pd.read_sql_query(sql, con, params={"thr": MIN_STRENGTH})
 
 def main():
-    log.info("executor_bracket | since-min=%s min_strength=%.2f", SINCE_MIN, MIN_STRENGTH)
+    bp = _get_buying_power()
+    log.info("executor_bracket | since-min=%s min_strength=%.2f | buying_power=%.2f",
+             SINCE_MIN, MIN_STRENGTH, bp)
+    if bp < MIN_ACCOUNT_BP_USD:
+        log.info("account BP < MIN_ACCOUNT_BP_USD (%.2f < %.2f) — skipping this cycle",
+                 bp, MIN_ACCOUNT_BP_USD)
+        return
+
     cli = _trading_client()
     df = _get_recent_signals()
     if df.empty:
@@ -82,8 +88,7 @@ def main():
         return
 
     for _, row in df.iterrows():
-        sym = row["symbol"]
-        side = row["side"]
+        sym = row["symbol"]; side = row["side"]
         px = float(row["px"]) if pd.notna(row["px"]) else None
         if px is None:
             try:
@@ -97,21 +102,16 @@ def main():
             log.info("%s: no buying power for qty; skip", sym)
             continue
 
-        if side == "buy":
-            tp_px = px + TP_ATR_MULT * atr
-            sl_px = px - SL_ATR_MULT * atr
-            order_side = OrderSide.BUY
-        else:
-            tp_px = px - TP_ATR_MULT * atr
-            sl_px = px + SL_ATR_MULT * atr
-            order_side = OrderSide.SELL
-
+        tp_px = px + TP_ATR_MULT * atr if side == "buy" else px - TP_ATR_MULT * atr
+        sl_px = px - SL_ATR_MULT * atr if side == "buy" else px + SL_ATR_MULT * atr
         try:
             req = LimitOrderRequest(
-                symbol=sym, qty=qty, side=order_side,
-                limit_price=round(px, 2), time_in_force=TimeInForce.DAY
+                symbol=sym, qty=qty,
+                side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                limit_price=round(px, 2),
+                time_in_force=TimeInForce.DAY
             )
-            o = cli.submit_order(req)
+            o = _trading_client().submit_order(req)
             log.info("submitted %s %s qty=%s px=%.2f tp=%.2f sl=%.2f id=%s",
                      sym, side, qty, px, tp_px, sl_px, o.id)
         except Exception as e:
