@@ -1,5 +1,5 @@
 # services/executor_bracket.py
-import os, logging, math
+import os, logging
 from decimal import Decimal, ROUND_DOWN
 
 import yfinance as yf
@@ -20,10 +20,12 @@ TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 RISK_PER_TRADE_USD = float(os.getenv("RISK_PER_TRADE_USD", "50"))
 
-# fractional config
+# fractional / policy
 FRACTIONAL = os.getenv("FRACTIONAL", "0") == "1"
 MIN_QTY = float(os.getenv("MIN_QTY", "0.01"))
 MIN_ACCOUNT_BP_USD = float(os.getenv("MIN_ACCOUNT_BP_USD", "100"))
+ALLOW_FRACTIONAL_SHORTS = os.getenv("ALLOW_FRACTIONAL_SHORTS", "0") == "1"  # Alpaca disallows; keep 0
+LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"  # set 1 to disable shorts entirely
 
 def _trading_client() -> TradingClient:
     return TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
@@ -53,17 +55,13 @@ def _get_atr(symbol: str, period="5d", interval="5m") -> float:
 def _round_qty(q: float) -> float:
     if not FRACTIONAL:
         return int(q)
-    # 2 decimal places is widely accepted for fractional equities
     return float(Decimal(q).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
 def _qty_from_risk(price: float, atr: float) -> float:
-    """Return qty (float when FRACTIONAL=1, otherwise int). 0 means 'don’t trade'."""
     if price <= 0:
         return 0
     sl_dist = max(0.01, atr * SL_ATR_MULT)
-    # risk-based shares
     qty_risk = max(MIN_QTY if FRACTIONAL else 1, RISK_PER_TRADE_USD / max(sl_dist, 1e-6))
-    # cap by BP
     bp = _get_buying_power()
     max_shares_by_bp = bp / price
     qty = min(qty_risk, max_shares_by_bp)
@@ -90,8 +88,8 @@ def _get_recent_signals():
 
 def main():
     bp = _get_buying_power()
-    log.info("executor_bracket | since-min=%s min_strength=%.2f | buying_power=%.2f | fractional=%s",
-             SINCE_MIN, MIN_STRENGTH, bp, FRACTIONAL)
+    log.info("executor_bracket | since-min=%s min_strength=%.2f | buying_power=%.2f | fractional=%s long_only=%s",
+             SINCE_MIN, MIN_STRENGTH, bp, FRACTIONAL, LONG_ONLY)
     if bp < MIN_ACCOUNT_BP_USD:
         log.info("account BP < MIN_ACCOUNT_BP_USD (%.2f < %.2f) — skipping this cycle",
                  bp, MIN_ACCOUNT_BP_USD)
@@ -105,6 +103,9 @@ def main():
 
     for _, row in df.iterrows():
         sym = row["symbol"]; side = row["side"]
+        if LONG_ONLY and side == "sell":
+            log.info("%s: LONG_ONLY=1 — skip short entry", sym); continue
+
         px = float(row["px"]) if pd.notna(row["px"]) else None
         if px is None:
             try:
@@ -118,13 +119,18 @@ def main():
             log.info("%s: no buying power for qty (px=%.2f, bp=%.2f); skip", sym, px, bp)
             continue
 
+        # Reject fractional shorts (Alpaca limitation)
+        if side == "sell" and FRACTIONAL and qty < 1 and not ALLOW_FRACTIONAL_SHORTS:
+            log.info("%s: fractional short qty=%s not allowed — skip", sym, qty)
+            continue
+
         tp_px = px + TP_ATR_MULT * atr if side == "buy" else px - TP_ATR_MULT * atr
         sl_px = px - SL_ATR_MULT * atr if side == "buy" else px + SL_ATR_MULT * atr
 
         try:
             req = LimitOrderRequest(
                 symbol=sym,
-                qty=qty,  # float allowed when fractional trading is enabled on Alpaca
+                qty=qty,
                 side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
                 limit_price=round(px, 2),
                 time_in_force=TimeInForce.DAY
