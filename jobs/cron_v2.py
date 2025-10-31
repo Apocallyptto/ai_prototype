@@ -34,6 +34,9 @@ def main():
             run("python -m tools.db_migrate_models")
             run("python -m tools.db_migrate_signals_px")
 
+            # --- start of each cycle: visibility into BP ---
+            run("python -m tools.bp_log")
+
             # --- signal generation (ensemble only; replaces make_signals) ---
             run("python -m jobs.make_signals_ensemble")
 
