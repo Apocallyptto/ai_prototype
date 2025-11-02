@@ -37,13 +37,43 @@ LONG_ONLY    = os.getenv("LONG_ONLY", "0") == "1"
 def _trading_client() -> TradingClient:
     return TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
 
+# --- replace your _get_buying_power with this robust version ---
 def _get_buying_power() -> float:
-    try:
-        cli = _trading_client()
-        acct = cli.get_account()
-        return float(getattr(acct, "buying_power", 0.0))
-    except Exception:
-        return 0.0
+    """
+    Returns account buying power with retries.
+    - If API hiccups -> retry and log.
+    - If buying_power is 0 but cash exists -> fall back to cash.
+    - If FORCE_BP is set (debug), use that value.
+    """
+    # Debug override for local testing
+    if os.getenv("FORCE_BP"):
+        try:
+            return float(os.getenv("FORCE_BP"))
+        except Exception:
+            pass
+
+    cli = _trading_client()
+    last_err = None
+    for attempt in range(3):
+        try:
+            acct = cli.get_account()
+            # Alpaca fields are usually strings
+            bp = float(getattr(acct, "buying_power", 0.0) or 0.0)
+            cash = float(getattr(acct, "cash", 0.0) or 0.0)
+            if bp <= 0.0 and cash > 0.0:
+                logging.getLogger("executor_bracket").warning(
+                    "buying_power reported 0; falling back to cash=%.2f", cash
+                )
+                return cash
+            return bp
+        except Exception as e:
+            last_err = e
+            time.sleep(0.4 * (attempt + 1))
+
+    logging.getLogger("executor_bracket").warning(
+        "get_account() failed; assuming BP=0.0 | err=%s", last_err
+    )
+    return 0.0
 
 def _round_cents(x: float) -> float:
     return float(Decimal(x).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
