@@ -1,231 +1,219 @@
 # services/executor_bracket.py
-import os, logging, argparse, time
+import os, sys, logging, math, time
 from decimal import Decimal, ROUND_DOWN
+from typing import List, Dict, Any
 
-import yfinance as yf
 import pandas as pd
-from sqlalchemy import create_engine, text
+import psycopg2
+from psycopg2.extras import DictCursor
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# 👉 NEW: quote helper (uses Alpaca market data with yfinance fallback)
+from tools.quotes import get_bid_ask_mid
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("executor_bracket")
 
-# ---------- ENV / defaults ----------
-DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
-DEFAULT_MIN_STRENGTH = float(os.getenv("EXEC_MIN_STRENGTH", os.getenv("MIN_STRENGTH", "0.60")))
-DEFAULT_SINCE_MIN   = int(os.getenv("EXEC_SINCE_MIN", os.getenv("SINCE_MIN", "20")))
+# --- Env / defaults ---
+TP_ATR_MULT         = float(os.getenv("TP_ATR_MULT", "1.5"))
+SL_ATR_MULT         = float(os.getenv("SL_ATR_MULT", "1.0"))
+ATR_PERIOD          = int(os.getenv("ATR_PERIOD", "14"))
+ATR_LOOKBACK_DAYS   = int(os.getenv("ATR_LOOKBACK_DAYS", "30"))
+RISK_PER_TRADE_USD  = float(os.getenv("RISK_PER_TRADE_USD", "50"))
 
-TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
-RISK_PER_TRADE_USD = float(os.getenv("RISK_PER_TRADE_USD", "50"))
+MAX_SPREAD_PCT      = float(os.getenv("MAX_SPREAD_PCT", "0.15"))   # in %
+MAX_SPREAD_ABS      = float(os.getenv("MAX_SPREAD_ABS", "0.06"))   # in $
+QUOTE_SLIP          = float(os.getenv("QUOTE_PRICE_SLIPPAGE", "0.02"))
 
-# fractional / policy
-FRACTIONAL = os.getenv("FRACTIONAL", "0") == "1"
-MIN_QTY = float(os.getenv("MIN_QTY", "0.01"))
-MIN_ACCOUNT_BP_USD = float(os.getenv("MIN_ACCOUNT_BP_USD", "100"))
-ALLOW_FRACTIONAL_SHORTS = os.getenv("ALLOW_FRACTIONAL_SHORTS", "0") == "1"  # Alpaca disallows; keep 0
-LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"  # set 1 to disable shorts entirely
+DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or "postgresql://postgres:postgres@postgres:5432/trader"
 
-# position limits / dedupe
-MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "50000"))         # cap per symbol by notional
-MAX_SHARES_PER_SYMBOL = float(os.getenv("MAX_SHARES_PER_SYMBOL", "1000"))
-OPEN_ORDER_COOLDOWN_SEC = int(os.getenv("OPEN_ORDER_COOLDOWN_SEC", "600"))  # skip if open order exists recently
+# Flags
+FRACTIONAL   = os.getenv("FRACTIONAL", "0") == "1"
+LONG_ONLY    = os.getenv("LONG_ONLY", "0") == "1"
 
-# ---------- Helpers ----------
 def _trading_client() -> TradingClient:
     return TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
 
-def _get_account():
-    return _trading_client().get_account()
-
 def _get_buying_power() -> float:
     try:
-        return float(getattr(_get_account(), "buying_power", 0.0))
-    except Exception as e:
-        log.warning("buying power read failed: %s", e)
-        return 0.0
-
-def _get_position_qty(symbol: str) -> float:
-    """Returns signed qty: positive for long, negative for short. 0 if none."""
-    try:
-        pos = _trading_client().get_open_position(symbol)
-        qty = float(getattr(pos, "qty", 0.0))
-        # Alpaca returns positive for both long and short with a 'side'; adjust:
-        side = str(getattr(pos, "side", "long")).lower()
-        return qty if side == "long" else -qty
+        cli = _trading_client()
+        acct = cli.get_account()
+        return float(getattr(acct, "buying_power", 0.0))
     except Exception:
         return 0.0
 
-def _has_recent_open_order(symbol: str) -> bool:
-    """Best-effort dedupe: if there are open orders for symbol, skip a new one."""
+def _round_cents(x: float) -> float:
+    return float(Decimal(x).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+def _fetch_signals(since_min: int, min_strength: float) -> pd.DataFrame:
+    sql = """
+        SELECT created_at, symbol, side,
+               COALESCE(scaled_strength, strength) AS strength,
+               COALESCE(px, NULL) AS px
+        FROM public.signals
+        WHERE created_at >= NOW() - INTERVAL %s
+          AND COALESCE(scaled_strength, strength) >= %s
+        ORDER BY created_at DESC;
+    """
+    with psycopg2.connect(DB_URL) as conn:
+        df = pd.read_sql(sql, conn, params=(f"{since_min} minutes", min_strength))
+    return df
+
+def _dedupe_latest_by_symbol(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df.empty:
+        return []
+    # Keep the most recent per-symbol
+    df = df.sort_values("created_at", ascending=False).drop_duplicates(subset=["symbol"], keep="first")
+    recs = df.to_dict("records")
+    # normalize side to 'buy'/'sell'
+    for r in recs:
+        s = str(r.get("side", "")).lower()
+        r["side"] = "buy" if s.startswith("b") else "sell"
+    return recs
+
+def _calc_atr(symbol: str) -> float:
+    """
+    Simple ATR using yfinance 5m bars over lookback days.
+    Fallback to a small positive to avoid zero division.
+    """
     try:
-        # new alpaca-py uses get_orders without 'status' kw; use list + filter
-        orders = _trading_client().get_orders()
-        now = time.time()
-        for o in orders:
-            if getattr(o, "symbol", "") == symbol and str(getattr(o, "status", "")).lower() in ("new","accepted","open","pending_new","partially_filled"):
-                # crude time guard: if submitted in last cooldown sec, skip
-                # many fields are strings; be tolerant
-                return True
-        return False
-    except Exception as e:
-        log.warning("get_orders check failed: %s", e)
-        return False
+        import yfinance as yf
+        period_days = max(2, ATR_LOOKBACK_DAYS)
+        df = yf.download(symbol, interval="5m", period=f"{period_days}d", progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return 0.25
+        df = df.rename(columns=str.lower)
+        h, l, c = df["high"], df["low"], df["close"]
+        prev_c = c.shift(1)
+        tr = pd.concat([
+            (h - l).abs(),
+            (h - prev_c).abs(),
+            (l - prev_c).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(ATR_PERIOD, min_periods=max(2, ATR_PERIOD // 2)).mean().iloc[-1]
+        return float(max(atr, 0.01))
+    except Exception:
+        return 0.25
 
-def _atr(h, l, c, n=14):
-    hl = (h - l).abs()
-    hc = (h - c.shift(1)).abs()
-    lc = (l - c.shift(1)).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
-def _get_atr(symbol: str, period="5d", interval="5m") -> float:
-    try:
-        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
-        return float(_atr(df["High"], df["Low"], df["Close"], 14).iloc[-1])
-    except Exception as e:
-        log.warning("%s ATR failed: %s", symbol, e)
-        return 0.0
-
-def _round_qty(q: float) -> float:
-    if not FRACTIONAL:
-        return int(q)
-    return float(Decimal(q).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
-
-def _qty_from_risk(price: float, atr: float) -> float:
-    """Return qty (float when FRACTIONAL=1, otherwise int). 0 means 'don’t trade'."""
-    if price <= 0:
-        return 0
+def _qty_from_risk(price: float, atr: float) -> int:
     sl_dist = max(0.01, atr * SL_ATR_MULT)
-    qty_risk = max(MIN_QTY if FRACTIONAL else 1, RISK_PER_TRADE_USD / max(sl_dist, 1e-6))
+    qty_risk = max(1, int(RISK_PER_TRADE_USD / max(sl_dist, 1e-6)))
+
+    # cap by buying power
     bp = _get_buying_power()
-    max_shares_by_bp = bp / price
-    qty = min(qty_risk, max_shares_by_bp)
-    qty = _round_qty(qty)
-    if qty < (MIN_QTY if FRACTIONAL else 1):
+    max_bp_shares = int(max(0, bp) // max(price, 0.01))
+    if max_bp_shares <= 0:
         return 0
+    qty = min(qty_risk, max_bp_shares)
+    if qty < qty_risk:
+        log.info("qty capped by BP: %s -> %s (bp=%.2f, px=%.2f)", qty_risk, qty, bp, price)
     return qty
 
-def _cap_by_position_limits(symbol: str, side: str, qty: float, px: float) -> float:
-    """Enforce: (1) notional cap, (2) max shares, (3) available shares for sells."""
-    if qty <= 0:
-        return 0
-    # 1) notional / shares caps for both directions
-    if MAX_POSITION_USD > 0:
-        max_shares_by_notional = MAX_POSITION_USD / max(px, 0.01)
-        qty = min(qty, max_shares_by_notional)
-    if MAX_SHARES_PER_SYMBOL > 0:
-        qty = min(qty, MAX_SHARES_PER_SYMBOL)
+def _parse_arg(flag: str, default: str) -> str:
+    """
+    Robust argv parsing: looks for '--flag value' or '--flag=value'
+    """
+    for i, a in enumerate(sys.argv):
+        if a == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return default
 
-    # 2) For SELL: cannot exceed available long qty (or short add if allowed)
-    pos_qty = _get_position_qty(symbol)  # +long / -short
-    if side == "sell":
-        if LONG_ONLY and pos_qty <= 0:
-            return 0
-        # If we have a long, we can sell up to that amount
-        available = pos_qty if pos_qty > 0 else 0.0
-        if FRACTIONAL:
-            # fractional: cap with float
-            qty = min(qty, available)
-        else:
-            qty = int(min(qty, available))
-        # Also handle Alpaca's "fractional shorts not allowed"
-        if FRACTIONAL and qty < 1.0 and not ALLOW_FRACTIONAL_SHORTS:
-            # If qty < 1 but we actually have >= 1 to sell, round down handled above
-            # If still <1, skip
-            return 0
-    # Ensure not negative
-    if qty <= 0:
-        return 0
-    return _round_qty(qty)
-
-def _get_recent_signals(since_min: int, min_strength: float):
-    eng = create_engine(DB_URL)
-    sql = text(f"""
-        SELECT DISTINCT ON (symbol)
-               created_at, symbol, side,
-               COALESCE(scaled_strength, strength) AS strength,
-               px
-        FROM signals
-        WHERE created_at >= NOW() - INTERVAL '{since_min} minutes'
-          AND COALESCE(scaled_strength, strength) >= :thr
-          AND side IN ('buy','sell')
-        ORDER BY symbol, created_at DESC
-    """)
-    with eng.connect() as con:
-        return pd.read_sql_query(sql, con, params={"thr": min_strength})
-
-# ---------- Main ----------
 def main():
-    # CLI args override envs
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--since-min", type=int, default=DEFAULT_SINCE_MIN)
-    ap.add_argument("--min-strength", type=float, default=DEFAULT_MIN_STRENGTH)
-    args = ap.parse_args()
+    since_min = int(_parse_arg("--since-min", "20"))
+    min_strength = float(_parse_arg("--min-strength", os.getenv("MIN_STRENGTH", "0.50")))
 
-    since_min = args.since_min
-    min_strength = args.min_strength
-
+    # Account context
     bp = _get_buying_power()
-    log.info("executor_bracket | since-min=%s min_strength=%.2f | buying_power=%.2f | fractional=%s long_only=%s",
-             since_min, min_strength, bp, FRACTIONAL, LONG_ONLY)
-    if bp < MIN_ACCOUNT_BP_USD:
-        log.info("account BP < MIN_ACCOUNT_BP_USD (%.2f < %.2f) — skipping this cycle",
-                 bp, MIN_ACCOUNT_BP_USD)
-        return
+    log.info("executor_bracket | since-min=%d min_strength=%.2f | buying_power=%.2f | fractional=%s long_only=%s",
+             since_min, min_strength, bp, str(FRACTIONAL), str(LONG_ONLY))
 
-    df = _get_recent_signals(since_min, min_strength)
-    if df.empty:
-        log.info("no qualifying signals in last %s min (>= %.2f)", since_min, min_strength)
+    # Fetch signals
+    df = _fetch_signals(since_min, min_strength)
+    rows = _dedupe_latest_by_symbol(df)
+    if not rows:
+        log.info("no qualifying signals in last %d min (>= %.2f)", since_min, min_strength)
         return
 
     cli = _trading_client()
 
-    for _, row in df.iterrows():
-        sym = row["symbol"]; side = row["side"]
-
+    for r in rows:
+        sym = r["symbol"]
+        side = r["side"]
         if LONG_ONLY and side == "sell":
-            log.info("%s: LONG_ONLY=1 — skip short/exit entry", sym)
+            # Skip shorts in long-only mode
+            log.info("%s: skip short in LONG_ONLY mode", sym)
             continue
 
-        if _has_recent_open_order(sym):
-            log.info("%s: open order exists (cooldown) — skip new entry", sym)
+        # Reference price for risk sizing
+        px = float(r["px"] or 0.0)
+        if px <= 0:
+            # fallback to mid
+            q = get_bid_ask_mid(sym)
+            if q:
+                _, _, mid = q
+                px = float(mid)
+
+        if px <= 0:
+            log.info("%s: no usable reference price; skip", sym)
             continue
 
-        # price
-        px = float(row["px"]) if pd.notna(row["px"]) else None
-        if px is None:
-            try:
-                px = float(yf.Ticker(sym).fast_info.last_price)
-            except Exception:
-                log.info("%s: no price; skip", sym); continue
-
-        atr = _get_atr(sym)
-        base_qty = _qty_from_risk(px, atr)
-        qty = _cap_by_position_limits(sym, side, base_qty, px)
+        atr = _calc_atr(sym)
+        qty = _qty_from_risk(px, atr)
         if qty <= 0:
-            log.info("%s: qty after caps is 0 (side=%s, base=%.4f); skip", sym, side, base_qty)
+            log.info("%s: no buying power for qty; skip", sym)
             continue
 
-        # Simple limit entry; exits handled by manage_exits OCO job
+        # --- price / quotes (NEW) ---
+        quote = get_bid_ask_mid(sym)
+        if quote:
+            bid, ask, mid = quote
+            spread_abs = max(0.0, ask - bid)
+            spread_pct = (spread_abs / mid) * 100.0 if mid > 0 else 999.0
+
+            if (spread_pct > MAX_SPREAD_PCT) or (spread_abs > MAX_SPREAD_ABS):
+                log.info("%s: skip due to wide spread (abs=%.4f pct=%.3f%% > limits)", sym, spread_abs, spread_pct)
+                continue
+
+            # Quote-aware limit target
+            slip = QUOTE_SLIP
+            if side == "buy":
+                limit_px = min(ask + slip, max(ask, px))
+            else:
+                limit_px = max(bid - slip, min(bid, px if px else bid))
+        else:
+            # Fallback to prior px (less ideal)
+            limit_px = px
+
+        limit_px = _round_cents(limit_px)
+
+        # Compute TP/SL off *entry ref* px (keep consistent with ATR risk model)
         tp_px = px + TP_ATR_MULT * atr if side == "buy" else px - TP_ATR_MULT * atr
         sl_px = px - SL_ATR_MULT * atr if side == "buy" else px + SL_ATR_MULT * atr
+        tp_px, sl_px = _round_cents(tp_px), _round_cents(sl_px)
 
+        # Build & submit primary limit order (TP/SL handled by jobs.manage_exits in your stack)
         try:
             req = LimitOrderRequest(
                 symbol=sym,
                 qty=qty,
                 side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-                limit_price=round(px, 2),
+                limit_price=limit_px,                      # 👉 NEW: quote-aware limit
                 time_in_force=TimeInForce.DAY
             )
             o = cli.submit_order(req)
             log.info("submitted %s %s qty=%s px=%.2f tp=%.2f sl=%.2f id=%s",
-                     sym, side, qty, px, tp_px, sl_px, o.id)
+                     sym, side, qty, limit_px, tp_px, sl_px, getattr(o, "id", ""))
         except Exception as e:
             log.warning("submit failed %s %s: %s", sym, side, e)
+            continue
+
+        # You already have jobs.manage_exits doing OCO logic using ATR; keep that path.
+        # (If you ever want native OCO attached here, we can wire TakeProfitRequest/StopLossRequest.)
 
 if __name__ == "__main__":
     main()
