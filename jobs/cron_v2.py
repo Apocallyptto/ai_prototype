@@ -48,6 +48,8 @@ def main():
             # --- risk management / maintenance ---
             run("python -m jobs.trailing_guard")
             run(f"python -m jobs.manage_exits --symbols {SYMBOLS}")
+            run("python -m jobs.partial_fills")  # cancel lingering partials
+            run("python -m jobs.reprice_stale")  # reprice orders older than REPRICE_AFTER_SEC
             run(f"python -m jobs.manage_stale_orders --symbols {SYMBOLS}")
 
             # --- housekeeping ---
