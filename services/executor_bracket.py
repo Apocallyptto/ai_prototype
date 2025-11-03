@@ -108,13 +108,63 @@ def _calc_atr_from_df(df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
     val = float(atr.iloc[-1])
     return max(1e-4, val)
 
+def _flatten_yf_multiindex(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    yfinance can return MultiIndex columns like:
+      level0='Price', level1='Ticker'  -> ('close','aapl')
+    Normalize to single index ['open','high','low','close', ...].
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+
+    sym_lower = symbol.lower()
+    levels = df.columns.names or [None, None]
+
+    # Try selecting by the last level (often the ticker)
+    try:
+        tickers = [str(x).lower() for x in df.columns.get_level_values(-1)]
+        if sym_lower in tickers:
+            df2 = df.xs(key=sym_lower, level=-1, axis=1)
+            return df2
+    except Exception:
+        pass
+
+    # Try selecting by the first level
+    try:
+        lv0 = [str(x).lower() for x in df.columns.get_level_values(0)]
+        if sym_lower in lv0:
+            df2 = df.xs(key=sym_lower, level=0, axis=1)
+            return df2
+    except Exception:
+        pass
+
+    # Fallback: if it's a single-ticker MultiIndex, just drop the ticker level
+    try:
+        if df.columns.nlevels >= 2:
+            return df.droplevel(1, axis=1)
+    except Exception:
+        pass
+
+    return df  # last resort (caller will validate required columns)
+
 def _fetch_bars(symbol: str, interval: str = "5m", period: str = "30d") -> pd.DataFrame:
-    df = yf.download(symbol, interval=interval, period=period, progress=False, auto_adjust=False)
+    # Force single-level columns; still flatten if MultiIndex slips through.
+    df = yf.download(
+        symbol,
+        interval=interval,
+        period=period,
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+    )
     if not isinstance(df, pd.DataFrame) or df.empty:
         raise RuntimeError(f"no bars for {symbol}")
+
+    # Normalize MultiIndex -> single index if needed
+    df = _flatten_yf_multiindex(df, symbol)
     df = df.rename(columns=str.lower)
-    # yfinance sometimes returns single-level index; ensure columns present
-    req = {"open","high","low","close"}
+
+    req = {"open", "high", "low", "close"}
     if not req.issubset(set(df.columns)):
         raise RuntimeError(f"bars missing columns for {symbol}: have {df.columns}")
     return df
@@ -133,7 +183,7 @@ def _qty_from_risk(price: float, atr: float) -> float:
     sl_dist = max(0.01, atr * SL_ATR_MULT)
     if FRACTIONAL:
         # fractional sizing in notional terms
-        # risk_per_share ~= sl_dist -> target notional = RISK / (sl_dist/price) = RISK * price / sl_dist
+        # risk_per_share ~= sl_dist -> target notional = RISK * price / sl_dist
         target_notional = max(0.0, RISK_PER_TRADE_USD * price / max(sl_dist, 1e-6))
         bp = _get_buying_power()
         max_notional = max(0.0, min(bp, target_notional))
@@ -163,10 +213,8 @@ def _submit_bracket(symbol: str, side: str, qty: float, limit_px: float, tp_px: 
     notional = None
     qty_val = None
     if FRACTIONAL:
-        # Alpaca fractional short selling is not allowed unless explicitly enabled by your plan.
         if side == "sell" and not ALLOW_FRACTIONAL_SHORTS:
             raise RuntimeError("fractional orders cannot be sold short")
-        # Use notional when fractional
         notional = round(float(qty) * float(limit_px), 2)
         if notional <= 0:
             raise RuntimeError("invalid notional computed")
