@@ -1,133 +1,195 @@
 # jobs/make_signals_ensemble.py
-import os, logging, math
-from typing import Dict, List
-import psycopg2
+import os
+import logging
+from datetime import datetime, timezone
+
+import numpy as np
 import pandas as pd
 import yfinance as yf
+from sqlalchemy import create_engine, text
+import joblib
+
+# --- env / config ---
+DB_URL = os.getenv("DB_URL", os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/trader"))
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/gbc_5m.pkl")
+DISABLE_NN = os.getenv("DISABLE_NN", "0") == "1"
+LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"  # <- NEW: filter out shorts at the writer level
+
+# rules weights / thresholds (can tune later)
+RSI_LEN = int(os.getenv("RSI_LEN", "14"))
+EMA_FAST = int(os.getenv("EMA_FAST", "20"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
+RULE_W = float(os.getenv("RULE_WEIGHT", "0.6"))
+NN_W = float(os.getenv("NN_WEIGHT", "0.4"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("make_signals_ensemble")
 
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
-PORTFOLIO_ID = os.getenv("PORTFOLIO_ID", "paper")
 
-WEIGHT_RULE = float(os.getenv("ENSEMBLE_W_RULE", "0.6"))
-WEIGHT_NN   = float(os.getenv("ENSEMBLE_W_NN", "0.4"))
-HOLD_THRESH = float(os.getenv("ENSEMBLE_HOLD_THRESHOLD", "0.10"))  # |score| <= HOLD -> hold
-
-def _rsi(s, n=14):
-    d = s.diff()
-    up = d.clip(lower=0).rolling(n).mean()
-    dn = (-d.clip(upper=0)).rolling(n).mean()
-    rs = (up / dn.replace(0, float("nan"))).fillna(0.0)
-    return 100 - 100/(1+rs.replace(0, float("inf")))
-
-def _ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
-
-def _atr(h, l, c, n=14):
-    hl = (h - l).abs()
-    hc = (h - c.shift(1)).abs()
-    lc = (l - c.shift(1)).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
-def _rule_one_symbol(sym: str) -> Dict[str, float]:
+def _safe_float(x, default=0.0):
     try:
-        df = yf.download(sym, interval="5m", period="2d", progress=False, auto_adjust=False).rename(columns=str.lower)
-        if df is None or df.empty or len(df) < 60:
-            return {"side":"hold","strength":0.0}
-        c = df["close"]; h = df["high"]; l = df["low"]
-        rsi14 = _rsi(c, 14)
-        ema20 = _ema(c, 20)
-        ema50 = _ema(c, 50)
-        atr14 = _atr(h, l, c, 14).fillna(0.0)
-
-        px       = float(c.iloc[-1].item())
-        ema20_v  = float(ema20.iloc[-1].item())
-        ema50_v  = float(ema50.iloc[-1].item())
-        rsi_v    = float(rsi14.iloc[-1].item())
-        atr_v    = max(1e-6, float(atr14.iloc[-1].item()))
-
-        up_trend   = px > ema50_v
-        down_trend = px < ema50_v
-        rsi_up     = rsi_v - 50.0
-        dist_ema   = (px - ema20_v)
-
-        score = 0.4*(rsi_up/20.0) + 0.6*(dist_ema/atr_v)
-        score = max(-1.0, min(1.0, score))
-
-        if score > +0.05 and up_trend:
-            return {"side":"buy",  "strength": round(min(1.0, abs(score)), 3)}
-        if score < -0.05 and down_trend:
-            return {"side":"sell", "strength": round(min(1.0, abs(score)), 3)}
-        return {"side":"hold","strength": round(abs(score), 3)}
-    except Exception as e:
-        log.warning("%s rule calc failed: %s", sym, e)
-        return {"side":"hold","strength":0.0}
-
-def _rules_all(symbols: List[str]) -> Dict[str, Dict[str, float]]:
-    return {s: _rule_one_symbol(s) for s in symbols}
-
-def _nn_rows(symbols_csv: str) -> Dict[str, Dict[str, float]]:
-    try:
-        from jobs.make_signals_nn import nn_predict
-        return nn_predict(symbols_csv)
-    except Exception as e:
-        log.warning("NN path failed: %s; using rules only.", e)
-        return {}
-
-def _score(row):
-    side = row.get("side","hold")
-    st   = float(row.get("strength",0.0))
-    if side == "buy":  return +st
-    if side == "sell": return -st
-    return 0.0
-
-def _merge(rule_rows: Dict[str, Dict[str, float]],
-           nn_rows: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
-    out: Dict[str, Dict[str, float]] = {}
-    for s in set(rule_rows.keys()) | set(nn_rows.keys()):
-        r = rule_rows.get(s, {"side":"hold","strength":0.0})
-        n = nn_rows.get(s,   {"side":"hold","strength":0.0})
-        blend = WEIGHT_RULE*_score(r) + WEIGHT_NN*_score(n)
-        if blend > +HOLD_THRESH:
-            out[s] = {"side":"buy",  "strength": round(min(1.0, abs(blend)), 3)}
-        elif blend < -HOLD_THRESH:
-            out[s] = {"side":"sell", "strength": round(min(1.0, abs(blend)), 3)}
-        else:
-            out[s] = {"side":"hold", "strength": round(abs(blend), 3)}
-    return out
-
-def _last_px(sym: str) -> float:
-    try:
-        p = yf.Ticker(sym).fast_info.last_price
-        return float(p) if p is not None else float("nan")
+        return float(x)
     except Exception:
-        return float("nan")
+        return default
 
-def _insert_rows(rows: Dict[str, Dict[str, float]]):
-    sql = """
-        INSERT INTO public.signals (created_at, symbol, side, strength, px, portfolio_id)
-        VALUES (NOW(), %s, %s, %s, %s, %s)
-    """
-    with psycopg2.connect(DB_URL) as conn, conn.cursor() as cur:
-        for s, r in rows.items():
-            if r["side"] == "hold":
-                continue
-            px = _last_px(s)
-            cur.execute(sql, (s, r["side"], float(r["strength"]), (None if math.isnan(px) else px), PORTFOLIO_ID))
-        conn.commit()
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    """Classic RSI."""
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out.fillna(method="bfill").fillna(50.0)
+
+
+def _load_model():
+    if DISABLE_NN:
+        return None
+    try:
+        bundle = joblib.load(MODEL_PATH)
+        log.info("Loaded model bundle: %s", MODEL_PATH)
+        # Accept plain estimator or dict bundle like {"model": clf, "scaler": scaler}
+        if hasattr(bundle, "predict_proba"):
+            return {"model": bundle, "scaler": None}
+        if isinstance(bundle, dict):
+            return {"model": bundle.get("model"), "scaler": bundle.get("scaler")}
+        return None
+    except Exception as e:
+        log.warning("NN unavailable (%s) -> proceeding rule-only", e)
+        return None
+
+
+def _download_5m(sym: str) -> pd.DataFrame:
+    df = yf.download(sym, interval="5m", period="2d", progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        raise RuntimeError(f"no bars for {sym}")
+    df = df.rename(columns=str.lower)
+    # For some yfinance versions, multiindex can appear — flatten if needed:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[-1] if isinstance(c, tuple) else c for c in df.columns]
+    # Ensure required cols
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df.columns:
+            raise RuntimeError(f"bars missing '{col}' for {sym}")
+    return df
+
+
+def _rule_strength(sym: str, df: pd.DataFrame):
+    c = df["close"]
+    ema20 = c.ewm(span=EMA_FAST, adjust=False).mean()
+    ema50 = c.ewm(span=EMA_SLOW, adjust=False).mean()
+    rsi14 = rsi(c, RSI_LEN)
+
+    px = _safe_float(c.iloc[-1])
+    ema20v = _safe_float(ema20.iloc[-1])
+    ema50v = _safe_float(ema50.iloc[-1])
+    rsi_v = _safe_float(rsi14.iloc[-1])
+
+    # trend bias by ema20 vs ema50 and current px vs ema20
+    up_trend = px > ema50v
+    down_trend = px < ema50v
+    dist_ema = px - ema20v
+
+    # simple normalized score: rsi tilt + distance to ema20
+    # map RSI 30..70 -> 0..1, clamp
+    rsi_score = np.clip((rsi_v - 30.0) / 40.0, 0.0, 1.0)
+    # distance scaled by recent ATR-ish proxy
+    vol = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
+    vol = max(_safe_float(vol, 1e-3), 1e-3)
+    dist_score = np.clip((dist_ema / vol) * 0.2 + 0.5, 0.0, 1.0)
+
+    buy_score = 0.0
+    sell_score = 0.0
+    if up_trend:
+        buy_score = 0.6 * rsi_score + 0.4 * dist_score
+        sell_score = 1.0 - buy_score * 0.7
+    elif down_trend:
+        sell_score = 0.6 * (1.0 - rsi_score) + 0.4 * (1.0 - dist_score)
+        buy_score = 1.0 - sell_score * 0.7
+    else:
+        # neutral: let RSI dominate a bit
+        buy_score = 0.55 * rsi_score + 0.45 * dist_score
+        sell_score = 1.0 - buy_score
+
+    # pick side by higher rule score
+    if buy_score >= sell_score:
+        return "buy", float(np.clip(buy_score, 0.0, 1.0)), px
+    else:
+        return "sell", float(np.clip(sell_score, 0.0, 1.0)), px
+
+
+def _nn_prob_buy(sym: str, df: pd.DataFrame, model_bundle):
+    """Very light feature stub; catches shape mismatch gracefully."""
+    if not model_bundle:
+        return None
+    try:
+        model = model_bundle["model"]
+        scaler = model_bundle["scaler"]
+        if not hasattr(model, "predict_proba"):
+            return None
+
+        c = df["close"]
+        ret1 = c.pct_change().iloc[-10:].fillna(0.0).to_numpy()
+        vol = (df["high"] - df["low"]).pct_change().iloc[-10:].fillna(0.0).to_numpy()
+        feats = np.concatenate([ret1[-5:], vol[-5:]])  # 10 features
+        X = feats.reshape(1, -1)
+        if scaler is not None:
+            X = scaler.transform(X)
+        proba = model.predict_proba(X)
+        # assume proba[:,1] is "up"
+        return float(np.clip(proba[0, 1], 0.0, 1.0))
+    except Exception as e:
+        log.info("%s NN skip: %s", sym, e)
+        return None
+
 
 def main():
     log.info("make_signals_ensemble | symbols=%s", ",".join(SYMBOLS))
-    rule_rows = _rules_all(SYMBOLS)
-    nn_rows   = _nn_rows(",".join(SYMBOLS))
-    merged    = _merge(rule_rows, nn_rows)
-    for s, r in merged.items():
-        log.info("Ensemble -> %s: %s (%.3f)", s, r["side"], r["strength"])
-    _insert_rows(merged)
+    eng = create_engine(DB_URL, pool_pre_ping=True)
+    model_bundle = _load_model()
+
+    inserted = 0
+    for sym in SYMBOLS:
+        try:
+            df = _download_5m(sym)
+            side_r, s_rule, px = _rule_strength(sym, df)
+            s_nn = _nn_prob_buy(sym, df, model_bundle)
+            # Build an ensemble strength on the chosen side
+            # If side is buy, NN contributes its buy-prob; if sell, 1 - buyProb
+            if s_nn is None:
+                s_ens_buy = s_rule if side_r == "buy" else 1.0 - s_rule
+            else:
+                s_ens_buy = (RULE_W * (s_rule if side_r == "buy" else 1.0 - s_rule)) + (NN_W * s_nn)
+
+            # final side & strength
+            if s_ens_buy >= 0.5:
+                side = "buy"
+                strength = float(np.clip(s_ens_buy, 0.0, 1.0))
+            else:
+                side = "sell"
+                strength = float(np.clip(1.0 - s_ens_buy, 0.0, 1.0))
+
+            # --- LONG_ONLY writer guard (NEW) ---
+            if LONG_ONLY and side == "sell":
+                log.info("LONG_ONLY=1 -> skip writing short for %s", sym)
+                continue
+
+            with eng.begin() as conn:
+                conn.execute(
+                    text("INSERT INTO signals (symbol, side, strength, px) VALUES (:sym, :side, :str, :px)"),
+                    {"sym": sym, "side": side, "str": strength, "px": px},
+                )
+            inserted += 1
+            log.info("Ensemble -> %s: %s (%.3f)", sym, side, strength)
+        except Exception as e:
+            log.warning("%s failed: %s", sym, e)
+
+    log.info("✔ inserted %d signals", inserted)
+
 
 if __name__ == "__main__":
     main()
