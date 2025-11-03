@@ -1,192 +1,200 @@
-# jobs/make_signals_ensemble.py
+"""
+make_signals_ensemble.py
+---------------------------------------
+Combines rule-based + ML ensemble to generate trading signals
+and write them to the 'signals' table.
+"""
+
 import os
 import logging
-from datetime import datetime, timezone
-
-import numpy as np
 import pandas as pd
+import numpy as np
 import yfinance as yf
-from sqlalchemy import create_engine, text
-import joblib
+from datetime import datetime, timezone
+from sqlalchemy import create_engine
+from joblib import load
+from sklearn.preprocessing import StandardScaler
 
-# --- env / config ---
-DB_URL = os.getenv("DB_URL", os.getenv("DATABASE_URL", "postgresql://postgres:postgres@postgres:5432/trader"))
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/gbc_5m.pkl")
-DISABLE_NN = os.getenv("DISABLE_NN", "0") == "1"
-LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"  # <- NEW: filter out shorts at the writer level
-
-# rules weights / thresholds (can tune later)
-RSI_LEN = int(os.getenv("RSI_LEN", "14"))
-EMA_FAST = int(os.getenv("EMA_FAST", "20"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
-RULE_W = float(os.getenv("RULE_WEIGHT", "0.6"))
-NN_W = float(os.getenv("NN_WEIGHT", "0.4"))
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ============================================================
+# LOGGING
+# ============================================================
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
 log = logging.getLogger("make_signals_ensemble")
 
+# ============================================================
+# CONFIG
+# ============================================================
+DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
+ENGINE = create_engine(DB_URL, pool_pre_ping=True)
 
-def _safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")]
+MODEL_PATH = os.getenv("MODEL_DIR", "/app/models/gbc_5m.pkl")
 
+MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.50"))
+RULE_WEIGHT = float(os.getenv("RULE_WEIGHT", "0.4"))
+NN_WEIGHT = float(os.getenv("NN_WEIGHT", "0.6"))
+LOOKBACK_BARS = int(os.getenv("ENSEMBLE_LOOKBACK_BARS", "200"))
 
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    """Classic RSI."""
-    delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/length, adjust=False).mean()
-    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/length, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    out = 100.0 - (100.0 / (1.0 + rs))
-    return out.fillna(method="bfill").fillna(50.0)
+# ============================================================
+# HELPERS
+# ============================================================
 
+def _fetch_bars(sym: str, interval: str = "5m", period: str = "2d") -> pd.DataFrame:
+    """
+    Robust yfinance fetch that always returns lower-case columns
+    (open, high, low, close, volume).
+    Handles MultiIndex, mixed-case, and empty returns.
+    """
+    df = yf.download(
+        tickers=sym,
+        interval=interval,
+        period=period,
+        auto_adjust=False,
+        actions=False,
+        progress=False,
+        group_by="ticker",
+        prepost=False,
+    )
 
-def _load_model():
-    if DISABLE_NN:
-        return None
-    try:
-        bundle = joblib.load(MODEL_PATH)
-        log.info("Loaded model bundle: %s", MODEL_PATH)
-        # Accept plain estimator or dict bundle like {"model": clf, "scaler": scaler}
-        if hasattr(bundle, "predict_proba"):
-            return {"model": bundle, "scaler": None}
-        if isinstance(bundle, dict):
-            return {"model": bundle.get("model"), "scaler": bundle.get("scaler")}
-        return None
-    except Exception as e:
-        log.warning("NN unavailable (%s) -> proceeding rule-only", e)
-        return None
+    if df is None or len(df) == 0:
+        raise ValueError(f"no bars for {sym}")
 
-
-def _download_5m(sym: str) -> pd.DataFrame:
-    df = yf.download(sym, interval="5m", period="2d", progress=False, auto_adjust=False)
-    if df is None or df.empty:
-        raise RuntimeError(f"no bars for {sym}")
-    df = df.rename(columns=str.lower)
-    # For some yfinance versions, multiindex can appear — flatten if needed:
+    # Handle MultiIndex format ('Open','AAPL') or ('open','aapl')
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[-1] if isinstance(c, tuple) else c for c in df.columns]
-    # Ensure required cols
-    for col in ("open", "high", "low", "close", "volume"):
-        if col not in df.columns:
-            raise RuntimeError(f"bars missing '{col}' for {sym}")
-    return df
+        sub = None
+        for key in (sym.lower(), sym.upper()):
+            try:
+                sub = df.xs(key, level=1, axis=1)
+                break
+            except Exception:
+                continue
+        if sub is None:
+            try:
+                sub = df.swaplevel(0, 1, axis=1).xs(sym.lower(), level=0, axis=1)
+            except Exception:
+                raise ValueError(f"multiindex bars missing {sym} slice")
 
+        sub.columns = [str(c).lower() for c in sub.columns]
+        need = ["open", "high", "low", "close", "volume"]
+        missing = [c for c in need if c not in sub.columns]
+        if missing:
+            raise ValueError(f"bars missing columns for {sym}: have {list(sub.columns)} need {need}")
+        out = sub[need].dropna().copy()
 
-def _rule_strength(sym: str, df: pd.DataFrame):
-    c = df["close"]
-    ema20 = c.ewm(span=EMA_FAST, adjust=False).mean()
-    ema50 = c.ewm(span=EMA_SLOW, adjust=False).mean()
-    rsi14 = rsi(c, RSI_LEN)
-
-    px = _safe_float(c.iloc[-1])
-    ema20v = _safe_float(ema20.iloc[-1])
-    ema50v = _safe_float(ema50.iloc[-1])
-    rsi_v = _safe_float(rsi14.iloc[-1])
-
-    # trend bias by ema20 vs ema50 and current px vs ema20
-    up_trend = px > ema50v
-    down_trend = px < ema50v
-    dist_ema = px - ema20v
-
-    # simple normalized score: rsi tilt + distance to ema20
-    # map RSI 30..70 -> 0..1, clamp
-    rsi_score = np.clip((rsi_v - 30.0) / 40.0, 0.0, 1.0)
-    # distance scaled by recent ATR-ish proxy
-    vol = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
-    vol = max(_safe_float(vol, 1e-3), 1e-3)
-    dist_score = np.clip((dist_ema / vol) * 0.2 + 0.5, 0.0, 1.0)
-
-    buy_score = 0.0
-    sell_score = 0.0
-    if up_trend:
-        buy_score = 0.6 * rsi_score + 0.4 * dist_score
-        sell_score = 1.0 - buy_score * 0.7
-    elif down_trend:
-        sell_score = 0.6 * (1.0 - rsi_score) + 0.4 * (1.0 - dist_score)
-        buy_score = 1.0 - sell_score * 0.7
     else:
-        # neutral: let RSI dominate a bit
-        buy_score = 0.55 * rsi_score + 0.45 * dist_score
-        sell_score = 1.0 - buy_score
+        df.columns = [str(c).lower() for c in df.columns]
+        need = ["open", "high", "low", "close", "volume"]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            raise ValueError(f"bars missing columns for {sym}: have {list(df.columns)} need {need}")
+        out = df[need].dropna().copy()
 
-    # pick side by higher rule score
-    if buy_score >= sell_score:
-        return "buy", float(np.clip(buy_score, 0.0, 1.0)), px
-    else:
-        return "sell", float(np.clip(sell_score, 0.0, 1.0)), px
-
-
-def _nn_prob_buy(sym: str, df: pd.DataFrame, model_bundle):
-    """Very light feature stub; catches shape mismatch gracefully."""
-    if not model_bundle:
-        return None
     try:
-        model = model_bundle["model"]
-        scaler = model_bundle["scaler"]
-        if not hasattr(model, "predict_proba"):
-            return None
+        out.index = out.index.tz_localize(None)
+    except Exception:
+        pass
 
-        c = df["close"]
-        ret1 = c.pct_change().iloc[-10:].fillna(0.0).to_numpy()
-        vol = (df["high"] - df["low"]).pct_change().iloc[-10:].fillna(0.0).to_numpy()
-        feats = np.concatenate([ret1[-5:], vol[-5:]])  # 10 features
-        X = feats.reshape(1, -1)
-        if scaler is not None:
-            X = scaler.transform(X)
-        proba = model.predict_proba(X)
-        # assume proba[:,1] is "up"
-        return float(np.clip(proba[0, 1], 0.0, 1.0))
-    except Exception as e:
-        log.info("%s NN skip: %s", sym, e)
-        return None
+    if out.empty:
+        raise ValueError(f"empty bars after cleaning for {sym}")
+
+    return out
 
 
+def _calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add RSI and EMA-based features."""
+    close = df["close"]
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["ema_fast"] = close.ewm(span=12, adjust=False).mean()
+    df["ema_slow"] = close.ewm(span=26, adjust=False).mean()
+    df["ema_diff"] = df["ema_fast"] - df["ema_slow"]
+    df["ema_signal"] = np.where(df["ema_diff"] > 0, 1, -1)
+    return df.dropna()
+
+
+def _rule_signal(df: pd.DataFrame) -> float:
+    """Rule-based signal using RSI and EMA crossover."""
+    if len(df) < 2:
+        return 0.0
+    last = df.iloc[-1]
+    rsi = last["rsi"]
+    ema_signal = last["ema_signal"]
+    if rsi < 35 and ema_signal > 0:
+        return 1.0
+    elif rsi > 65 and ema_signal < 0:
+        return -1.0
+    return 0.0
+
+
+def _nn_signal(df: pd.DataFrame, model) -> float:
+    """Feed the most recent features to the ML model."""
+    try:
+        feat_cols = ["close", "ema_fast", "ema_slow", "ema_diff", "rsi"]
+        X = df[feat_cols].tail(LOOKBACK_BARS).values
+        X_scaled = StandardScaler().fit_transform(X)
+        probs = model.predict_proba(X_scaled)[-1]
+        # prob[1] = buy probability, prob[0] = sell probability
+        return float(probs[1] - probs[0])
+    except Exception:
+        return 0.0
+
+
+def _write_signal(symbol: str, side: str, strength: float, px: float):
+    """Insert signal into DB."""
+    ts = datetime.now(timezone.utc)
+    data = pd.DataFrame(
+        [{"created_at": ts, "symbol": symbol, "side": side, "strength": strength, "px": px}]
+    )
+    data.to_sql("signals", ENGINE, if_exists="append", index=False)
+
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     log.info("make_signals_ensemble | symbols=%s", ",".join(SYMBOLS))
-    eng = create_engine(DB_URL, pool_pre_ping=True)
-    model_bundle = _load_model()
+
+    try:
+        model = load(MODEL_PATH)
+        log.info("Loaded model bundle: %s", MODEL_PATH)
+    except Exception as e:
+        log.warning("No model loaded: %s", e)
+        model = None
 
     inserted = 0
     for sym in SYMBOLS:
         try:
-            df = _download_5m(sym)
-            side_r, s_rule, px = _rule_strength(sym, df)
-            s_nn = _nn_prob_buy(sym, df, model_bundle)
-            # Build an ensemble strength on the chosen side
-            # If side is buy, NN contributes its buy-prob; if sell, 1 - buyProb
-            if s_nn is None:
-                s_ens_buy = s_rule if side_r == "buy" else 1.0 - s_rule
-            else:
-                s_ens_buy = (RULE_W * (s_rule if side_r == "buy" else 1.0 - s_rule)) + (NN_W * s_nn)
+            df = _fetch_bars(sym)
+            df = _calc_indicators(df)
 
-            # final side & strength
-            if s_ens_buy >= 0.5:
+            rule_val = _rule_signal(df)
+            nn_val = _nn_signal(df, model) if model else 0.0
+            ensemble = RULE_WEIGHT * rule_val + NN_WEIGHT * nn_val
+
+            if ensemble > MIN_STRENGTH:
                 side = "buy"
-                strength = float(np.clip(s_ens_buy, 0.0, 1.0))
-            else:
+            elif ensemble < -MIN_STRENGTH:
                 side = "sell"
-                strength = float(np.clip(1.0 - s_ens_buy, 0.0, 1.0))
-
-            # --- LONG_ONLY writer guard (NEW) ---
-            if LONG_ONLY and side == "sell":
-                log.info("LONG_ONLY=1 -> skip writing short for %s", sym)
+            else:
+                log.info("%s neutral (%.3f)", sym, ensemble)
                 continue
 
-            with eng.begin() as conn:
-                conn.execute(
-                    text("INSERT INTO signals (symbol, side, strength, px) VALUES (:sym, :side, :str, :px)"),
-                    {"sym": sym, "side": side, "str": strength, "px": px},
-                )
+            px = float(df["close"].iloc[-1])
+            log.info("Ensemble -> %s: %s (%.3f)", sym, side, ensemble)
+            _write_signal(sym, side, ensemble, px)
             inserted += 1
-            log.info("Ensemble -> %s: %s (%.3f)", sym, side, strength)
+
         except Exception as e:
             log.warning("%s failed: %s", sym, e)
+            continue
 
     log.info("✔ inserted %d signals", inserted)
 
