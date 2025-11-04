@@ -13,6 +13,7 @@ from alpaca.common.exceptions import APIError
 from tools.util import pg_connect, market_is_open, retry
 from tools.quotes import get_bid_ask_mid
 from tools.atr import get_atr
+from sqlalchemy import create_engine
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -53,8 +54,9 @@ def _market_open() -> bool:
         return False
 
 # ---------- DB ----------
+
+# --- replace your _fetch_signals(...) with this version ---
 def _fetch_signals(since_min: int, min_strength: float) -> pd.DataFrame:
-    conn = pg_connect()
     sql = """
         SELECT s.created_at, s.symbol, s.side,
                COALESCE(s.scaled_strength, s.strength) AS strength,
@@ -64,9 +66,11 @@ def _fetch_signals(since_min: int, min_strength: float) -> pd.DataFrame:
           AND COALESCE(s.scaled_strength, s.strength) >= %s
         ORDER BY s.created_at DESC
     """
-    df = pd.read_sql(sql, conn, params=(f"{since_min} minutes", min_strength))
-    conn.close()
-    return df
+    # build a proper SQLAlchemy engine from the same DB env vars you use now
+    db_url = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        return pd.read_sql(sql, conn, params=(f"{since_min} minutes", min_strength))
 
 # ---------- orders ----------
 @retry(tries=3, delay=2)
