@@ -18,3 +18,10 @@ plotly
 
 alpaca-py
 alpaca-trade-api
+# --- HTTP stack (pin to avoid urllib3/six breakage) ---
+requests==2.31.0
+urllib3==1.26.18
+six==1.16.0
+certifi>=2024.7.4
+charset-normalizer>=3.3.2
+idna>=3.7
