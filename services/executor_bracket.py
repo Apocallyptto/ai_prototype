@@ -1,12 +1,12 @@
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import os
 import time
 import logging
 import pandas as pd
-from datetime import datetime, timezone, timedelta
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderType
 from alpaca.trading.requests import LimitOrderRequest
-from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from tools.atr import get_atr
