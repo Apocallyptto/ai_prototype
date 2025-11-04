@@ -15,3 +15,6 @@ yfinance
 # --- optional UI/tools ---
 streamlit
 plotly
+
+alpaca-py
+alpaca-trade-api
