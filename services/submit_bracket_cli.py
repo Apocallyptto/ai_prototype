@@ -18,7 +18,7 @@ def main():
     p.add_argument("--notional", type=float, default=None)
     p.add_argument("--limit", type=float, default=None)
     p.add_argument("--atr", type=float, default=None)
-    p.add_argument("--extended-hours", action="store_true", help="not recommended; we default to regular hours")
+    p.add_argument("--extended-hours", action="store_true")
     args = p.parse_args()
 
     cid = submit_bracket(
