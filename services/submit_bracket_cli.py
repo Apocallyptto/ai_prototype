@@ -1,22 +1,37 @@
-# services/submit_bracket_cli.py
-from __future__ import annotations
 import argparse
-
+import os
+from alpaca.trading.client import TradingClient
 from services.bracket_helper import submit_bracket
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--symbol", required=True)
-    ap.add_argument("--side", required=True, choices=["buy","sell"])
-    ap.add_argument("--qty", type=int, default=None, help="If omitted, dynamic sizing is used.")
-    ap.add_argument("--strength", type=float, default=None, help="Optional signal strength (enables size-by-strength).")
-    args = ap.parse_args()
+def _client() -> TradingClient:
+    return TradingClient(
+        os.getenv("ALPACA_API_KEY"),
+        os.getenv("ALPACA_API_SECRET"),
+        paper=True,
+    )
 
-    try:
-        resp = submit_bracket(args.symbol, args.side, qty=args.qty, strength=args.strength)
-        print(f"OK placed {args.symbol} {args.side} qty={'(dynamic)' if args.qty is None else args.qty} id={resp.get('id')}")
-    except Exception as e:
-        print(f"ERROR: {e}")
+def main():
+    p = argparse.ArgumentParser("submit_bracket_cli")
+    p.add_argument("--symbol", required=True)
+    p.add_argument("--side", choices=["buy", "sell"], required=True)
+    p.add_argument("--qty", type=float, default=None)
+    p.add_argument("--notional", type=float, default=None)
+    p.add_argument("--limit", type=float, default=None)
+    p.add_argument("--atr", type=float, default=None)
+    p.add_argument("--extended-hours", action="store_true", help="not recommended; we default to regular hours")
+    args = p.parse_args()
+
+    cid = submit_bracket(
+        _client(),
+        args.symbol,
+        args.side,
+        limit_price=args.limit,
+        qty=args.qty,
+        notional=args.notional,
+        atr=args.atr,
+        extended_hours=args.extended_hours,
+    )
+    print("submitted order_id:", cid)
 
 if __name__ == "__main__":
     main()
