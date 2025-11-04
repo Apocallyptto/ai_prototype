@@ -1,139 +1,193 @@
-# --- make local packages importable in IDE & runtime ---
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
+# services/executor_bracket.py
+from __future__ import annotations
+import os
 import time
 import logging
 import pandas as pd
+
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderType
-from alpaca.trading.requests import LimitOrderRequest
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
+from alpaca.common.exceptions import APIError
 
-# === local utilities ===
-from tools.atr import get_atr
+from tools.util import pg_connect, market_is_open, retry
 from tools.quotes import get_bid_ask_mid
-from tools.util import pg_connect, market_is_open
+from tools.atr import get_atr
 
+# ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# === ENV CONFIG ===
-MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.45"))
-TP_MULT = float(os.getenv("TP_MULTIPLIER", "1.5"))
-SL_MULT = float(os.getenv("SL_MULTIPLIER", "1.0"))
+# ---------- ENV ----------
 ALLOW_AFTER_HOURS = os.getenv("ALLOW_AFTER_HOURS", "0") == "1"
-LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"
-FRACTIONAL = os.getenv("FRACTIONAL", "0") == "1"
-ACCOUNT_FALLBACK_TO_CASH = os.getenv("ACCOUNT_FALLBACK_TO_CASH", "1") == "1"
 MIN_ACCOUNT_BP_USD = float(os.getenv("MIN_ACCOUNT_BP_USD", "100"))
-SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
+TP_MULT = float(os.getenv("TP_MULT", "1.5"))   # ×ATR take-profit
+SL_MULT = float(os.getenv("SL_MULT", "1.0"))   # ×ATR stop-loss
 
-# === BRACKET ORDER FUNCTION ===
-def submit_bracket_order(client, symbol, side, limit_price, atr):
-    """Submit bracket order with OCO (take-profit / stop-loss) logic."""
+# ---------- Alpaca ----------
+def _trading_client() -> TradingClient:
+    return TradingClient(
+        os.getenv("ALPACA_API_KEY"),
+        os.getenv("ALPACA_API_SECRET"),
+        paper=True,
+    )
+
+def _get_buying_power(cli: TradingClient | None = None) -> float:
+    cli = cli or _trading_client()
     try:
-        if side == "buy":
-            tp_price = round(limit_price + atr * TP_MULT, 2)
-            sl_price = round(limit_price - atr * SL_MULT, 2)
-        else:
-            tp_price = round(limit_price - atr * TP_MULT, 2)
-            sl_price = round(limit_price + atr * SL_MULT, 2)
-
-        order = client.submit_order(
-            symbol=symbol,
-            qty=1,
-            side=side,
-            type=OrderType.LIMIT,
-            limit_price=limit_price,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            take_profit={"limit_price": tp_price},
-            stop_loss={"stop_price": sl_price},
-        )
-
-        logger.info(f"{symbol} {side.upper()} | limit={limit_price} TP={tp_price} SL={sl_price} | id={order.id}")
-        return order
-
+        acc = cli.get_account()
+        bp = float(getattr(acc, "buying_power", 0) or 0)
+        if bp == 0 and getattr(acc, "cash", None):
+            log.warning("buying_power reported 0; falling back to cash=%s", acc.cash)
+            bp = float(acc.cash)
+        return bp
     except Exception as e:
-        logger.error(f"submit_bracket_order failed for {symbol}: {e}")
-        return None
+        log.warning("bp fetch failed: %s", e)
+        return 0.0
 
+# ---------- market gate ----------
+def _market_open() -> bool:
+    try:
+        return market_is_open()
+    except Exception:
+        return False
 
-# === MAIN EXECUTION ===
-def main():
-    since_min = int(os.getenv("SINCE_MIN", "180"))
-    min_strength = float(os.getenv("MIN_STRENGTH", "0.45"))
-
-    logger.info(f"executor_bracket | since-min={since_min} min_strength={min_strength} | fractional={FRACTIONAL} long_only={LONG_ONLY}")
-
-    # --- Connect DB ---
+# ---------- DB ----------
+def _fetch_signals(since_min: int, min_strength: float) -> pd.DataFrame:
     conn = pg_connect()
     sql = """
-        SELECT symbol, side, strength, px
-        FROM signals
-        WHERE created_at > NOW() - INTERVAL '%s'
-          AND ABS(strength) >= %s
-        ORDER BY created_at DESC
+        SELECT s.created_at, s.symbol, s.side,
+               COALESCE(s.scaled_strength, s.strength) AS strength,
+               s.px
+        FROM signals s
+        WHERE s.created_at >= NOW() - INTERVAL %s
+          AND COALESCE(s.scaled_strength, s.strength) >= %s
+        ORDER BY s.created_at DESC
     """
     df = pd.read_sql(sql, conn, params=(f"{since_min} minutes", min_strength))
     conn.close()
+    return df
 
-    if df.empty:
-        logger.info(f"no qualifying signals in last {since_min} min (>= {min_strength})")
-        return
+# ---------- orders ----------
+@retry(tries=3, delay=2)
+def _submit_entry_and_attach_oco(cli: TradingClient, symbol: str, side: str, limit_px: float, atr_val: float) -> None:
+    """
+    Place the entry limit order. If it fills within our small polling window,
+    attach an OCO (TP/SL) using ATR-based targets.
+    """
+    qty = 1
+    try:
+        entry_req = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+            type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_px,
+            extended_hours=False,
+        )
+        entry = cli.submit_order(entry_req)
+        log.info("Entry submitted %s %s @ %.2f", side, symbol, limit_px)
 
-    # --- Alpaca client ---
-    c = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
-    acct = c.get_account()
-    buying_power = float(acct.buying_power or 0)
-    if buying_power < MIN_ACCOUNT_BP_USD:
-        if ACCOUNT_FALLBACK_TO_CASH:
-            buying_power = float(acct.cash)
-            logger.warning(f"buying_power reported 0; falling back to cash={buying_power}")
+        # poll for fill a few times
+        for _ in range(10):
+            cur = cli.get_order_by_id(entry.id)
+            if str(cur.status).lower() == "filled":
+                _place_oco_exit(cli, symbol, side, limit_px, atr_val, qty)
+                return
+            time.sleep(5)
+
+        log.info("%s not filled yet -> skip OCO attach", symbol)
+
+    except APIError as e:
+        log.warning("submit failed %s %s: %s", symbol, side, e)
+    except Exception as e:
+        log.warning("order submit error %s %s: %s", symbol, side, e)
+
+def _place_oco_exit(cli: TradingClient, symbol: str, entry_side: str, entry_px: float, atr_val: float, qty: int) -> None:
+    """
+    Place ATR-based OCO exit (TP/SL). NOTE: OCO is an OrderClass, not OrderType.
+    """
+    try:
+        # distance in dollars = multiplier * ATR
+        tp_off = TP_MULT * atr_val
+        sl_off = SL_MULT * atr_val
+
+        if entry_side == "buy":
+            tp_price = round(entry_px + tp_off, 2)
+            sl_price = round(entry_px - sl_off, 2)
+            oco_side = OrderSide.SELL
         else:
-            logger.warning("buying_power insufficient — skip run")
-            return
+            tp_price = round(entry_px - tp_off, 2)
+            sl_price = round(entry_px + sl_off, 2)
+            oco_side = OrderSide.BUY
 
-    # --- Market hours check ---
-    if not ALLOW_AFTER_HOURS and not market_is_open():
-        logger.info("market is closed and ALLOW_AFTER_HOURS=0 -> skip this pass")
+        tp_req = TakeProfitRequest(limit_price=tp_price)
+        sl_req = StopLossRequest(stop_price=sl_price)
+
+        # OCO is set via order_class
+        oco_req = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=oco_side,
+            type=OrderType.LIMIT,         # TP leg is a limit; SL leg is in stop_loss
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.OCO,
+            take_profit=tp_req,
+            stop_loss=sl_req,
+            extended_hours=False,
+        )
+        cli.submit_order(oco_req)
+        log.info("OCO placed %s TP=%.2f SL=%.2f (ATR=%.3f)", symbol, tp_price, sl_price, atr_val)
+    except Exception as e:
+        log.warning("OCO place failed %s: %s", symbol, e)
+
+# ---------- main ----------
+def main(since_min: int = 180, min_strength: float = 0.45) -> None:
+    cli = _trading_client()
+    bp = _get_buying_power(cli)
+    log.info(
+        "executor_bracket | since-min=%d min_strength=%.2f | buying_power=%.2f",
+        since_min, min_strength, bp
+    )
+
+    if not ALLOW_AFTER_HOURS and not _market_open():
+        log.info("market is closed and ALLOW_AFTER_HOURS=0 -> skip this pass")
         return
 
-    # --- Iterate recent signals ---
+    if bp < MIN_ACCOUNT_BP_USD:
+        log.info("buying_power %.2f < MIN_ACCOUNT_BP_USD %.2f -> skip", bp, MIN_ACCOUNT_BP_USD)
+        return
+
+    df = _fetch_signals(since_min, min_strength)
+    if df.empty:
+        log.info("no qualifying signals in last %d min (>= %.2f)", since_min, min_strength)
+        return
+
     for _, row in df.iterrows():
         symbol = row.symbol
         side = row.side.lower()
-        strength = float(row.strength)
         px = float(row.px)
 
-        if LONG_ONLY and side == "sell":
-            logger.info(f"{symbol}: LONG_ONLY=1 -> skip short")
+        q = get_bid_ask_mid(symbol)
+        if not q:
+            log.warning("%s: no quote -> skip", symbol)
             continue
 
-        bid, ask, mid = get_bid_ask_mid(symbol)
-        if not bid or not ask:
-            logger.warning(f"{symbol}: missing bid/ask -> skip")
-            continue
-
+        bid, ask, mid = q
         spread_abs = abs(ask - bid)
-        spread_pct = spread_abs / mid * 100
-        if spread_pct > 0.2:
-            logger.info(f"{symbol}: skip wide spread abs={spread_abs:.4f} pct={spread_pct:.3f}%")
+        spread_pct = spread_abs / mid * 100.0
+        if spread_pct > 0.25:
+            log.info("%s: skip wide spread abs=%.4f pct=%.3f%%", symbol, spread_abs, spread_pct)
             continue
 
-        try:
-            atr = get_atr(symbol, period=14, lookback_days=30)
-        except Exception as e:
-            logger.warning(f"{symbol}: ATR fetch failed: {e} -> skip")
-            continue
-
-        limit_price = round(mid, 2)
-        submit_bracket_order(c, symbol, side, limit_price, atr)
-
-    logger.info("All qualifying bracket orders submitted.")
-
+        atr_val, _ = get_atr(symbol)
+        _submit_entry_and_attach_oco(cli, symbol, side, px, atr_val)
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--since-min", type=int, default=180)
+    p.add_argument("--min-strength", type=float, default=0.45)
+    a = p.parse_args()
+    main(a.since_min, a.min_strength)
