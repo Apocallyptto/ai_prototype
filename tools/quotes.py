@@ -1,50 +1,38 @@
-# tools/quotes.py
-import os, logging
-from typing import Tuple, Optional
+"""
+Best-effort latest NBBO quote fetch with Alpaca. Falls back gracefully.
+Returns (bid, ask, mid) or None if unavailable.
+"""
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("quotes")
+from __future__ import annotations
+import os
+from typing import Optional, Tuple
 
-def _alpaca_quote(symbol: str) -> Optional[Tuple[float, float]]:
-    try:
-        # alpaca-py market data client
-        from alpaca.data.historical.stock import StockHistoricalDataClient
-        from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.common.enums import BaseURL
 
-        key = os.getenv("ALPACA_API_KEY")
-        sec = os.getenv("ALPACA_API_SECRET")
-        cli = StockHistoricalDataClient(key, sec)
-        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        q = cli.get_stock_latest_quote(req)
-        # response is mapping {symbol: Quote}
-        q = q[symbol]
-        bid = float(getattr(q, "bid_price", 0) or 0)
-        ask = float(getattr(q, "ask_price", 0) or 0)
-        if bid > 0 and ask > 0 and ask >= bid:
-            return bid, ask
-    except Exception as e:
-        log.debug("alpaca quote fallback: %s", e)
-    return None
 
-def _yf_quote(symbol: str) -> Optional[Tuple[float, float]]:
-    try:
-        import yfinance as yf
-        t = yf.Ticker(symbol)
-        info = getattr(t, "fast_info", None)
-        if info:
-            last = float(getattr(info, "last_price", 0) or 0)
-            # yfinance often lacks bid/ask intraday; synthesize a tiny spread if needed
-            if last > 0:
-                spread = max(0.01, min(0.05, last * 0.0005))  # ~5 bps cap
-                return last - spread/2, last + spread/2
-    except Exception as e:
-        log.debug("yfinance quote fallback: %s", e)
-    return None
+def _client() -> StockHistoricalDataClient:
+    key = os.getenv("ALPACA_API_KEY") or ""
+    secret = os.getenv("ALPACA_API_SECRET") or ""
+    # For paper accounts, market data is still live endpoint (depends on plan).
+    return StockHistoricalDataClient(key, secret)
+
 
 def get_bid_ask_mid(symbol: str) -> Optional[Tuple[float, float, float]]:
-    q = _alpaca_quote(symbol) or _yf_quote(symbol)
-    if not q:
+    try:
+        cli = _client()
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        qmap = cli.get_stock_latest_quote(req)
+        q = qmap.get(symbol)
+        if not q:
+            return None
+        bid = float(q.bid_price) if q.bid_price is not None else None
+        ask = float(q.ask_price) if q.ask_price is not None else None
+        if bid is None or ask is None:
+            return None
+        mid = (bid + ask) / 2.0
+        return bid, ask, mid
+    except Exception:
+        # If the plan doesn’t include quotes or the call fails, let caller decide.
         return None
-    bid, ask = q
-    mid = (bid + ask) / 2.0
-    return bid, ask, mid
