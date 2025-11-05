@@ -1,141 +1,158 @@
-import math
 import os
-import logging
 from typing import Optional, Tuple
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
-from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.common.exceptions import APIError
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import (
+    LimitOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
+)
+from alpaca.trading.models import Order
 
-from tools.util import market_is_open
 from tools.quotes import get_bid_ask_mid
+from tools.atr import get_atr
+from tools.util import market_is_open
 
-log = logging.getLogger(__name__)
-
-# ---------- ENV ----------
-ALLOW_AFTER_HOURS       = os.getenv("ALLOW_AFTER_HOURS", "0") == "1"
-MIN_ACCOUNT_BP_USD      = float(os.getenv("MIN_ACCOUNT_BP_USD", "100"))
-
-TP_MULT                 = float(os.getenv("TP_MULT", "1.5"))  # ×ATR take-profit
-SL_MULT                 = float(os.getenv("SL_MULT", "1.0"))  # ×ATR stop-loss
-
+# --- ENV / switches ---
 FRACTIONAL              = os.getenv("FRACTIONAL", "0") == "1"
-_default_min_qty        = "0.01" if FRACTIONAL else "1"
-MIN_QTY                 = float(os.getenv("MIN_QTY", _default_min_qty))
+ALLOW_AFTER_HOURS       = os.getenv("ALLOW_AFTER_HOURS", "0") == "1"
+ACCOUNT_FALLBACK_TO_CASH= os.getenv("ACCOUNT_FALLBACK_TO_CASH", "1") == "1"
 
-ALLOW_FRACTIONAL_SHORTS = os.getenv("ALLOW_FRACTIONAL_SHORTS", "0") == "1"
+# MIN_QTY is float when FRACTIONAL=1; int otherwise
+if FRACTIONAL:
+    MIN_QTY = float(os.getenv("MIN_QTY", "0.01"))
+else:
+    MIN_QTY = int(os.getenv("MIN_QTY", "1"))
 
+TP_ATR_MULT             = float(os.getenv("TP_ATR_MULT", "1.5"))
+SL_ATR_MULT             = float(os.getenv("SL_ATR_MULT", "1.0"))
+QUOTE_PRICE_SLIPPAGE    = float(os.getenv("QUOTE_PRICE_SLIPPAGE", "0.02"))
 
-def _round_qty(qty: float) -> float:
-    """Round quantity for Alpaca."""
-    if FRACTIONAL:
-        return round(qty, 2)  # fractional to 2 decimals
-    return int(max(1, math.floor(qty)))
-
-
-def _min_qty_ok(side: str, qty: float) -> bool:
-    if qty < MIN_QTY:
-        return False
-    if (side == "sell") and (not FRACTIONAL) and (abs(qty) < 1):
-        return False
-    if (side == "sell") and FRACTIONAL and not ALLOW_FRACTIONAL_SHORTS:
-        # disallow fractional shorts if policy off
-        if qty != int(qty):
-            return False
-    return True
+MAX_SPREAD_PCT          = float(os.getenv("MAX_SPREAD_PCT", "0.15"))  # %
+MAX_SPREAD_ABS          = float(os.getenv("MAX_SPREAD_ABS", "0.06"))  # $
 
 
-def _side_enum(side: str) -> OrderSide:
-    s = side.lower()
+def _coerce_side(side: str) -> OrderSide:
+    s = side.lower().strip()
     if s not in ("buy", "sell"):
         raise ValueError("side must be 'buy' or 'sell'")
     return OrderSide.BUY if s == "buy" else OrderSide.SELL
 
 
-def _tp_sl_from_atr(limit_price: float, atr: float) -> Tuple[float, float]:
-    tp = limit_price + atr * TP_MULT
-    sl = max(0.01, limit_price - atr * SL_MULT)
-    return tp, sl
+def _quote_guard_limit(symbol: str, side: str, px_hint: Optional[float]) -> Tuple[float, float, float]:
+    """
+    Returns (limit_px, bid, ask) using a quote-aware slippage guard.
+    Raises ValueError if spread is too wide.
+    """
+    q = get_bid_ask_mid(symbol)
+    if not q:
+        # Fallback to px_hint if quotes not available
+        if px_hint is None:
+            raise ValueError(f"No quotes and no px_hint for {symbol}")
+        return round(px_hint, 2), 0.0, 0.0
+
+    bid, ask, mid = q
+    spread_abs = max(0.0, ask - bid)
+    spread_pct = (spread_abs / mid) * 100.0 if mid > 0 else 999.0
+
+    if (spread_pct > MAX_SPREAD_PCT) or (spread_abs > MAX_SPREAD_ABS):
+        raise ValueError(
+            f"skip wide spread for {symbol} (bid={bid:.2f} ask={ask:.2f} mid={mid:.2f} "
+            f"abs={spread_abs:.4f} pct={spread_pct:.3f}%)"
+        )
+
+    slip = QUOTE_PRICE_SLIPPAGE
+    if side == "buy":
+        limit_px = min(ask + slip, max(ask, px_hint if px_hint else ask))
+    else:
+        limit_px = max(bid - slip, min(bid, px_hint if px_hint else bid))
+    return round(limit_px, 2), bid, ask
+
+
+def _compute_targets(side: str, entry_ref_px: float, atr: float) -> Tuple[float, float]:
+    """
+    Returns (tp_px, sl_px) computed from ATR multipliers.
+    """
+    if side == "buy":
+        tp_px = entry_ref_px + TP_ATR_MULT * atr
+        sl_px = entry_ref_px - SL_ATR_MULT * atr
+    else:
+        tp_px = entry_ref_px - TP_ATR_MULT * atr
+        sl_px = entry_ref_px + SL_ATR_MULT * atr
+    return (round(tp_px, 2), round(sl_px, 2))
 
 
 def submit_bracket(
     client: TradingClient,
     symbol: str,
     side: str,
-    *,
-    limit_price: Optional[float] = None,
-    qty: Optional[float] = None,
-    notional: Optional[float] = None,
-    atr: Optional[float] = None,
+    qty: float,
+    px_hint: Optional[float] = None,
+    allow_after_hours: Optional[bool] = None,
+) -> str:
+    """
+    Submit a REGULAR-HOURS-ONLY bracket (entry + TP + SL).
+    Alpaca does not allow bracket orders in extended hours.
+    """
+    if qty < MIN_QTY:
+        raise ValueError(f"qty {qty} < MIN_QTY {MIN_QTY}")
+
+    # RTH only
+    if allow_after_hours is None:
+        allow_after_hours = ALLOW_AFTER_HOURS
+    if (not allow_after_hours) and (not market_is_open()):
+        raise RuntimeError("Market is closed and ALLOW_AFTER_HOURS=0 (brackets are RTH-only).")
+
+    # price + guard
+    limit_px, _, _ = _quote_guard_limit(symbol, side, px_hint)
+
+    # ATR for TP/SL
+    atr, _last_close = get_atr(symbol)
+    tp_px, sl_px = _compute_targets(side, limit_px, atr)
+
+    # Build bracket request
+    req = LimitOrderRequest(
+        symbol=symbol,
+        qty=str(qty) if FRACTIONAL else int(qty),
+        side=_coerce_side(side),
+        time_in_force=TimeInForce.DAY,
+        limit_price=limit_px,
+        order_class=OrderClass.BRACKET,
+        take_profit=TakeProfitRequest(limit_price=tp_px),
+        stop_loss=StopLossRequest(stop_price=sl_px),
+        extended_hours=False,  # force RTH
+    )
+    o: Order = client.submit_order(req)
+    return o.client_order_id or o.id
+
+
+def submit_simple_entry(
+    client: TradingClient,
+    symbol: str,
+    side: str,
+    qty: float,
+    px_hint: Optional[float] = None,
     extended_hours: bool = False,
 ) -> str:
     """
-    Submit a parent LIMIT with OCO TP/SL.
+    Submit a simple LIMIT entry (no TP/SL). Use this for after-hours testing.
+    Your exit manager can attach TP/SL later after the fill.
     """
-    # RTH gate
-    if not ALLOW_AFTER_HOURS and not extended_hours and not market_is_open():
-        raise RuntimeError("Market is closed and ALLOW_AFTER_HOURS=0.")
+    if qty < MIN_QTY:
+        raise ValueError(f"qty {qty} < MIN_QTY {MIN_QTY}")
 
-    # Quotes
-    bid, ask, mid = get_bid_ask_mid(symbol)
-    # guard broken quotes (sometimes ask=0 from free feeds)
-    if (bid is None or bid <= 0) and (ask is None or ask <= 0) and (mid is not None and mid > 0):
-        bid = ask = mid
-    if ask is not None and ask <= 0 and mid and mid > 0:
-        ask = mid
-    if bid is not None and bid <= 0 and mid and mid > 0:
-        bid = mid
-
-    px = float(limit_price) if limit_price else (mid if mid and mid > 0 else bid or ask)
-    if px is None or px <= 0:
-        raise RuntimeError(f"no usable price for {symbol}: bid={bid} ask={ask} mid={mid}")
-
-    # Quantity
-    if qty is None:
-        if notional is None:
-            qty = MIN_QTY
-        else:
-            qty = notional / px
-    qty = abs(_round_qty(float(qty)))
-    if not _min_qty_ok(side, qty):
-        raise ValueError(f"qty {qty} violates MIN_QTY={MIN_QTY} or short/fractional policy")
-
-    # TP/SL
-    if atr and atr > 0:
-        tp_buy, sl_buy = _tp_sl_from_atr(px, atr)
-    else:
-        # conservative defaults if ATR not given
-        tp_buy = px * 1.004
-        sl_buy = px * 0.997
-
-    if side.lower() == "sell":
-        # mirror for shorts
-        tp = px - (tp_buy - px)
-        sl = px + (px - sl_buy)
-    else:
-        tp = tp_buy
-        sl = sl_buy
+    limit_px, _, _ = _quote_guard_limit(symbol, side, px_hint)
 
     req = LimitOrderRequest(
         symbol=symbol,
-        side=_side_enum(side),
-        type=OrderType.LIMIT,
+        qty=str(qty) if FRACTIONAL else int(qty),
+        side=_coerce_side(side),
         time_in_force=TimeInForce.DAY,
-        limit_price=round(px, 4),
-        qty=qty,
-        order_class="bracket",
-        take_profit=TakeProfitRequest(limit_price=round(tp, 4)),
-        stop_loss=StopLossRequest(stop_price=round(sl, 4)),
-        # IMPORTANT: honor requested extended hours flag
-        extended_hours=bool(extended_hours),
+        limit_price=limit_px,
+        # Not a bracket
+        order_class=None,
+        extended_hours=extended_hours,
     )
-
-    try:
-        o = client.submit_order(req)
-        log.info("submitted %s %s qty=%s limit=%.4f TP=%.4f SL=%.4f id=%s ext_hours=%s",
-                 symbol, side, qty, px, tp, sl, o.id, extended_hours)
-        return o.id
-    except APIError as e:
-        log.warning("submit failed %s %s: %s", symbol, side, e)
-        raise
+    o: Order = client.submit_order(req)
+    return o.client_order_id or o.id
