@@ -78,7 +78,7 @@ def _coerce_side(side: str) -> OrderSide:
 def _quote_guard_limit(symbol: str, side: str, px_hint: Optional[float]) -> Tuple[float, float, float]:
     """
     Returns (limit_px, bid, ask) using a quote-aware slippage guard.
-    Raises ValueError if spread is too wide.
+    Rounds final limit to 1-cent (Alpaca requirement).
     """
     q = get_bid_ask_mid(symbol)
     if not q:
@@ -98,11 +98,13 @@ def _quote_guard_limit(symbol: str, side: str, px_hint: Optional[float]) -> Tupl
 
     slip = QUOTE_PRICE_SLIPPAGE
     if side == "buy":
-        limit_px = min(ask + slip, max(ask, px_hint if px_hint else ask))
+        raw_limit = min(ask + slip, max(ask, px_hint if px_hint else ask))
     else:
-        limit_px = max(bid - slip, min(bid, px_hint if px_hint else bid))
+        raw_limit = max(bid - slip, min(bid, px_hint if px_hint else bid))
 
-    return _qt(limit_px), bid, ask
+    limit_px = _qt(raw_limit)  # <<<<< hard snap to 2 decimals here
+    return limit_px, bid, ask
+
 
 def _compute_targets(side: str, entry_ref_px: float, atr: float) -> Tuple[float, float]:
     """
