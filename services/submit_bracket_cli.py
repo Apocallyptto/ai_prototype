@@ -1,34 +1,42 @@
 import argparse
 import os
 from alpaca.trading.client import TradingClient
+
 from services.bracket_helper import (
     submit_bracket,
     submit_simple_entry,
 )
 
 def main():
-    p = argparse.ArgumentParser(description="Submit bracket (RTH) or simple entry (AH).")
-    p.add_argument("--symbol", required=True)
-    p.add_argument("--side", required=True, choices=["buy", "sell"])
-    p.add_argument("--qty", required=True, type=float)
-    p.add_argument("--tp-mult", type=float, default=float(os.getenv("TP_ATR_MULT", "1.5")))
-    p.add_argument("--sl-mult", type=float, default=float(os.getenv("SL_ATR_MULT", "1.0")))
-    p.add_argument("--after-hours", action="store_true",
-                   help="If set, place simple LIMIT entry (no TP/SL) with extended-hours.")
-    args = p.parse_args()
-
-    # Forward custom multipliers via ENV (bracket_helper reads from ENV)
-    os.environ["TP_ATR_MULT"] = str(args.tp_mult)
-    os.environ["SL_ATR_MULT"] = str(args.sl_mult)
+    ap = argparse.ArgumentParser(description="Submit a bracket (or simple) order with quote guard + penny rounding.")
+    ap.add_argument("--symbol", required=True)
+    ap.add_argument("--side", required=True, choices=["buy", "sell"])
+    ap.add_argument("--qty", required=True, type=float, help="Shares. If FRACTIONAL=1, decimals allowed.")
+    ap.add_argument("--allow-after-hours", action="store_true", help="Only applies to simple orders. Brackets are RTH only.")
+    ap.add_argument("--tp-mult", type=float, default=None, help="Override TP ATR multiplier.")
+    ap.add_argument("--sl-mult", type=float, default=None, help="Override SL ATR multiplier.")
+    ap.add_argument("--simple", action="store_true", help="If set, submit a simple LIMIT instead of bracket.")
+    args = ap.parse_args()
 
     cli = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
 
-    if args.after_hours:
-        cid = submit_simple_entry(cli, args.symbol, args.side, args.qty, px_hint=None, extended_hours=True)
-        print("SUBMITTED SIMPLE ENTRY (AH) cid=", cid)
+    if args.simple:
+        cid = submit_simple_entry(
+            cli, args.symbol, args.side, args.qty,
+            px_hint=None,
+            allow_after_hours=args.allow_after_hours
+        )
     else:
-        cid = submit_bracket(cli, args.symbol, args.side, args.qty, px_hint=None, allow_after_hours=False)
-        print("SUBMITTED BRACKET (RTH) cid=", cid)
+        # Brackets: extended hours are not supported by Alpaca
+        cid = submit_bracket(
+            cli, args.symbol, args.side, args.qty,
+            px_hint=None,
+            allow_after_hours=False,
+            tp_mult=args.tp_mult,
+            sl_mult=args.sl_mult,
+        )
+
+    print("submitted client_order_id:", cid)
 
 if __name__ == "__main__":
     main()
