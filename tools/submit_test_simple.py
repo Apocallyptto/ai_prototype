@@ -10,7 +10,8 @@ ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") != "0"
 
 SYMBOL = os.getenv("TEST_SYMBOL", "AAPL")
 QTY = float(os.getenv("TEST_QTY", "0.05"))  # fractional position
-EXT = os.getenv("TEST_EXT_HOURS", "1") == "1"  # allow after-hours
+# IMPORTANT: market orders cannot be extended-hours on Alpaca. Keep it False.
+EXT = False
 
 def main():
     cli = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
