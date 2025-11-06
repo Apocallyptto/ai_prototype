@@ -4,7 +4,6 @@ import logging
 from typing import Optional, Tuple
 
 import math
-import datetime as dt
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus
@@ -17,9 +16,7 @@ from alpaca.trading.requests import (
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
-from alpaca.data.timeframe import TimeFrame
 
-# Optional ATR via yfinance
 try:
     import pandas as pd
     import yfinance as yf
@@ -30,7 +27,6 @@ except Exception:
 log = logging.getLogger("oco_exit_monitor")
 logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 
-# === ENV KNOBS ===
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 EXIT_MONITOR_POLL_SECONDS = int(os.getenv("EXIT_MONITOR_POLL_SECONDS", "15"))
@@ -40,19 +36,16 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") != "0"
 
-# --------- helpers ---------
 def _qt(x: float, places: int = 2) -> float:
     return round(float(x) + 1e-9, places)
 
-def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str):
     try:
         q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
         qsym = q[symbol]
         bid = float(qsym.bid_price) if qsym.bid_price is not None else None
         ask = float(qsym.ask_price) if qsym.ask_price is not None else None
-        mid = None
-        if bid is not None and ask is not None:
-            mid = (bid + ask) / 2.0
+        mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
         return bid, ask, mid
     except Exception:
         try:
@@ -62,10 +55,7 @@ def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str) -> 
         except Exception:
             return None, None, None
 
-def _atr(symbol: str, lookback_days: int = 30, period: int = 14) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Returns (ATR, ref_price). ref_price ~ last close.
-    """
+def _atr(symbol: str, lookback_days: int = 30, period: int = 14):
     if yf is not None and pd is not None:
         try:
             df = yf.download(symbol, period=f"{lookback_days}d", interval="1d", progress=False, auto_adjust=False, threads=False)
@@ -91,21 +81,17 @@ def _derive_tp_sl(side: str, ref_px: float, atr_val: Optional[float]) -> Tuple[f
     if atr_val is None:
         atr_val = 0.50
     if side == "long":
-        tp = _qt(ref_px + TP_ATR_MULT * atr_val, 2)
-        sl = _qt(max(0.01, ref_px - SL_ATR_MULT * atr_val), 2)
+        tp = _qt(ref_px + TP_ATR_MULT * atr_val, 2)   # higher
+        sl = _qt(max(0.01, ref_px - SL_ATR_MULT * atr_val), 2)  # lower
     else:
-        tp = _qt(ref_px - TP_ATR_MULT * atr_val, 2)
-        sl = _qt(ref_px + SL_ATR_MULT * atr_val, 2)
+        tp = _qt(ref_px - TP_ATR_MULT * atr_val, 2)   # lower
+        sl = _qt(ref_px + SL_ATR_MULT * atr_val, 2)   # higher
     return tp, sl
 
 def _has_any_children(trading: TradingClient, symbol: str) -> bool:
     try:
         open_orders = trading.get_orders(
-            filter=GetOrdersRequest(
-                status=QueryOrderStatus.OPEN,
-                nested=True,
-                symbols=[symbol],
-            )
+            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, symbols=[symbol])
         )
         for o in open_orders:
             oc = getattr(o, "order_class", None)
@@ -117,36 +103,40 @@ def _has_any_children(trading: TradingClient, symbol: str) -> bool:
     except Exception:
         return False
 
-def _submit_attached_oco(trading: TradingClient, symbol: str, side: str, qty: float, anchor_limit: float, tp: float, sl: float):
-    parent_side = OrderSide.SELL if side == "long" else OrderSide.BUY
+def _submit_oco_exit(trading: TradingClient, symbol: str, long_side: bool, qty: float, tp: float, sl: float):
+    """
+    Submit a TRUE OCO exit (no parent). For a long position -> side=SELL with TP>SL.
+    For a short position -> side=BUY with TP<SL. This matches Alpaca's OCO spec.
+    """
+    side = OrderSide.SELL if long_side else OrderSide.BUY
+
+    # For OCO, API requires type=LIMIT and stop_loss.stop_price present.
     req = LimitOrderRequest(
         symbol=symbol,
-        side=parent_side,
+        side=side,
         type=OrderType.LIMIT,
         time_in_force=TimeInForce.DAY,
-        limit_price=_qt(anchor_limit, 2),
         qty=qty,
-        order_class="bracket",
+        order_class="oco",
         take_profit=TakeProfitRequest(limit_price=_qt(tp, 2)),
         stop_loss=StopLossRequest(stop_price=_qt(sl, 2)),
-        extended_hours=False,
+        extended_hours=False,  # exits are RTH-only per Alpaca docs
     )
     if DRY_RUN:
-        log.info("[DRY_RUN] would submit OCO exits for %s qty=%.4f | anchor=%.2f TP=%.2f SL=%.2f",
-                 symbol, qty, anchor_limit, tp, sl)
+        log.info("[DRY_RUN] would submit OCO exit %s qty=%.4f | TP=%.2f SL=%.2f", symbol, qty, tp, sl)
         return
     o = trading.submit_order(req)
-    log.info("attached OCO exits -> %s parent_id=%s", symbol, o.id)
+    log.info("OCO exits attached -> %s oco_parent_id=%s", symbol, o.id)
 
-# --------- main loop ---------
 def run_once(trading: TradingClient, data_client: StockHistoricalDataClient):
     positions = trading.get_all_positions()
     if not positions:
         log.info("no positions")
         return
+
     for p in positions:
         symbol = p.symbol
-        side = "long" if float(p.qty) > 0 else "short"
+        long_side = float(p.qty) > 0
         qty = abs(float(p.qty))
         avg_entry = float(p.avg_entry_price)
 
@@ -160,13 +150,18 @@ def run_once(trading: TradingClient, data_client: StockHistoricalDataClient):
         atr_val, close_ref = _atr(symbol)
         ref_for_tp_sl = ref_px if ref_px is not None else (close_ref if close_ref else avg_entry)
 
-        tp, sl = _derive_tp_sl(side, ref_for_tp_sl, atr_val)
-        anchor = _qt(ref_px if ref_px is not None else avg_entry, 2)
+        tp, sl = _derive_tp_sl("long" if long_side else "short", ref_for_tp_sl, atr_val)
 
-        log.info("%s: attaching OCO exits side=%s qty=%.4f | anchor=%.2f TP=%.2f SL=%.2f",
-                 symbol, side, qty, anchor, tp, sl)
+        # For long: ensure TP > SL; for short: TP < SL (Alpaca OCO rules mirror bracket leg logic).
+        if long_side and not (tp > sl):
+            tp, sl = sl + 0.02, tp - 0.02
+        if (not long_side) and not (tp < sl):
+            tp, sl = sl - 0.02, tp + 0.02
+
+        log.info("%s: attaching OCO exits side=%s qty=%.4f | TP=%.2f SL=%.2f",
+                 symbol, "long" if long_side else "short", qty, tp, sl)
         try:
-            _submit_attached_oco(trading, symbol, side, qty, anchor, tp, sl)
+            _submit_oco_exit(trading, symbol, long_side, qty, tp, sl)
         except APIError as e:
             log.warning("attach failed for %s: %s", symbol, e)
 
