@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.common.exceptions import APIError
-from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import GetOrdersRequest, ReplaceOrderRequest
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
@@ -15,7 +15,7 @@ log = logging.getLogger("reprice_stale")
 logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 
 # === ENV KNOBS ===
-STALE_AFTER_SECONDS = int(os.getenv("STALE_AFTER_SECONDS", "300"))   # 5 min
+STALE_AFTER_SECONDS = int(os.getenv("STALE_AFTER_SECONDS", "300"))
 REPRICE_EVERY_SECONDS = int(os.getenv("REPRICE_EVERY_SECONDS", "90"))
 MAX_REPRICES = int(os.getenv("MAX_REPRICES", "4"))
 CANCEL_AFTER_REPRICES = os.getenv("CANCEL_AFTER_REPRICES", "1") == "1"
@@ -116,18 +116,17 @@ def run_once(trading: TradingClient, data_client: StockHistoricalDataClient):
         return
 
     open_orders = trading.get_orders(
-        filter=GetOrdersRequest(
-            status=QueryOrderStatus.OPEN,
-            nested=True,
-        )
+        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)
     )
+    if not open_orders:
+        log.info("no open orders to reprice")
+        return
 
     for o in open_orders:
         if not _is_parent_limit(o):
             continue
 
-        age = _age_seconds(getattr(o, "submitted_at", None))
-        if age < STALE_AFTER_SECONDS:
+        if _age_seconds(getattr(o, "submitted_at", None)) < STALE_AFTER_SECONDS:
             continue
 
         rcount = _count_reprices(o)
@@ -160,7 +159,10 @@ def run_once(trading: TradingClient, data_client: StockHistoricalDataClient):
             continue
 
         try:
-            trading.replace_order_by_id(o.id, limit_price=new_px, client_order_id=new_coid)
+            trading.replace_order_by_id(
+                o.id,
+                order_data=ReplaceOrderRequest(limit_price=new_px, client_order_id=new_coid),
+            )
         except APIError as e:
             log.warning("%s: replace failed: %s", o.symbol, e)
 
