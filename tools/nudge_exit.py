@@ -16,11 +16,10 @@ def main():
     tc = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
     dc = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
 
-    # find our synthetic TP limit (client_order_id endswith -tp)
     od = tc.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, symbols=[SYMBOL]))
     tps = [o for o in od if (o.client_order_id or "").endswith("-tp")]
     if not tps:
-        print("no TP leg found to nudge"); sys.exit(0)
+        print("no TP leg found"); sys.exit(0)
     tp = tps[0]
 
     q = dc.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=SYMBOL))[SYMBOL]
@@ -29,7 +28,7 @@ def main():
         print("no bid available"); sys.exit(0)
 
     new_px = qt(bid, 2)
-    print(f"nudge {SYMBOL} TP: {tp.limit_price} -> {new_px}")
+    print(f"nudging {SYMBOL} TP {tp.limit_price} -> {new_px}")
     tc.replace_order_by_id(tp.id, order_data=ReplaceOrderRequest(limit_price=new_px, client_order_id=tp.client_order_id))
     print("done")
 
