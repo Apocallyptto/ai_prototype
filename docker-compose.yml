@@ -22,28 +22,20 @@ services:
     build: .
     container_name: trader_executor
     command: ["python","services/executor_bracket.py"]
-    env_file:
-      - .env
+    env_file: [.env]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      # --- DB ---
       DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-
-      # --- Symbols / cadence (example) ---
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "180"
       MIN_STRENGTH: "0.60"
-
-      # --- ML / NN path (optional) ---
       DISABLE_NN: "0"
       ML_LOOKBACK_DAYS: "30"
       ML_BAR_INTERVAL: "5m"
       ML_TARGET_HORIZON_BARS: "6"
       MODEL_DIR: "/app/models"
-
-      # --- Alpaca creds (forwarded from .env) ---
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
       ALPACA_PAPER: "1"
@@ -52,8 +44,7 @@ services:
     build: .
     container_name: trader_oco_exit_monitor
     command: ["python","-m","services.oco_exit_monitor"]
-    env_file:
-      - .env
+    env_file: [.env]
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,8 +60,7 @@ services:
     build: .
     container_name: trader_reprice_stale
     command: ["python","-m","services.reprice_stale"]
-    env_file:
-      - .env
+    env_file: [.env]
     depends_on:
       postgres:
         condition: service_healthy
@@ -85,6 +75,22 @@ services:
       MAX_SPREAD_PCT: "0.15"
       MAX_SPREAD_ABS: "0.12"
       QUOTE_PRICE_SLIPPAGE: "0.02"
+
+  tester:
+    build: .
+    container_name: trader_tester
+    command: ["python","-m","tools.submit_test_simple"]
+    env_file: [.env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      ALPACA_PAPER: "1"
+      TEST_SYMBOL: "AAPL"
+      TEST_QTY: "0.05"
+      TEST_EXT_HOURS: "1"
 
 volumes:
   pgdata:
