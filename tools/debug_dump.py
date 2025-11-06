@@ -1,4 +1,3 @@
-# tools/debug_dump.py
 import os
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest
@@ -13,9 +12,9 @@ def main():
     clk = tc.get_clock()
     print(f"market is_open={getattr(clk,'is_open',None)} next_open={getattr(clk,'next_open',None)} next_close={getattr(clk,'next_close',None)}")
 
-    pos = tc.get_all_positions()
-    print(f"positions: {len(pos)}")
-    for p in pos:
+    positions = tc.get_all_positions()
+    print(f"positions: {len(positions)}")
+    for p in positions:
         print(f"  {p.symbol} qty={p.qty} avg_entry={p.avg_entry_price}")
 
     od = tc.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True))
