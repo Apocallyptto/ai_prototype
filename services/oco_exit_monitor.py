@@ -7,18 +7,25 @@ import math
 import datetime as dt
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
-from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus
+from alpaca.trading.requests import (
+    LimitOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
+    GetOrdersRequest,
+)
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame
 
-# Optional ATR via yfinance (fallback if Alpaca history is unavailable)
+# Optional ATR via yfinance
 try:
+    import pandas as pd
     import yfinance as yf
 except Exception:
     yf = None
+    pd = None
 
 log = logging.getLogger("oco_exit_monitor")
 logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
@@ -37,13 +44,6 @@ ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") != "0"
 def _qt(x: float, places: int = 2) -> float:
     return round(float(x) + 1e-9, places)
 
-def _market_is_open(trading: TradingClient) -> bool:
-    try:
-        clk = trading.get_clock()
-        return bool(getattr(clk, "is_open", False))
-    except Exception:
-        return False
-
 def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     try:
         q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
@@ -55,7 +55,6 @@ def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str) -> 
             mid = (bid + ask) / 2.0
         return bid, ask, mid
     except Exception:
-        # Fallback: last trade
         try:
             t = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))[symbol]
             last = float(t.price)
@@ -66,10 +65,8 @@ def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str) -> 
 def _atr(symbol: str, lookback_days: int = 30, period: int = 14) -> Tuple[Optional[float], Optional[float]]:
     """
     Returns (ATR, ref_price). ref_price ~ last close.
-    Prefer yfinance for simplicity; fallback modest ATR if unavailable.
     """
-    # yfinance path
-    if yf is not None:
+    if yf is not None and pd is not None:
         try:
             df = yf.download(symbol, period=f"{lookback_days}d", interval="1d", progress=False, auto_adjust=False, threads=False)
             if df is not None and not df.empty and {"High","Low","Close"}.issubset(df.columns):
@@ -88,12 +85,10 @@ def _atr(symbol: str, lookback_days: int = 30, period: int = 14) -> Tuple[Option
                 return float(atr) if not math.isnan(atr) else None, ref
         except Exception:
             pass
-    # fallback
     return None, None
 
 def _derive_tp_sl(side: str, ref_px: float, atr_val: Optional[float]) -> Tuple[float, float]:
     if atr_val is None:
-        # modest defaults if ATR not available
         atr_val = 0.50
     if side == "long":
         tp = _qt(ref_px + TP_ATR_MULT * atr_val, 2)
@@ -105,7 +100,13 @@ def _derive_tp_sl(side: str, ref_px: float, atr_val: Optional[float]) -> Tuple[f
 
 def _has_any_children(trading: TradingClient, symbol: str) -> bool:
     try:
-        open_orders = trading.get_orders(status="open", nested=True, symbols=[symbol])
+        open_orders = trading.get_orders(
+            filter=GetOrdersRequest(
+                status=QueryOrderStatus.OPEN,
+                nested=True,
+                symbols=[symbol],
+            )
+        )
         for o in open_orders:
             oc = getattr(o, "order_class", None)
             if oc in ("bracket", "oco"):
@@ -128,7 +129,7 @@ def _submit_attached_oco(trading: TradingClient, symbol: str, side: str, qty: fl
         order_class="bracket",
         take_profit=TakeProfitRequest(limit_price=_qt(tp, 2)),
         stop_loss=StopLossRequest(stop_price=_qt(sl, 2)),
-        extended_hours=False,  # keep OCO RTH (consistent with your bracket constraints)
+        extended_hours=False,
     )
     if DRY_RUN:
         log.info("[DRY_RUN] would submit OCO exits for %s qty=%.4f | anchor=%.2f TP=%.2f SL=%.2f",
@@ -180,7 +181,6 @@ def main():
         time.sleep(EXIT_MONITOR_POLL_SECONDS)
 
 if __name__ == "__main__":
-    # Optional: warn if keys missing
     if not ALPACA_API_KEY or not ALPACA_API_SECRET:
         log.warning("ALPACA_API_KEY/SECRET not set; this script will fail to connect.")
     main()
