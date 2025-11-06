@@ -6,6 +6,8 @@ from typing import Optional, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.common.exceptions import APIError
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 
@@ -32,7 +34,6 @@ def _qt(x: float, places: int = 2) -> float:
     return round(float(x) + 1e-9, places)
 
 def _age_seconds(ts) -> int:
-    # ts is usually aware; handle both
     if ts is None:
         return 0
     if getattr(ts, "tzinfo", None) is None:
@@ -80,7 +81,6 @@ def _guarded_limit(data_client: StockHistoricalDataClient, symbol: str, side: st
             raw = min(bid, (px_hint if px_hint else bid))
             raw = max(raw - slip, bid - slip)
         return _qt(raw, 2), bid, ask
-    # No quote available; fallback to hint
     if px_hint is None:
         raise RuntimeError(f"no quotes and no px_hint for {symbol}")
     return _qt(px_hint, 2), None, None
@@ -115,7 +115,13 @@ def run_once(trading: TradingClient, data_client: StockHistoricalDataClient):
         log.info("market closed -> skipping reprice loop")
         return
 
-    open_orders = trading.get_orders(status="open", nested=True)
+    open_orders = trading.get_orders(
+        filter=GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            nested=True,
+        )
+    )
+
     for o in open_orders:
         if not _is_parent_limit(o):
             continue
