@@ -9,13 +9,13 @@ ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") != "0"
 def main():
     tc = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
 
-    # 1) Fractional test -> will route to simple (synthetic exits attach)
+    # Fractional test -> simple (AH-safe: LIMIT w/ extended_hours; RTH: MARKET unless you set use_limit=True)
     o1 = place_entry(tc, symbol="AAPL", side="buy", qty=0.05, use_limit=False)
-    print("fractional simple ->", o1.id)
+    print("fractional entry ->", o1.id)
 
-    # 2) Whole-share test -> will route to native bracket (RTH only)
+    # Whole-share test -> bracket if RTH, else LIMIT AH simple
     # o2 = place_entry(tc, symbol="AAPL", side="buy", qty=1, use_limit=False)
-    # print("whole-share bracket ->", o2.id)
+    # print("whole-share entry ->", o2.id)
 
 if __name__ == "__main__":
     main()
