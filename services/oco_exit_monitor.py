@@ -1,322 +1,244 @@
 import os
 import time
 import logging
-import math
-import uuid
-from typing import Optional, Tuple, List, Dict
-from collections import defaultdict
+from typing import List, Optional, Tuple
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import (
-    OrderSide, TimeInForce, OrderType, QueryOrderStatus, OrderStatus
-)
-from alpaca.trading.requests import (
-    LimitOrderRequest, StopOrderRequest, GetOrdersRequest
-)
-from alpaca.common.exceptions import APIError
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
+from alpaca.trading.enums import QueryOrderStatus, OrderSide, OrderType, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, StopOrderRequest
 
-try:
-    import pandas as pd
-    import yfinance as yf
-except Exception:
-    yf = None
-    pd = None
-
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("oco_exit_monitor")
-logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 
-# === ENV ===
+POLL = int(os.getenv("EXIT_MONITOR_POLL_SECONDS", "15"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
-EXIT_MONITOR_POLL_SECONDS = int(os.getenv("EXIT_MONITOR_POLL_SECONDS", "15"))
-DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
-
-# Synthetic OCO for fractional qty
-USE_SYNTHETIC_FRACTIONAL_OCO = os.getenv("USE_SYNTHETIC_FRACTIONAL_OCO", "1") == "1"
-SYN_PREFIX = os.getenv("SYN_OCO_PREFIX", "fracoco")
-
-# Cooldown when there is no available qty to place missing sibling(s)
-NO_AVAIL_COOLDOWN_SECONDS = int(os.getenv("NO_AVAIL_COOLDOWN_SECONDS", "60"))
+MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "1.00"))
+COOLDOWN_SECONDS = int(os.getenv("EXIT_MONITOR_COOLDOWN_SECONDS", "30"))
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") != "0"
 
-# remembers last time we saw "no available qty" for a symbol
-_last_no_avail: Dict[str, float] = defaultdict(lambda: 0.0)
+# We use simple client_order_id suffixes to identify legs
+SUF_TP = "-tp"
+SUF_SL = "-sl"
 
-def _qt(x: float, places: int = 2) -> float:
-    return round(float(x) + 1e-9, places)
+_last_attempt = {}  # symbol -> epoch seconds
 
-def _qqty(q: float) -> float:
-    """Round quantity to 0.001 share precision."""
-    return round(max(0.0, float(q)), 3)
 
-def _is_whole_share(qty: float) -> bool:
-    return abs(qty - round(qty)) < 1e-9
+def _qt(x: float, p: int = 2) -> float:
+    return round(float(x) + 1e-9, p)
 
-def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str):
-    try:
-        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
-        qsym = q[symbol]
-        bid = float(qsym.bid_price) if qsym.bid_price is not None else None
-        ask = float(qsym.ask_price) if qsym.ask_price is not None else None
-        mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
-        return bid, ask, mid
-    except Exception:
-        try:
-            t = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))[symbol]
-            last = float(t.price)
-            return None, None, last
-        except Exception:
-            return None, None, None
 
-def _atr(symbol: str, lookback_days: int = 30, period: int = 14):
-    if yf is not None and pd is not None:
-        try:
-            df = yf.download(symbol, period=f"{lookback_days}d", interval="1d",
-                             progress=False, auto_adjust=False, threads=False)
-            if df is not None and not df.empty and {"High","Low","Close"}.issubset(df.columns):
-                high = df["High"].astype(float)
-                low = df["Low"].astype(float)
-                close = df["Close"].astype(float)
-                prev_close = close.shift(1)
-
-                tr1 = (high - low).abs()
-                tr2 = (high - prev_close).abs()
-                tr3 = (low - prev_close).abs()
-                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-                atr = tr.rolling(window=period, min_periods=period).mean().iloc[-1]
-                ref = float(close.iloc[-1])
-                return float(atr) if not math.isnan(atr) else None, ref
-        except Exception:
-            pass
-    return None, None
-
-def _derive_tp_sl(is_long: bool, ref_px: float, atr_val: Optional[float]) -> Tuple[float, float]:
-    if atr_val is None:
-        atr_val = 0.50
-    if is_long:
-        tp = _qt(ref_px + TP_ATR_MULT * atr_val, 2)
-        sl = _qt(max(0.01, ref_px - SL_ATR_MULT * atr_val), 2)
-    else:
-        tp = _qt(ref_px - TP_ATR_MULT * atr_val, 2)
-        sl = _qt(ref_px + SL_ATR_MULT * atr_val, 2)
-    return tp, sl
-
-def _open_orders(trading: TradingClient, symbol: Optional[str] = None):
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, symbols=[symbol] if symbol else None)
-    return trading.get_orders(filter=req)
-
-def _classify_sell_orders(orders) -> Dict[str, float]:
-    reserved_total = 0.0
-    syn_tp_qty = 0.0
-    syn_sl_qty = 0.0
-    for o in orders:
-        try:
-            side = str(getattr(o, "side", "")).lower()
-            if not side.endswith("sell"):
-                continue
-            q = float(getattr(o, "qty", 0) or 0.0)
-            reserved_total += q
-            coid = (getattr(o, "client_order_id", "") or "")
-            if coid.startswith(f"{SYN_PREFIX}-") and coid.endswith("-tp"):
-                syn_tp_qty += q
-            if coid.startswith(f"{SYN_PREFIX}-") and coid.endswith("-sl"):
-                syn_sl_qty += q
-        except Exception:
-            pass
-    return {"reserved": reserved_total, "syn_tp_qty": syn_tp_qty, "syn_sl_qty": syn_sl_qty}
-
-def _submit_true_oco_long(trading: TradingClient, symbol: str, qty: float, tp: float, sl: float):
-    req = LimitOrderRequest(
-        symbol=symbol, side=OrderSide.SELL, type=OrderType.LIMIT,
-        time_in_force=TimeInForce.DAY, qty=_qqty(qty), order_class="oco",
-        extended_hours=False,
-    )
-    if DRY_RUN:
-        log.info("[DRY_RUN] true OCO SELL %s qty=%.3f tp=%.2f sl=%.2f", symbol, qty, tp, sl)
-        return
-    trading.submit_order(req, take_profit={"limit_price": _qt(tp, 2)}, stop_loss={"stop_price": _qt(sl, 2)})
-
-def _submit_simple_tp(trading: TradingClient, symbol: str, qty: float, tp: float, tag: str):
-    req_tp = LimitOrderRequest(
-        symbol=symbol, side=OrderSide.SELL, type=OrderType.LIMIT,
-        time_in_force=TimeInForce.DAY, qty=_qqty(qty), limit_price=_qt(tp, 2),
-        extended_hours=False, client_order_id=f"{tag}-tp",
-    )
-    if DRY_RUN:
-        log.info("[DRY_RUN] TP simple SELL %s qty=%.3f @ %.2f (%s)", symbol, qty, tp, tag)
-        return
-    trading.submit_order(req_tp)
-
-def _submit_simple_sl(trading: TradingClient, symbol: str, qty: float, sl: float, tag: str):
-    req_sl = StopOrderRequest(
-        symbol=symbol, side=OrderSide.SELL,
-        time_in_force=TimeInForce.DAY, qty=_qqty(qty), stop_price=_qt(sl, 2),
-        extended_hours=False, client_order_id=f"{tag}-sl",
-    )
-    if DRY_RUN:
-        log.info("[DRY_RUN] SL simple SELL %s qty=%.3f @ %.2f (%s)", symbol, qty, sl, tag)
-        return
-    trading.submit_order(req_sl)
-
-def _cancel_orders(trading: TradingClient, orders: List):
-    for o in orders:
-        try:
-            trading.cancel_order_by_id(o.id)
-        except Exception as e:
-            log.warning("cancel %s failed: %s", o.client_order_id, e)
-
-def _reconcile_synthetic_pairs(trading: TradingClient, symbol: str, position_qty: float):
-    open_os = _open_orders(trading, symbol)
-    syn_tp = [o for o in open_os if o.client_order_id and f"{SYN_PREFIX}-{symbol}" in o.client_order_id and o.client_order_id.endswith("-tp")]
-    syn_sl = [o for o in open_os if o.client_order_id and f"{SYN_PREFIX}-{symbol}" in o.client_order_id and o.client_order_id.endswith("-sl")]
-
-    # If flat, cancel remaining sells
-    if position_qty <= 1e-9 and (syn_tp or syn_sl):
-        log.info("%s: flat -> cancel remaining synthetic exits", symbol)
-        _cancel_orders(trading, syn_tp + syn_sl)
-        return
-
-    openish = {OrderStatus.NEW, OrderStatus.ACCEPTED, OrderStatus.PENDING_NEW, OrderStatus.PARTIALLY_FILLED}
-    for tp_o in syn_tp:
-        if tp_o.status not in openish:
-            mates = [s for s in syn_sl if s.client_order_id.split("-tp")[0] == tp_o.client_order_id.split("-tp")[0]]
-            _cancel_orders(trading, mates)
-    for sl_o in syn_sl:
-        if sl_o.status not in openish:
-            mates = [t for t in syn_tp if t.client_order_id.split("-sl")[0] == sl_o.client_order_id.split("-sl")[0]]
-            _cancel_orders(trading, mates)
-
-def _too_soon_no_avail(symbol: str) -> bool:
-    last = _last_no_avail[symbol]
-    if time.time() - last < NO_AVAIL_COOLDOWN_SECONDS:
+def _cooldown_ok(symbol: str) -> bool:
+    now = time.time()
+    last = _last_attempt.get(symbol, 0)
+    if now - last >= COOLDOWN_SECONDS:
+        _last_attempt[symbol] = now
         return True
-    _last_no_avail[symbol] = time.time()
     return False
 
-def run_once(trading: TradingClient, data_client: StockHistoricalDataClient):
-    positions = trading.get_all_positions()
-    if not positions:
+
+def _open_orders(tc: TradingClient, symbol: str):
+    return tc.get_orders(
+        filter=GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            nested=True,
+            symbols=[symbol],
+        )
+    )
+
+
+def _existing_legs(tc: TradingClient, symbol: str):
+    """Return (tp_orders, sl_orders) currently open on SELL side for this symbol."""
+    od = _open_orders(tc, symbol)
+    tps = []
+    sls = []
+    for o in od:
+        try:
+            coid = (o.client_order_id or "")
+            if getattr(o, "side", None) == OrderSide.SELL:
+                if coid.endswith(SUF_TP):
+                    tps.append(o)
+                elif coid.endswith(SUF_SL):
+                    sls.append(o)
+        except Exception:
+            pass
+    return tps, sls
+
+
+def _has_open_entry(tc: TradingClient, symbol: str, long_side: bool) -> Optional[str]:
+    """
+    If there exists any OPEN order on the entry side (BUY for long, SELL for short),
+    return its client_order_id (indicates we must defer exits). Otherwise None.
+    """
+    od = _open_orders(tc, symbol)
+    wanted_side = OrderSide.BUY if long_side else OrderSide.SELL
+    for o in od:
+        try:
+            if getattr(o, "side", None) == wanted_side:
+                return o.client_order_id or o.id
+        except Exception:
+            pass
+    return None
+
+
+def _position_info(tc: TradingClient, symbol: str) -> Tuple[float, Optional[float]]:
+    """
+    Returns (qty, avg_entry_price or None)
+    """
+    for p in tc.get_all_positions():
+        if p.symbol == symbol:
+            try:
+                return float(p.qty), float(p.avg_entry_price)
+            except Exception:
+                return float(p.qty), None
+    return 0.0, None
+
+
+def _qty_already_held_for_sell(tc: TradingClient, symbol: str) -> float:
+    """Compute how much position qty is already reserved by SELL orders (both TP and SL)."""
+    q = 0.0
+    for o in _open_orders(tc, symbol):
+        try:
+            if getattr(o, "side", None) == OrderSide.SELL:
+                q += float(o.qty)
+        except Exception:
+            pass
+    return q
+
+
+def _attach_synthetic_tp(tc: TradingClient, symbol: str, qty: float, limit_px: float):
+    coid = f"fracoco-{symbol[:5]}-{os.urandom(3).hex()}{SUF_TP}"
+    req = LimitOrderRequest(
+        symbol=symbol,
+        side=OrderSide.SELL,
+        type=OrderType.LIMIT,
+        time_in_force=TimeInForce.DAY,
+        qty=qty,
+        limit_price=_qt(limit_px, 2),
+        extended_hours=True,   # allow during AH
+        client_order_id=coid,
+    )
+    return tc.submit_order(req)
+
+
+def _attach_synthetic_sl(tc: TradingClient, symbol: str, qty: float, stop_px: float):
+    # Using STOP (market stop) as synthetic SL; fractional simple order is allowed.
+    coid = f"fracoco-{symbol[:5]}-{os.urandom(3).hex()}{SUF_SL}"
+    req = StopOrderRequest(
+        symbol=symbol,
+        side=OrderSide.SELL,
+        type=OrderType.STOP,
+        time_in_force=TimeInForce.DAY,
+        qty=qty,
+        stop_price=_qt(stop_px, 2),
+        extended_hours=True,   # allow during AH
+        client_order_id=coid,
+    )
+    return tc.submit_order(req)
+
+
+def _compute_tp_sl_from_ref(ref_px: float, atr: float = 0.5) -> Tuple[float, float]:
+    tp = _qt(ref_px + TP_ATR_MULT * atr, 2)
+    sl = _qt(max(0.01, ref_px - SL_ATR_MULT * atr), 2)
+    if tp <= sl:
+        tp, sl = sl + 0.02, max(0.01, tp - 0.02)
+    return tp, sl
+
+
+def run_once(tc: TradingClient, symbols: List[str]):
+    for sym in symbols:
+        qty, avg = _position_info(tc, sym)
+        if qty <= 0:
+            continue  # only manage long positions here
+
+        # 1) If an entry BUY is still open, DEFER exits (prevents wash-trade 403)
+        entry_open_id = _has_open_entry(tc, sym, long_side=True)
+        if entry_open_id:
+            log.info(f"{sym}: entry still open ({entry_open_id}); deferring exits")
+            continue
+
+        # 2) Determine how much is already reserved by existing SELLs
+        held_sell_qty = _qty_already_held_for_sell(tc, sym)
+        avail = max(0.0, _qt(qty - held_sell_qty, 3))
+        tp_orders, sl_orders = _existing_legs(tc, sym)
+
+        if avail <= 0 and tp_orders and sl_orders:
+            log.info(f"{sym}: exits already present")
+            continue
+
+        # cooldown to avoid spam
+        if not _cooldown_ok(sym):
+            continue
+
+        ref = avg if avg is not None else 0.0
+        tp_px, sl_px = _compute_tp_sl_from_ref(ref, atr=0.5)
+
+        # Ensure notional >= $1 where required
+        if tp_px * max(avail, 0.0) < MIN_NOTIONAL:
+            # if too small, try to place at least $1 notional TP/SL (round tiny top-up)
+            min_qty = max(avail, _qt(MIN_NOTIONAL / max(tp_px, 0.01), 3))
+            avail = min(avail, min_qty)
+
+        # Attach missing legs only, sized to available qty
+        if avail > 0:
+            need_tp = len(tp_orders) == 0
+            need_sl = len(sl_orders) == 0
+
+            if need_tp and need_sl:
+                # Place separately (synthetic OCO)
+                log.info(f"{sym}: attaching SYN OCO both legs qty={_qt(avail/2,3)} each | TP={tp_px} SL={sl_px} (avail={_qt(avail,3)})")
+                half = _qt(avail / 2.0, 3)
+                # try both; if either fails with “insufficient qty”, we’ll retry next loop
+                try:
+                    _attach_synthetic_tp(tc, sym, half, tp_px)
+                except Exception as e:
+                    log.warning(f"{sym}: TP submit failed: {e}")
+                try:
+                    _attach_synthetic_sl(tc, sym, avail - half, sl_px)
+                except Exception as e:
+                    log.warning(f"{sym}: SL submit failed: {e}")
+
+            elif need_tp:
+                log.info(f"{sym}: attaching SYN TP qty={_qt(avail,3)} @ {tp_px} (avail path)")
+                try:
+                    _attach_synthetic_tp(tc, sym, avail, tp_px)
+                except Exception as e:
+                    log.warning(f"{sym}: TP submit failed: {e}")
+
+            elif need_sl:
+                log.info(f"{sym}: attaching SYN SL qty={_qt(avail,3)} @ {sl_px} (avail path)")
+                try:
+                    _attach_synthetic_sl(tc, sym, avail, sl_px)
+                except Exception as e:
+                    log.warning(f"{sym}: SL submit failed: {e}")
+        else:
+            log.info(f"{sym}: exits already present")
+
+
+def main():
+    tc = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
+
+    # Manage only symbols we actually hold; you can restrict via env SYMBOLS if you want
+    symbols_env = os.getenv("SYMBOLS")
+    if symbols_env:
+        symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
+    else:
+        symbols = [p.symbol for p in tc.get_all_positions()]
+
+    if not symbols:
         log.info("no positions")
         return
 
-    for p in positions:
-        symbol = p.symbol
-        is_long = float(p.qty) > 0
-        pos_qty = abs(float(p.qty))
-        avg_entry = float(p.avg_entry_price)
-
-        # Reconcile synthetic legs first
-        _reconcile_synthetic_pairs(trading, symbol, pos_qty if is_long else -pos_qty)
-
-        if not is_long:
-            log.info("%s: short exits not implemented yet", symbol)
-            continue
-
-        all_open = _open_orders(trading, symbol)
-        sel = _classify_sell_orders(all_open)
-        reserved = sel["reserved"]
-        syn_tp_qty = sel["syn_tp_qty"]
-        syn_sl_qty = sel["syn_sl_qty"]
-        available = max(0.0, pos_qty - reserved)
-
-        if syn_tp_qty > 0 or syn_sl_qty > 0:
-            need_tp = syn_tp_qty <= 1e-9
-            need_sl = syn_sl_qty <= 1e-9
-        else:
-            need_tp = True
-            need_sl = True
-
-        bid, ask, mid = _latest_bid_ask_mid(data_client, symbol)
-        ref_px = mid if mid is not None else avg_entry
-        atr_val, close_ref = _atr(symbol)
-        ref_for_tp_sl = ref_px if ref_px is not None else (close_ref if close_ref else avg_entry)
-        tp, sl = _derive_tp_sl(True, ref_for_tp_sl, atr_val)
-        if not (tp > sl):
-            tp, sl = sl + 0.02, tp - 0.02
-
-        if _is_whole_share(pos_qty) and need_tp and need_sl and available >= 1.0:
-            log.info("%s: attaching TRUE OCO (whole shares) qty=%.3f | TP=%.2f SL=%.2f", symbol, pos_qty, tp, sl)
-            try:
-                if not DRY_RUN:
-                    _submit_true_oco_long(trading, symbol, pos_qty, tp, sl)
-            except APIError as e:
-                log.warning("true OCO failed for %s: %s", symbol, e)
-            continue
-
-        if not USE_SYNTHETIC_FRACTIONAL_OCO:
-            log.info("%s: fractional position but synthetic disabled -> skipping", symbol)
-            continue
-
-        tag = f"{SYN_PREFIX}-{symbol}-{uuid.uuid4().hex[:6]}"
-
-        if need_tp and need_sl:
-            if available <= 1e-6:
-                if not _too_soon_no_avail(symbol):
-                    log.info("%s: exits wanted but no available qty (reserved=%.3f pos=%.3f)", symbol, reserved, pos_qty)
-                continue
-            per_leg = _qqty(available / 2.0)
-            if per_leg <= 0.0:
-                # prefer SL only for safety
-                sl_qty = _qqty(available)
-                log.info("%s: placing only SL (safety) qty=%.3f @ %.2f", symbol, sl_qty, sl)
-                try:
-                    _submit_simple_sl(trading, symbol, sl_qty, sl, tag)
-                except APIError as e:
-                    log.warning("%s: SL submit failed: %s", symbol, e)
-            else:
-                log.info("%s: attaching SYN OCO both legs qty=%.3f each | TP=%.2f SL=%.2f (avail=%.3f)",
-                         symbol, per_leg, tp, sl, available)
-                try:
-                    _submit_simple_tp(trading, symbol, per_leg, tp, tag)
-                    _submit_simple_sl(trading, symbol, per_leg, sl, tag)
-                except APIError as e:
-                    log.warning("%s: synthetic both legs failed: %s", symbol, e)
-        elif need_tp:
-            want = syn_sl_qty if syn_sl_qty > 0 else available
-            qty = _qqty(min(want, available))
-            if qty <= 0.0:
-                if not _too_soon_no_avail(symbol):
-                    log.info("%s: TP missing but no available qty (reserved=%.3f pos=%.3f)", symbol, reserved, pos_qty)
-                continue
-            log.info("%s: attaching SYN TP qty=%.3f @ %.2f (avail=%.3f, existing SL=%.3f)",
-                     symbol, qty, tp, available, syn_sl_qty)
-            try:
-                _submit_simple_tp(trading, symbol, qty, tp, tag)
-            except APIError as e:
-                log.warning("%s: TP submit failed: %s", symbol, e)
-        elif need_sl:
-            want = syn_tp_qty if syn_tp_qty > 0 else available
-            qty = _qqty(min(want, available))
-            if qty <= 0.0:
-                if not _too_soon_no_avail(symbol):
-                    log.info("%s: SL missing but no available qty (reserved=%.3f pos=%.3f)", symbol, reserved, pos_qty)
-                continue
-            log.info("%s: attaching SYN SL qty=%.3f @ %.2f (avail=%.3f, existing TP=%.3f)",
-                     symbol, qty, sl, available, syn_tp_qty)
-            try:
-                _submit_simple_sl(trading, symbol, qty, sl, tag)
-            except APIError as e:
-                log.warning("%s: SL submit failed: %s", symbol, e)
-        else:
-            log.info("%s: exits already present", symbol)
-
-def main():
-    trading = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
-    data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
     while True:
         try:
-            run_once(trading, data_client)
+            run_once(tc, symbols)
         except Exception as e:
-            log.exception("exit monitor loop error: %s", e)
-        time.sleep(EXIT_MONITOR_POLL_SECONDS)
+            log.warning(f"monitor loop error: {e}")
+        time.sleep(POLL)
+
 
 if __name__ == "__main__":
-    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
-        log.warning("ALPACA_API_KEY/SECRET not set; this script will fail to connect.")
     main()
