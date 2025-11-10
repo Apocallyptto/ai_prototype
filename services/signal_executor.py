@@ -1,166 +1,243 @@
+# services/signal_executor.py
+
 import os
 import time
-import uuid
 import logging
-from decimal import Decimal
+from typing import Dict, Any, List, Optional
 
 import psycopg2
-import psycopg2.extras
+from psycopg2.extras import RealDictCursor
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide
-from services.order_router import place_entry  # we rely on your router’s safety
 
+# Our order entry helper (already in your repo)
+from services.order_router import place_entry
+
+
+# -----------------------------
+# Logging
+# -----------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("signal_executor")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# ----------------
-# Env & helpers
-# ----------------
 
-def env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v not in ("0", "false", "False", "no", "NO")
+# -----------------------------
+# Env/config helpers
+# -----------------------------
+def env_bool(name: str, default: str = "1") -> bool:
+    v = os.getenv(name, default)
+    return str(v).strip() not in ("0", "", "false", "False", "FALSE", "no", "No", "NO")
+
 
 DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
 
-MIN_STRENGTH = Decimal(os.getenv("MIN_STRENGTH", "0.60"))
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+ALPACA_PAPER = env_bool("ALPACA_PAPER", "1")
 
-# Sizing: choose one of the knobs below
-FIXED_QTY = Decimal(os.getenv("FIXED_QTY", "0.05"))       # fractional shares default
-NOTIONAL_USD = Decimal(os.getenv("NOTIONAL_USD", "0"))    # optional: if >0, router will size by notional if supported
+MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
+SYMBOLS_RAW = os.getenv("SYMBOLS", "")  # comma-separated
+SYMBOLS_SET = {s.strip().upper() for s in SYMBOLS_RAW.split(",") if s.strip()} if SYMBOLS_RAW else set()
 
-# Poll cadence
-SLEEP_SECONDS = int(os.getenv("SIGNAL_POLL_SECONDS", "20"))
+PORTFOLIO_ID = os.getenv("PORTFOLIO_ID")  # optional filter
+SIGNAL_POLL_SECONDS = int(os.getenv("SIGNAL_POLL_SECONDS", "20"))
 
-# Optional portfolio segregation
-PORTFOLIO_ID = os.getenv("PORTFOLIO_ID")  # if set, only execute signals with this portfolio_id (or NULL if ALL)
 
-# Idempotency window (minutes)
-DEDUPE_MINUTES = int(os.getenv("DEDUPE_MINUTES", "10"))
+def _sizing_kwargs() -> Dict[str, Any]:
+    """
+    Prefer NOTIONAL_USD if present and > 0, otherwise use FIXED_QTY if present and > 0.
+    Fallback to qty=1.0. This avoids passing an unsupported 'notional' arg when env is blank.
+    """
+    notional_env = os.getenv("NOTIONAL_USD")
+    qty_env = os.getenv("FIXED_QTY")
+    try:
+        n = float(notional_env) if (notional_env is not None and notional_env.strip() != "") else 0.0
+    except ValueError:
+        n = 0.0
+    try:
+        q = float(qty_env) if (qty_env is not None and qty_env.strip() != "") else 0.0
+    except ValueError:
+        q = 0.0
 
-# ----------------
-# DB
-# ----------------
+    if n > 0:
+        return {"notional": n}
+    if q > 0:
+        return {"qty": q}
+    return {"qty": 1.0}
 
+
+# -----------------------------
+# DB helpers
+# -----------------------------
 def get_conn():
     return psycopg2.connect(DB_URL)
 
-def fetch_unprocessed_signals(conn):
-    """
-    Expected 'signals' table minimal columns:
-      id (pk), symbol TEXT, side TEXT ('buy'/'sell'), strength NUMERIC, created_at timestamptz
-    Optional (if used): portfolio_id TEXT
-    """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        q = """
-        SELECT id, symbol, side, strength, created_at, portfolio_id
-        FROM signals
-        WHERE processed_at IS NULL
-          AND strength >= %s
-        ORDER BY created_at ASC
-        LIMIT 50;
-        """
-        cur.execute(q, (str(MIN_STRENGTH),))
-        rows = cur.fetchall()
-        return rows
 
-def mark_signal(conn, signal_id, status, error=None, order_id=None, client_order_id=None):
+def fetch_unprocessed_signals(conn) -> List[Dict[str, Any]]:
+    """
+    Fetch signals to execute:
+      - status IS NULL OR status='pending'
+      - processed_at IS NULL
+      - strength >= MIN_STRENGTH
+      - optional SYMBOLS filter
+      - optional PORTFOLIO_ID filter
+    Oldest first.
+    """
+    filters = [
+        "(status IS NULL OR status = 'pending')",
+        "processed_at IS NULL",
+        "strength >= %s",
+    ]
+    params: List[Any] = [MIN_STRENGTH]
+
+    if SYMBOLS_SET:
+        sym_list = sorted(SYMBOLS_SET)
+        placeholders = ", ".join(["%s"] * len(sym_list))
+        filters.append(f"UPPER(symbol) IN ({placeholders})")
+        params.extend(sym_list)
+
+    if PORTFOLIO_ID and PORTFOLIO_ID.strip():
+        filters.append("COALESCE(portfolio_id, '') = %s")
+        params.append(PORTFOLIO_ID.strip())
+
+    where_clause = " AND ".join(filters)
+    q = f"""
+        SELECT id, created_at, symbol, side, strength, source, portfolio_id
+        FROM signals
+        WHERE {where_clause}
+        ORDER BY created_at ASC
+        LIMIT 20
+    """
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(q, params)
+        rows = cur.fetchall()
+    return rows
+
+
+def mark_signal(
+    conn,
+    signal_id: int,
+    status: str,
+    error: Optional[str] = None,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    exec_order_id: Optional[str] = None,
+):
+    """
+    Update a signal row with processing result. All optional fields are written
+    using NULL when missing.
+    """
+    q = """
+    UPDATE signals
+    SET
+        status = %s,
+        processed_at = NOW(),
+        error = %s,
+        order_id = %s,
+        client_order_id = %s,
+        exec_order_id = %s
+    WHERE id = %s;
+    """
     with conn.cursor() as cur:
-        q = """
-        UPDATE signals
-        SET processed_at = NOW(),
-            status = %s,
-            error = %s,
-            exec_order_id = %s,
-            client_order_id = %s
-        WHERE id = %s
-        """
-        cur.execute(q, (status, error, order_id, client_order_id, signal_id))
+        cur.execute(q, (status, error, order_id, client_order_id, exec_order_id, signal_id))
     conn.commit()
 
-# ----------------
-# Core
-# ----------------
 
-def acceptable(symbol: str, side: str, portfolio_id: str|None):
-    if symbol.upper() not in SYMBOLS:
-        return False, "symbol not allowed"
-    if side.lower() not in ("buy", "sell"):
-        return False, "invalid side"
-    if PORTFOLIO_ID and portfolio_id and portfolio_id != PORTFOLIO_ID:
-        return False, "portfolio mismatch"
-    if PORTFOLIO_ID and portfolio_id is None:
-        # enforce only my portfolio signals if env asks for it
-        return False, "portfolio missing"
-    return True, None
+# -----------------------------
+# Execution
+# -----------------------------
+def build_trading_client() -> TradingClient:
+    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
+        log.warning("ALPACA_API_KEY/SECRET not set; TradingClient will likely fail for live API calls.")
+    return TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
 
-def size_for(symbol: str, side: str):
-    # priority: NOTIONAL if set; else FIXED_QTY
-    if NOTIONAL_USD > 0:
-        return None, float(NOTIONAL_USD)  # (qty, notional)
-    return float(FIXED_QTY), None
 
-def process_one(tc: TradingClient, sig, conn):
+def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
     sid = sig["id"]
-    symbol = sig["symbol"].upper()
-    side = sig["side"].lower()
-    strength = Decimal(str(sig["strength"]))
-    portfolio_id = sig.get("portfolio_id")
+    symbol = str(sig["symbol"]).upper()
+    side = str(sig["side"]).lower()
 
-    ok, why = acceptable(symbol, side, portfolio_id)
-    if not ok:
-        log.info("skip signal %s %s: %s", symbol, side, why)
-        mark_signal(conn, sid, status="skipped", error=why)
+    # Sanity
+    if side not in ("buy", "sell"):
+        err = f"invalid side '{side}'"
+        log.warning("signal %s %s failed: %s", symbol, side, err)
+        mark_signal(conn, sid, status="error", error=err)
         return
 
-    qty, notional = size_for(symbol, side)
-
-    # Build a unique-ish COID that the router can forward (router may override).
-    coid = f"sigexec-{symbol}-{uuid.uuid4().hex[:6]}"
-
-    # Route entry via order_router (handles AH safety, dedupe, spread, opposite cancel)
     try:
+        kwargs = _sizing_kwargs()
+        # IMPORTANT: do not pass 'notional' unless _sizing_kwargs chose it
+        # place_entry signature supports: (tc, symbol, side, qty=?, notional=?, use_limit=?)
         o = place_entry(
-            trading=tc,
+            tc,
             symbol=symbol,
-            side=side,                         # 'buy' or 'sell'
-            qty=qty,                           # may be None when using notional
-            notional=notional,                 # may be None
-            use_limit=False,                   # router will choose market/limit per rules
-            allow_after_hours=True,            # router enforces AH rules (e.g., stops not AH)
-            client_order_id=coid
+            side=side,
+            use_limit=False,
+            **kwargs,
         )
-        log.info("submitted %s %s qty=%s notional=%s -> order_id=%s",
-                 symbol, side, qty, notional, getattr(o, "id", None))
-        mark_signal(conn, sid, status="submitted",
-                    error=None, order_id=getattr(o, "id", None), client_order_id=coid)
+
+        order_id = getattr(o, "id", None)
+        client_order_id = getattr(o, "client_order_id", None)
+
+        # If you generate your own exec order id (router), populate it; else leave None
+        exec_order_id = None
+
+        log.info("signal %s %s submitted: order_id=%s client_order_id=%s kwargs=%s",
+                 symbol, side, order_id, client_order_id, kwargs)
+
+        mark_signal(
+            conn,
+            sid,
+            status="submitted",
+            error=None,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            exec_order_id=exec_order_id,
+        )
+
+    except TypeError as te:
+        # Typical case when someone passed an unsupported kwarg (e.g., 'notional')
+        err = str(te)
+        log.warning("signal %s %s failed: %s", symbol, side, err)
+        mark_signal(conn, sid, status="error", error=err)
+
     except Exception as e:
         err = str(e)
         log.warning("signal %s %s failed: %s", symbol, side, err)
         mark_signal(conn, sid, status="error", error=err)
 
-def loop():
-    key = os.getenv("ALPACA_API_KEY")
-    sec = os.getenv("ALPACA_API_SECRET")
-    paper = env_bool("ALPACA_PAPER", True)
-    tc = TradingClient(key, sec, paper=paper)
 
-    while True:
-        try:
-            with get_conn() as conn:
+def loop():
+    tc = build_trading_client()
+
+    with get_conn() as conn:
+        while True:
+            try:
                 sigs = fetch_unprocessed_signals(conn)
                 if not sigs:
                     log.info("no new signals")
+                    time.sleep(SIGNAL_POLL_SECONDS)
+                    continue
+
                 for sig in sigs:
                     process_one(tc, sig, conn)
-        except Exception as e:
-            log.exception("main loop error: %s", e)
-        time.sleep(SLEEP_SECONDS)
 
-if __name__ == "__main__":
+                # small breather to avoid hammering
+                time.sleep(1)
+
+            except Exception as e:
+                log.error("main loop error: %s", e, exc_info=True)
+                # brief backoff on unexpected failures
+                time.sleep(min(SIGNAL_POLL_SECONDS, 10))
+
+
+def main():
+    log.info("signal_executor starting | MIN_STRENGTH=%.2f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss",
+             MIN_STRENGTH, ",".join(sorted(SYMBOLS_SET)) if SYMBOLS_SET else "(all)", PORTFOLIO_ID, SIGNAL_POLL_SECONDS)
     loop()
 
+
+if __name__ == "__main__":
+    main()
