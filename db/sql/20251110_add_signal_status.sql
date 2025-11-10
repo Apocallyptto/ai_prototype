@@ -1,15 +1,17 @@
--- Minimal, non-destructive migration for signals execution bookkeeping.
--- Adjust table/column names if your schema differs.
+-- db/sql/20251110_add_signal_status.sql
 
--- 1) Add columns if not present
-ALTER TABLE IF EXISTS signals
+-- Add bookkeeping columns for the signal runner
+ALTER TABLE signals
   ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS status TEXT,             -- 'queued'|'submitted'|'skipped'|'error'
-  ADD COLUMN IF NOT EXISTS error TEXT,              -- last error (optional)
-  ADD COLUMN IF NOT EXISTS exec_order_id TEXT,      -- last created order id (optional)
-  ADD COLUMN IF NOT EXISTS client_order_id TEXT;    -- client id we sent (optional)
+  ADD COLUMN IF NOT EXISTS status TEXT,
+  ADD COLUMN IF NOT EXISTS status_reason TEXT;
 
--- 2) Helpful filtered index for polling
-CREATE INDEX IF NOT EXISTS signals_unprocessed_idx
-  ON signals (created_at)
-  WHERE processed_at IS NULL;
+-- Backfill sensible defaults
+UPDATE signals
+SET status = COALESCE(status, 'pending')
+WHERE status IS NULL;
+
+-- Helpful indexes for the polling query
+CREATE INDEX IF NOT EXISTS idx_signals_processed_at ON signals (processed_at);
+CREATE INDEX IF NOT EXISTS idx_signals_status ON signals (status);
+CREATE INDEX IF NOT EXISTS idx_signals_strength_created_at ON signals (strength, created_at DESC);
