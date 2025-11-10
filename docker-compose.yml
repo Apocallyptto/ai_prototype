@@ -76,6 +76,18 @@ services:
       MAX_SPREAD_ABS: "0.12"
       QUOTE_PRICE_SLIPPAGE: "0.02"
 
+  signal_executor:
+    build: .
+    container_name: trader_signal_executor
+    command: [ "python", "-m", "services.signal_executor" ]
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+    volumes:
+      - .:/app
+
   tester:
     build: .
     container_name: trader_tester
