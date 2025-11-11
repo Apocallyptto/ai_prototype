@@ -6,7 +6,7 @@ import psycopg2
 import psycopg2.extras
 
 from alpaca.trading.client import TradingClient
-from services.order_router import place_entry   # absolute import
+from services.order_router import place_entry  # absolute import
 
 log = logging.getLogger("signal_executor")
 logging.basicConfig(
@@ -20,7 +20,7 @@ if not DB_URL:
 
 MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
-PORTFOLIO_ID = os.getenv("PORTFOLIO_ID")  # optional scope
+PORTFOLIO_ID = os.getenv("PORTFOLIO_ID")  # optional
 POLL = int(os.getenv("SIGNAL_POLL_SECONDS", "20"))
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
@@ -54,10 +54,11 @@ def _s(v):
     return str(v) if v is not None else None
 
 def connect():
-    return psycopg2.connect(DB_URL)
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = True  # <- important: no transaction nesting issues
+    return conn
 
 def fetch_unprocessed_signals(conn):
-    # Scope by strength, optional portfolio_id, and optional symbol allowlist
     symbol_filter = ""
     params = [str(MIN_STRENGTH)]
 
@@ -99,7 +100,8 @@ def mark_signal(conn, signal_id, status, error=None, order_id=None, client_order
         exec_order_id = %s
     WHERE id = %s;
     """
-    with conn, conn.cursor() as cur:
+    # DO NOT re-enter the connection context; just open a cursor and let autocommit handle it
+    with conn.cursor() as cur:
         cur.execute(q, (_s(status), _s(error), _s(order_id), _s(client_order_id), _s(exec_order_id), signal_id))
 
 def process_one(tc, sig, conn):
@@ -112,14 +114,20 @@ def process_one(tc, sig, conn):
             use_limit=False,
             **kwargs,
         )
+
         oid  = _s(getattr(o, "id", None))
         coid = _s(getattr(o, "client_order_id", None))
-        xoid = None  # set later when you have an exec id
+        xoid = None  # fill later if you wire exec IDs
 
         log.info(
             "signal %s %s submitted: order_id=%s client_order_id=%s kwargs=%s",
             sig["symbol"], sig["side"], oid, coid, kwargs
         )
+
+        # If broker returned nothing, treat as error to avoid leaving 'pending' forever
+        if oid is None and coid is None:
+            raise RuntimeError("broker returned no order IDs (check API keys/market status)")
+
         mark_signal(conn, sig["id"], status="submitted", error=None, order_id=oid, client_order_id=coid, exec_order_id=xoid)
 
     except Exception as e:
@@ -133,16 +141,29 @@ def loop():
         MIN_STRENGTH, ",".join(SYMBOLS) if SYMBOLS else "(all)", PORTFOLIO_ID or "(any)", POLL
     )
     tc = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=PAPER)
+
+    conn = None
     while True:
         try:
-            with connect() as conn:
-                sigs = fetch_unprocessed_signals(conn)
-                if not sigs:
-                    log.info("no new signals")
-                for sig in sigs:
-                    process_one(tc, sig, conn)
+            if conn is None or conn.closed:
+                conn = connect()
+
+            sigs = fetch_unprocessed_signals(conn)
+            if not sigs:
+                log.info("no new signals")
+            for sig in sigs:
+                process_one(tc, sig, conn)
+
         except Exception as e:
             log.error("main loop error: %s", e, exc_info=True)
+            # if DB connection is the problem, drop it and reconnect next tick
+            try:
+                if conn and not conn.closed:
+                    conn.close()
+            except Exception:
+                pass
+            conn = None
+
         time.sleep(POLL)
 
 if __name__ == "__main__":
