@@ -3,7 +3,7 @@ import os
 import logging
 from alpaca.trading.client import TradingClient
 
-from order_router import place_entry
+from services.order_router import place_entry
 
 # ... your other imports ...
 
@@ -11,10 +11,6 @@ log = logging.getLogger("signal_executor")
 
 # --- sizing helper (as you already added) ---
 def _sizing_kwargs():
-    """
-    Prefer NOTIONAL_USD if present and > 0, otherwise use FIXED_QTY if present and > 0.
-    Fallback to qty=1.0.
-    """
     notional_env = os.getenv("NOTIONAL_USD")
     qty_env = os.getenv("FIXED_QTY")
     try:
@@ -32,11 +28,9 @@ def _sizing_kwargs():
         return {"qty": q}
     return {"qty": 1.0}
 
-# --- small utility to cast UUIDs / None cleanly ---
 def _s(v):
     return str(v) if v is not None else None
 
-# --- update: write all optional fields safely (strings/NULLs) ---
 def mark_signal(conn, signal_id, status, error=None, order_id=None, client_order_id=None, exec_order_id=None):
     q = """
     UPDATE signals
@@ -52,7 +46,6 @@ def mark_signal(conn, signal_id, status, error=None, order_id=None, client_order
     with conn, conn.cursor() as cur:
         cur.execute(q, (_s(status), _s(error), _s(order_id), _s(client_order_id), _s(exec_order_id), signal_id))
 
-# --- inside your process_one(...) replace the place_entry call + capture IDs ---
 def process_one(tc, sig, conn):
     try:
         kwargs = _sizing_kwargs()
@@ -64,11 +57,9 @@ def process_one(tc, sig, conn):
             **kwargs,
         )
 
-        # Alpaca SDK objects may expose UUIDs — cast to str
-        oid = _s(getattr(o, "id", None))
+        oid  = _s(getattr(o, "id", None))
         coid = _s(getattr(o, "client_order_id", None))
-        # if you derive an execution id elsewhere, pass it; otherwise None
-        xoid = None
+        xoid = None  # set if you derive exec id elsewhere
 
         log.info(
             "signal %s %s submitted: order_id=%s client_order_id=%s kwargs=%s",
@@ -77,7 +68,6 @@ def process_one(tc, sig, conn):
         mark_signal(conn, sig["id"], status="submitted", error=None, order_id=oid, client_order_id=coid, exec_order_id=xoid)
 
     except Exception as e:
-        # Make sure errors get recorded but don’t crash the loop
         err = f"{e}"
         log.warning("signal %s %s failed: %s", sig["symbol"], sig["side"], err)
         mark_signal(conn, sig["id"], status="error", error=err, order_id=None, client_order_id=None, exec_order_id=None)
