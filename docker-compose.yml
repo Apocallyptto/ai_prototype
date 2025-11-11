@@ -79,7 +79,7 @@ services:
   signal_executor:
     build: .
     container_name: trader_signal_executor
-    command: [ "python", "-m", "services.signal_executor" ]
+    command: [ "python","-u","-m","services.signal_executor" ]   # ← add -u
     restart: unless-stopped
     env_file:
       - .env
