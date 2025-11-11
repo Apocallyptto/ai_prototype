@@ -13,7 +13,7 @@ from alpaca.trading.client import TradingClient
 
 # NOTE: we only *import the function signature* you already have.
 # Ensure services/order_router.py exports place_entry(tc, symbol, side, use_limit=False, **kwargs)
-from order_router import place_entry
+from services.order_router import place_entry
 
 log = logging.getLogger("signal_executor")
 logging.basicConfig(
