@@ -4,6 +4,7 @@ Sync local 'signals' with Alpaca orders.
 - Looks at both OPEN and CLOSED orders (within LOOKBACK_DAYS).
 - Matches by order_id OR client_order_id.
 - Optionally marks 'submitted' older than STALE_MINUTES as skipped.
+
 Env:
   DB_URL (required)
   ALPACA_API_KEY / ALPACA_API_SECRET (required)
@@ -40,11 +41,9 @@ orders_by_coid = {}
 cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 def recent(o):
     try:
-        # alpaca Order has submitted_at or created_at
         ts = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
         if ts is None:
-            return True  # keep if unsure
-        # ensure tz-aware to compare
+            return True
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         return ts >= cutoff
@@ -59,9 +58,9 @@ for o in list(open_orders) + list(closed_orders):
         orders_by_coid[to_str(o.client_order_id)] = o
 
 status_map = {
-    "new":       None,          # still open
-    "accepted":  None,          # still open
-    "partially_filled": None,   # still working
+    "new":       None,
+    "accepted":  None,
+    "partially_filled": None,
     "filled":    ("filled",  "order filled"),
     "canceled":  ("skipped", "broker canceled"),
     "expired":   ("skipped", "broker expired"),
@@ -75,7 +74,6 @@ updated = 0
 stale_updated = 0
 
 with psycopg2.connect(db_url) as conn, conn.cursor() as cur:
-    # 1) Reconcile all 'submitted'
     cur.execute("""
         SELECT id, symbol, side, order_id, client_order_id, status, processed_at, created_at
           FROM signals
@@ -101,7 +99,6 @@ with psycopg2.connect(db_url) as conn, conn.cursor() as cur:
             if mapped:
                 new_status, reason = mapped
 
-        # If enabled, mark stale submitted older than X minutes
         if not new_status and stale_minutes > 0 and created_at is not None:
             now = datetime.now(timezone.utc)
             if created_at.tzinfo is None:
@@ -120,8 +117,6 @@ with psycopg2.connect(db_url) as conn, conn.cursor() as cur:
                        status_reason=%s
                  WHERE id=%s;
             """, (new_status, reason, sid))
-            updated += 1
-
     conn.commit()
 
 print(f"checked {checked} submitted rows, updated {updated} (stale={stale_updated})")
