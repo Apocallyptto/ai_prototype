@@ -72,28 +72,25 @@ services:
       python -m services.signal_executor
     restart: unless-stopped
 
-  sync_orders:
-    image: ai_prototype-executor
-    container_name: trader_sync_orders   # <- stable name for docker logs
-    depends_on:
-      - postgres
-    environment:
-      # --- DB / Broker ---
-      DB_URL: ${DB_URL}
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: ${ALPACA_PAPER:-1}
-
-      # --- Runner knobs (tweak as you like) ---
-      LOOKBACK_DAYS: "3"   # how far back we scan broker orders
-      STALE_MINUTES: "20"  # mark long 'submitted' as skipped
-    volumes:
-      - .:/app             # dev: always use latest repo code
-    command: >
-      sh -lc 'while true; do
-        python -u tools/sync_orders.py || true;
-        sleep 60;
-      done'
+sync_orders:
+  image: ai_prototype-executor
+  container_name: trader_sync_orders
+  depends_on:
+    - postgres
+  environment:
+    DB_URL: ${DB_URL}
+    ALPACA_API_KEY: ${ALPACA_API_KEY}
+    ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+    ALPACA_PAPER: ${ALPACA_PAPER:-1}
+    LOOKBACK_DAYS: "3"
+    STALE_MINUTES: "20"
+  volumes:
+    - .:/app
+  command: >
+    sh -lc 'while true; do
+      python -u tools/sync_orders.py || true;
+      sleep 300;
+    done'
 
 
 # networks/volumes can be defaulted; add if you need named ones
