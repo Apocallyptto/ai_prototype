@@ -8,101 +8,94 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: trader
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
     ports:
       - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trader || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
+  # --- your app image with tools/* scripts (used for one-off jobs & sync_orders)
   executor:
-    build: .
+    image: ai_prototype-executor
     container_name: trader_executor
-    command: ["python","services/executor_bracket.py"]
-    env_file: [.env]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-      SYMBOLS: "AAPL,MSFT,SPY"
-      CRON_SLEEP_SECONDS: "180"
-      MIN_STRENGTH: "0.60"
-      DISABLE_NN: "0"
-      ML_LOOKBACK_DAYS: "30"
-      ML_BAR_INTERVAL: "5m"
-      ML_TARGET_HORIZON_BARS: "6"
-      MODEL_DIR: "/app/models"
+      # --- DB ---
+      DB_URL: ${DB_URL:-postgresql://postgres:postgres@postgres:5432/trader}
+
+      # --- Alpaca ---
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: "1"
+      ALPACA_PAPER: ${ALPACA_PAPER:-1}
 
-  oco_exit_monitor:
-    build: .
-    container_name: trader_oco_exit_monitor
-    command: ["python","-m","services.oco_exit_monitor"]
-    env_file: [.env]
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: "1"
-      EXIT_MONITOR_POLL_SECONDS: "15"
-      TP_ATR_MULT: "1.5"
-      SL_ATR_MULT: "1.0"
+      # Optional defaults used by tools
+      LOOKBACK_DAYS: "3"
+      STALE_MINUTES: "20"
 
-  reprice_stale:
-    build: .
-    container_name: trader_reprice_stale
-    command: ["python","-m","services.reprice_stale"]
-    env_file: [.env]
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: "1"
-      STALE_AFTER_SECONDS: "300"
-      REPRICE_EVERY_SECONDS: "90"
-      MAX_REPRICES: "4"
-      CANCEL_AFTER_REPRICES: "1"
-      MAX_SPREAD_PCT: "0.15"
-      MAX_SPREAD_ABS: "0.12"
-      QUOTE_PRICE_SLIPPAGE: "0.02"
-
-  signal_executor:
-    build: .
-    container_name: trader_signal_executor
-    command: [ "python","-u","-m","services.signal_executor" ]   # ← add -u
+    command: >
+      sh -lc 'sleep 999999'   # stays idle; you run one-off tools via `docker compose run --rm executor ...`
     restart: unless-stopped
-    env_file:
-      - .env
-    depends_on:
-      - postgres
-    volumes:
-      - .:/app
 
-  tester:
-    build: .
-    container_name: trader_tester
-    command: ["python","-m","tools.submit_test_simple"]
-    env_file: [.env]
+  # --- the signal runner (polls DB and places entries)
+  signal_executor:
+    image: ai_prototype-signal_executor
+    container_name: trader_signal_executor
     depends_on:
       postgres:
         condition: service_healthy
     environment:
+      # --- DB ---
+      DB_URL: ${DB_URL:-postgresql://postgres:postgres@postgres:5432/trader}
+
+      # --- Symbols / filter ---
+      SYMBOLS: ${SYMBOLS:-AAPL,MSFT,SPY,NVDA,AMD}
+      MIN_STRENGTH: ${MIN_STRENGTH:-0.60}
+      PORTFOLIO_ID: ${PORTFOLIO_ID:-paper-core}
+
+      # --- Sizing (either NOTIONAL_USD or FIXED_QTY) ---
+      NOTIONAL_USD: ${NOTIONAL_USD:-}
+      FIXED_QTY: ${FIXED_QTY:-0.05}
+
+      # --- Alpaca ---
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: "1"
-      TEST_SYMBOL: "AAPL"
-      TEST_QTY: "0.05"
-      TEST_EXT_HOURS: "1"
+      ALPACA_PAPER: ${ALPACA_PAPER:-1}
 
-volumes:
-  pgdata:
+      # --- Loop cadence ---
+      POLL_SECONDS: ${POLL_SECONDS:-20}
+
+    command: >
+      python -m services.signal_executor
+    restart: unless-stopped
+
+  # --- NEW: keeps DB in sync with broker orders (both OPEN & CLOSED)
+  sync_orders:
+    image: ai_prototype-executor
+    container_name: trader_sync_orders
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- DB ---
+      DB_URL: ${DB_URL:-postgresql://postgres:postgres@postgres:5432/trader}
+
+      # --- Alpaca ---
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      ALPACA_PAPER: ${ALPACA_PAPER:-1}
+
+      # --- Sync options ---
+      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-3}   # search window for broker orders
+      STALE_MINUTES: ${STALE_MINUTES:-20}  # mark long-submitted rows w/o broker record as skipped
+    command: >
+      sh -lc 'while true; do
+        python tools/sync_orders.py || true;
+        sleep 60;
+      done'
+    restart: unless-stopped
+
+# networks/volumes can be defaulted; add if you need named ones
