@@ -93,7 +93,7 @@ services:
       STALE_MINUTES: ${STALE_MINUTES:-20}  # mark long-submitted rows w/o broker record as skipped
     command: >
       sh -lc 'while true; do
-        python tools/sync_orders.py || true;
+        python -u tools/sync_orders.py || true;
         sleep 60;
       done'
     restart: unless-stopped
