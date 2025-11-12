@@ -50,12 +50,12 @@ services:
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
       ALPACA_PAPER: ${ALPACA_PAPER:-1}
 
-  # ✅ new service lives UNDER services:
   sync_orders:
-    image: ai_prototype-executor   # uses the executor image where tools/ live
+    image: ai_prototype-executor
     container_name: trader_sync_orders
     depends_on:
-      - postgres
+      postgres:
+        condition: service_started
     environment:
       DB_URL: ${DB_URL}
       ALPACA_API_KEY: ${ALPACA_API_KEY}
@@ -63,14 +63,14 @@ services:
       ALPACA_PAPER: ${ALPACA_PAPER:-1}
       LOOKBACK_DAYS: "3"
       STALE_MINUTES: "20"
-    # DEV convenience: bind the repo so you always run the latest file
     volumes:
-      - .:/app
+      - .:/app        # ✅ dev bind mount — always use latest code
     command: >
       sh -lc 'while true; do
         python -u tools/sync_orders.py || true;
         sleep 60;
       done'
+
 
 volumes:
   pgdata:
