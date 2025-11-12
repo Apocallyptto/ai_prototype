@@ -1,26 +1,61 @@
-# tools/sync_orders.py
-from __future__ import annotations
-import os
-from datetime import datetime, timedelta, timezone
+#!/usr/bin/env python3
+"""
+tools/sync_orders.py
+Sync local 'signals' table with Alpaca order status.
+"""
 
-from lib.broker_alpaca import list_orders
-from lib.db_orders import upsert_orders
+import os, psycopg2
+from datetime import datetime, timezone
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+lookback_days = int(os.getenv("LOOKBACK_DAYS", "3"))
+paper = os.getenv("ALPACA_PAPER", "1") != "0"
 
-def log(msg, level="INFO"):
-    levels = ["DEBUG","INFO","WARN","ERROR"]
-    if levels.index(level) >= levels.index(LOG_LEVEL):
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
-        print(f"{ts} {level} sync_orders | {msg}", flush=True)
+tc = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=paper)
+orders = tc.get_orders(GetOrdersRequest(status=None, limit=500))
+orders_map = {str(o.id): o for o in orders}
 
-def main():
-    lookback_days = int(os.getenv("ORDERS_LOOKBACK_DAYS","7"))
-    after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    orders = list_orders(status="all", nested=True, limit=500, after=after)
-    log(f"fetched {len(orders)} orders since {after.isoformat()}")
-    n = upsert_orders(orders)
-    log(f"sync complete (upserted {n})")
+db_url = os.environ["DB_URL"]
+updated = 0
 
-if __name__ == "__main__":
-    main()
+with psycopg2.connect(db_url) as conn, conn.cursor() as cur:
+    cur.execute("""
+        SELECT id, symbol, side, order_id, status
+          FROM signals
+         WHERE status='submitted'
+      ORDER BY id DESC;
+    """)
+    rows = cur.fetchall()
+
+    for row in rows:
+        sid, symbol, side, order_id, db_status = row
+        o = orders_map.get(str(order_id))
+        if not o:
+            continue
+
+        new_status = None
+        reason = None
+        if o.status == "filled":
+            new_status = "filled"
+            reason = "order filled"
+        elif o.status in ("canceled", "expired"):
+            new_status = "skipped"
+            reason = f"broker {o.status}"
+        elif o.status in ("replaced", "rejected"):
+            new_status = "error"
+            reason = f"broker {o.status}"
+        if new_status and new_status != db_status:
+            cur.execute("""
+                UPDATE signals
+                   SET status=%s,
+                       processed_at=NOW(),
+                       status_reason=%s
+                 WHERE id=%s;
+            """, (new_status, reason, sid))
+            updated += 1
+
+    conn.commit()
+
+print(f"checked {len(rows)} submitted rows, updated {updated}")
