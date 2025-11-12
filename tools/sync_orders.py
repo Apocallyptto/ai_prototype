@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Sync local 'signals' with Alpaca orders.
 - Looks at both OPEN and CLOSED orders (within LOOKBACK_DAYS).
@@ -117,6 +117,7 @@ with psycopg2.connect(db_url) as conn, conn.cursor() as cur:
                        status_reason=%s
                  WHERE id=%s;
             """, (new_status, reason, sid))
+            updated += 1
     conn.commit()
 
 print(f"checked {checked} submitted rows, updated {updated} (stale={stale_updated})")
