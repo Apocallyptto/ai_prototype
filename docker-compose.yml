@@ -64,12 +64,13 @@ services:
       LOOKBACK_DAYS: "3"
       STALE_MINUTES: "20"
     volumes:
-      - .:/app        # ✅ dev bind mount — always use latest code
+      - .:/app    # dev bind mount so the container uses your latest code
     command: >
       sh -lc 'while true; do
         python -u tools/sync_orders.py || true;
         sleep 60;
       done'
+
 
 
 volumes:
