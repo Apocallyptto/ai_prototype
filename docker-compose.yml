@@ -74,28 +74,27 @@ services:
 
   # --- NEW: keeps DB in sync with broker orders (both OPEN & CLOSED)
   sync_orders:
-    image: ai_prototype-executor
-    container_name: trader_sync_orders
+    image: ai_prototype-executor          # same image your tools live in
     depends_on:
-      postgres:
-        condition: service_healthy
+      - postgres
     environment:
-      # --- DB ---
-      DB_URL: ${DB_URL:-postgresql://postgres:postgres@postgres:5432/trader}
-
-      # --- Alpaca ---
+      DB_URL: ${DB_URL}
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
       ALPACA_PAPER: ${ALPACA_PAPER:-1}
-
-      # --- Sync options ---
-      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-3}   # search window for broker orders
-      STALE_MINUTES: ${STALE_MINUTES:-20}  # mark long-submitted rows w/o broker record as skipped
+      LOOKBACK_DAYS: "3"
+      STALE_MINUTES: "20"
+    # DEV: always run the latest code from your working tree
+    volumes:
+      - .:/app
     command: >
-      sh -lc 'while true; do
-        python -u tools/sync_orders.py || true;
-        sleep 60;
-      done'
-    restart: unless-stopped
+      sh -lc '
+        set -euo pipefail;
+        python -u tools/sync_orders.py;
+        while true; do
+          python -u tools/sync_orders.py || true;
+          sleep 60;
+        done
+      '
 
 # networks/volumes can be defaulted; add if you need named ones
