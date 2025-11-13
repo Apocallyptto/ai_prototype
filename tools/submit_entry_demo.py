@@ -2,6 +2,13 @@ import os
 from alpaca.trading.client import TradingClient
 from services.order_router import place_entry
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") != "0"
