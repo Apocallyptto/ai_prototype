@@ -72,6 +72,43 @@ services:
       done'
 
 
+  oco_exit_monitor:
+    image: ai_prototype-executor
+    container_name: trader_oco_exit_monitor
+    depends_on:
+      postgres:
+        condition: service_started
+        required: true
+    environment:
+      # --- DB ---
+      DB_URL: ${DB_URL}
+
+      # --- Broker ---
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      ALPACA_PAPER: ${ALPACA_PAPER:-1}
+
+      # --- Universe / risk knobs ---
+      SYMBOLS: "AAPL,MSFT,SPY,NVDA,AMD"
+      TP_ATR_MULT: "1.5"
+      SL_ATR_MULT: "1.0"
+      MIN_NOTIONAL: "1.00"
+      MIN_QTY: "0.001"
+
+      # --- Runtime behavior ---
+      EXIT_MONITOR_POLL_SECONDS: "15"
+      EXIT_COOLDOWN_SECONDS: "45"
+      ALLOW_AFTER_HOURS: "1"     # TP can be placed AH; SL will be respected only RTH by broker
+      LOG_LEVEL: "INFO"
+    # Dev convenience: always use your latest repo code inside the container
+    volumes:
+      - .:/app
+    command: >
+      sh -lc '
+        python -u services/oco_exit_monitor.py
+      '
+
+
 
 volumes:
   pgdata:
