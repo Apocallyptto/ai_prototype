@@ -34,21 +34,25 @@ services:
 
   # 🔧 your signal runner
   signal_executor:
-    image: ai_prototype-signal_executor
     container_name: trader_signal_executor
     depends_on:
-      - postgres
+      postgres:
+        condition: service_started
+        required: true
     environment:
-      DB_URL: ${DB_URL}
-      PORTFOLIO_ID: ${PORTFOLIO_ID:-paper-core}
-      SYMBOLS: ${SYMBOLS:-AAPL,MSFT,SPY,NVDA,AMD}
-      MIN_STRENGTH: ${MIN_STRENGTH:-0.60}
-      FIXED_QTY: ${FIXED_QTY:-0.05}
-      NOTIONAL_USD: ${NOTIONAL_USD:-}
-      ALLOW_AFTER_HOURS: ${ALLOW_AFTER_HOURS:-0}
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: ${ALPACA_PAPER:-1}
+      ALLOW_AFTER_HOURS: "0"
+      ALPACA_API_KEY: PKQBHFISALV4GKDTBDHEFDN6K7
+      ALPACA_API_SECRET: ASnJK4UkkzVpSqzB1ZPPqEqEkd2U2zxybFpxRY8ZWUb6
+      ALPACA_PAPER: "1"
+      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/trader   # 👈 ADD THIS
+      FIXED_QTY: "0.05"
+      MIN_STRENGTH: "0.60"
+      NOTIONAL_USD: ""
+      PORTFOLIO_ID: paper-core
+      SYMBOLS: AAPL,MSFT,SPY,NVDA,AMD
+    image: ai_prototype-signal_executor
+
 
   sync_orders:
     image: ai_prototype-executor
