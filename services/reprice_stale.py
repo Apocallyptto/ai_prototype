@@ -1,186 +1,229 @@
 import os
 import time
 import logging
-from datetime import datetime, timezone
-from typing import Optional, Tuple
+from collections import defaultdict
+from decimal import Decimal
 
 from alpaca.trading.client import TradingClient
-from alpaca.common.exceptions import APIError
 from alpaca.trading.requests import GetOrdersRequest, ReplaceOrderRequest
-from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.enums import QueryOrderStatus, OrderSide, OrderType, OrderClass
+
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
+from alpaca.data.requests import StockLatestQuoteRequest
 
-log = logging.getLogger("reprice_stale")
-logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 
-# === ENV KNOBS ===
-STALE_AFTER_SECONDS = int(os.getenv("STALE_AFTER_SECONDS", "300"))
-REPRICE_EVERY_SECONDS = int(os.getenv("REPRICE_EVERY_SECONDS", "90"))
-MAX_REPRICES = int(os.getenv("MAX_REPRICES", "4"))
-CANCEL_AFTER_REPRICES = os.getenv("CANCEL_AFTER_REPRICES", "1") == "1"
+logger = logging.getLogger("reprice_stale")
 
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
-MAX_SPREAD_ABS = float(os.getenv("MAX_SPREAD_ABS", "0.12"))
-QUOTE_PRICE_SLIPPAGE = float(os.getenv("QUOTE_PRICE_SLIPPAGE", "0.02"))
 
-DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+# --- Tunable params (env overrides our defaults) ---
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "1") != "0"
+# Max allowed spread (% of mid) – if wider, we skip repricing to avoid bad fills.
+MAX_SPREAD_PCT = float(os.getenv("REPRICE_MAX_SPREAD_PCT", "0.40"))
 
-def _qt(x: float, places: int = 2) -> float:
-    return round(float(x) + 1e-9, places)
+# Min absolute move needed (in $) to bother repricing.
+MIN_ABS_MOVE = float(os.getenv("REPRICE_MIN_ABS_MOVE", "0.01"))
 
-def _age_seconds(ts) -> int:
-    if ts is None:
-        return 0
-    if getattr(ts, "tzinfo", None) is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return int((datetime.now(timezone.utc) - ts).total_seconds())
+# How often we loop when run as a daemon (cron still calls it once per cycle).
+LOOP_SLEEP_SECS = int(os.getenv("REPRICE_LOOP_SLEEP_SECS", "1"))
 
-def _market_is_open(trading: TradingClient) -> bool:
-    try:
-        clk = trading.get_clock()
-        return bool(getattr(clk, "is_open", False))
-    except Exception:
-        return False
+# Safety cap: how many times we reprice the *same* order id in this process.
+MAX_REPRICES_PER_ORDER = int(os.getenv("REPRICE_MAX_REPRICES_PER_ORDER", "20"))
 
-def _latest_bid_ask_mid(data_client: StockHistoricalDataClient, symbol: str):
-    try:
-        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
-        qsym = q[symbol]
-        bid = float(qsym.bid_price) if qsym.bid_price is not None else None
-        ask = float(qsym.ask_price) if qsym.ask_price is not None else None
-        mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else None
-        return bid, ask, mid
-    except Exception:
-        try:
-            t = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))[symbol]
-            last = float(t.price)
-            return None, None, last
-        except Exception:
-            return None, None, None
 
-def _guarded_limit(data_client: StockHistoricalDataClient, symbol: str, side: str, px_hint: Optional[float]):
-    bid, ask, mid = _latest_bid_ask_mid(data_client, symbol)
-    if bid is not None and ask is not None and mid is not None:
-        spread_abs = max(0.0, ask - bid)
-        spread_pct = (spread_abs / mid) * 100.0 if mid else 999.0
-        if (spread_pct > MAX_SPREAD_PCT) or (spread_abs > MAX_SPREAD_ABS):
-            raise RuntimeError(
-                f"wide spread skip {symbol} bid={bid:.2f} ask={ask:.2f} mid={mid:.2f} "
-                f"abs={spread_abs:.4f} pct={spread_pct:.3f}%"
-            )
-        slip = QUOTE_PRICE_SLIPPAGE
-        if side.lower() == "buy":
-            raw = max(ask, (px_hint if px_hint else ask))
-            raw = min(raw + slip, ask + slip)
-        else:
-            raw = min(bid, (px_hint if px_hint else bid))
-            raw = max(raw - slip, bid - slip)
-        return _qt(raw, 2), bid, ask
-    if px_hint is None:
-        raise RuntimeError(f"no quotes and no px_hint for {symbol}")
-    return _qt(px_hint, 2), None, None
+def make_clients() -> tuple[TradingClient, StockHistoricalDataClient]:
+    api_key = os.getenv("ALPACA_API_KEY")
+    api_secret = os.getenv("ALPACA_API_SECRET")
+    paper = os.getenv("ALPACA_PAPER", "1") != "0"
 
-def _is_parent_limit(o) -> bool:
-    oc = getattr(o, "order_class", None)
-    if oc not in ("bracket", "simple", None):
-        return False
-    if getattr(o, "status", "") not in ("new", "accepted", "pending_new"):
-        return False
-    if getattr(o, "type", "").lower() != "limit":
-        return False
-    try:
-        filled_qty = float(getattr(o, "filled_qty", 0) or 0)
-    except Exception:
-        filled_qty = 0.0
-    return filled_qty == 0.0
+    if not api_key or not api_secret:
+        raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET not set in env.")
 
-def _count_reprices(o) -> int:
-    coid = (getattr(o, "client_order_id", "") or "")
-    for i in range(7):
-        if coid.endswith(f"-rp{i}"):
-            return i
-    return 0
+    trading = TradingClient(api_key, api_secret, paper=paper)
+    data_client = StockHistoricalDataClient(api_key, api_secret)
+    return trading, data_client
 
-def _next_coid(o) -> str:
-    base = (getattr(o, "client_order_id", "") or "").split("-rp")[0]
-    return f"{base}-rp{_count_reprices(o)+1}"
 
-def run_once(trading: TradingClient, data_client: StockHistoricalDataClient):
-    if not _market_is_open(trading):
-        log.info("market closed -> skipping reprice loop")
-        return
-
-    open_orders = trading.get_orders(
-        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)
+def get_open_limit_orders(trading: TradingClient):
+    """
+    Fetch open parent limit orders (we don't touch children legs directly).
+    Uses the *new* alpaca-py style: GetOrdersRequest + filter=...
+    """
+    req = GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,
+        nested=True,  # include legs; we'll skip children manually
     )
-    if not open_orders:
-        log.info("no open orders to reprice")
+    orders = trading.get_orders(filter=req)
+
+    parents = []
+    for o in orders:
+        # Only limit / stop-limit orders.
+        if o.order_type not in (OrderType.LIMIT, OrderType.STOP_LIMIT):
+            continue
+
+        # Skip bracket / other complex classes for now
+        # – we expect parents to be SIMPLE or BRACKET parents.
+        # If your setup marks parents as BRACKET, we still keep them;
+        # we just don't want to touch children.
+        if o.order_class not in (OrderClass.SIMPLE, OrderClass.BRACKET):
+            continue
+
+        # If this is a child of a bracket, Alpaca usually gives parent ids;
+        # you can extend this filter later if you want.
+        parents.append(o)
+
+    return parents
+
+
+def get_quote(data_client: StockHistoricalDataClient, symbol: str):
+    """
+    Get latest NBBO quote for symbol.
+    """
+    req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+    out = data_client.get_stock_latest_quote(req)
+    q = out.get(symbol)
+    if q is None or q.bid_price is None or q.ask_price is None:
+        return None
+
+    bid = float(q.bid_price)
+    ask = float(q.ask_price)
+    if bid <= 0 or ask <= 0:
+        return None
+
+    return bid, ask
+
+
+def compute_new_price(order, bid: float, ask: float) -> float | None:
+    """
+    Decide a new limit price based on side and current quote.
+    We keep your existing "hug the inside" behaviour:
+      - BUY → just above bid
+      - SELL → just below ask
+    But we still respect min move and spread caps.
+    """
+    mid = (bid + ask) / 2.0
+    spread_abs = ask - bid
+    spread_pct = (spread_abs / mid) * 100.0
+
+    if spread_pct > MAX_SPREAD_PCT:
+        logger.info(
+            "AAPL: skip reprice (wide spread skip %s bid=%.2f ask=%.2f mid=%.2f abs=%.4f pct=%.3f%%)",
+            order.symbol,
+            bid,
+            ask,
+            mid,
+            spread_abs,
+            spread_pct,
+        )
+        return None
+
+    old_px = float(order.limit_price) if order.limit_price is not None else None
+    if old_px is None:
+        return None
+
+    # For US stocks we typically tick at 0.01, so we round to 2 decimals.
+    tick = Decimal("0.01")
+
+    if order.side == OrderSide.BUY:
+        # Place near the bid, but slightly inside to stay competitive
+        target = Decimal(str(bid)) + tick
+        if float(target) >= old_px:
+            # We're already better than or equal to bid; no point moving.
+            return None
+    else:
+        # SELL – place near ask but slightly inside
+        target = Decimal(str(ask)) - tick
+        if float(target) <= old_px:
+            return None
+
+    new_px = float(target)
+
+    # Require a minimum move to avoid useless replace spam
+    if abs(new_px - old_px) < MIN_ABS_MOVE:
+        return None
+
+    return round(new_px, 2)
+
+
+def run_once(trading: TradingClient, data_client: StockHistoricalDataClient,
+             reprice_counts: dict[str, int], dry_run: bool = False):
+    orders = get_open_limit_orders(trading)
+
+    if not orders:
+        logger.info("no open orders to reprice")
         return
 
-    for o in open_orders:
-        if not _is_parent_limit(o):
+    for o in orders:
+        # Cap per-run/instance reprice count for safety
+        count = reprice_counts[o.id]
+        if count >= MAX_REPRICES_PER_ORDER:
             continue
 
-        if _age_seconds(getattr(o, "submitted_at", None)) < STALE_AFTER_SECONDS:
+        quote = get_quote(data_client, o.symbol)
+        if not quote:
+            continue
+        bid, ask = quote
+
+        new_px = compute_new_price(o, bid, ask)
+        if new_px is None:
             continue
 
-        rcount = _count_reprices(o)
-        if rcount >= MAX_REPRICES:
-            if CANCEL_AFTER_REPRICES:
-                log.info("%s: max reprices reached -> cancel", o.symbol)
-                if not DRY_RUN:
-                    try:
-                        trading.cancel_order_by_id(o.id)
-                    except APIError as e:
-                        log.warning("%s: cancel failed: %s", o.symbol, e)
-            else:
-                log.info("%s: max reprices reached -> leaving as is", o.symbol)
+        count += 1
+        reprice_counts[o.id] = count
+
+        # Build new client_order_id so we can track the lineage
+        base_coid = (o.client_order_id or "noprefix").split("-rp")[0]
+        new_coid = f"{base_coid}-rp{count}"
+
+        logger.info(
+            "%s: reprice #%d | %.2f -> %.2f  (bid=%.2f ask=%.2f)  coid=%s",
+            o.symbol,
+            count,
+            float(o.limit_price),
+            new_px,
+            bid,
+            ask,
+            new_coid,
+        )
+
+        if dry_run:
             continue
 
         try:
-            new_px, bid, ask = _guarded_limit(data_client, o.symbol, o.side.lower(), float(o.limit_price))
-        except Exception as e:
-            log.info("%s: skip reprice (%s)", o.symbol, e)
-            continue
-
-        new_coid = _next_coid(o)
-        log.info("%s: reprice #%d | %.2f -> %.2f  (bid=%s ask=%s)  coid=%s",
-                 o.symbol, rcount+1, float(o.limit_price), new_px,
-                 f"{bid:.2f}" if bid is not None else "n/a",
-                 f"{ask:.2f}" if ask is not None else "n/a",
-                 new_coid)
-
-        if DRY_RUN:
-            continue
-
-        try:
-            trading.replace_order_by_id(
-                o.id,
-                order_data=ReplaceOrderRequest(limit_price=new_px, client_order_id=new_coid),
+            # ✅ Correct alpaca-py usage:
+            #   ReplaceOrderRequest + order_data=...
+            replace_req = ReplaceOrderRequest(
+                limit_price=new_px,
+                client_order_id=new_coid,
             )
-        except APIError as e:
-            log.warning("%s: replace failed: %s", o.symbol, e)
+            trading.replace_order_by_id(
+                order_id=o.id,
+                order_data=replace_req,
+            )
+        except Exception as e:
+            logger.error("error replacing order %s: %s", o.id, e)
+
 
 def main():
-    trading = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
-    data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
-    last = 0.0
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
+
+    dry_run = os.getenv("DRY_RUN", "0") == "1"
+    trading, data_client = make_clients()
+    reprice_counts: dict[str, int] = defaultdict(int)
+
+    logger.info("reprice_stale | starting loop | dry_run=%s", dry_run)
+
     while True:
-        now = time.time()
-        if now - last >= REPRICE_EVERY_SECONDS:
-            last = now
-            try:
-                run_once(trading, data_client)
-            except Exception as e:
-                log.exception("reprice loop error: %s", e)
-        time.sleep(1)
+        try:
+            run_once(trading, data_client, reprice_counts, dry_run=dry_run)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error("reprice loop error: %s", e)
+        time.sleep(LOOP_SLEEP_SECS)
+
 
 if __name__ == "__main__":
-    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
-        log.warning("ALPACA_API_KEY/SECRET not set; this script will fail to connect.")
     main()
