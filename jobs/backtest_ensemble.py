@@ -67,18 +67,27 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
     Wilder ATR.
     Očakáva stĺpce: High, Low, Close.
+    Vráti vždy pd.Series so spoločným indexom.
     """
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
+    high = pd.to_numeric(df["High"], errors="coerce")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+    close = pd.to_numeric(df["Close"], errors="coerce")
 
     prev_close = close.shift(1)
+
     tr1 = (high - low).abs()
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
+
+    # TR je Series: max z troch sérii po riadkoch
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
     atr = tr.rolling(window=period, min_periods=period).mean()
+
+    # istota, že vrátime Series, nie DataFrame
+    atr = pd.Series(atr, index=df.index, name="atr")
     return atr
+
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
