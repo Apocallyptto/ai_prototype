@@ -9,17 +9,13 @@ Jednoduchý backtester pre tvoj 5m "ensemble / ML" prístup.
 - Pokúsi sa načítať model models/gbc_5m.pkl (ak to zlyhá, použije rule-based fallback)
 - Simuluje LONG obchody s ATR-based TP/SL
 - Ukladá výsledky do CSV a vypisuje štatistiky
-
-Verzia je napísaná robustnejšie:
-- zvláda aj MultiIndex stĺpce z yfinance
-- ATR vždy vracia Series, nie DataFrame
 """
 
 import os
 import math
 import warnings
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,7 +35,7 @@ def get_env(name: str, default: str) -> str:
 
 
 BACKTEST_SYMBOLS = get_env("BACKTEST_SYMBOLS", "AAPL,MSFT,SPY").split(",")
-BACKTEST_DAYS = int(get_env("BACKTEST_DAYS", "60"))
+BACKTEST_DAYS = int(get_env("BACKTEST_DAYS", "30"))  # default 30, kvôli Yahoo 5m limitu
 BACKTEST_INTERVAL = get_env("BACKTEST_INTERVAL", "5m")
 
 # ATR-based exits
@@ -65,31 +61,16 @@ OUT_EQUITY_CSV = get_env("BACKTEST_EQUITY_CSV", "backtest_equity_curve.csv")
 # Technické indikátory / featury
 # =============================
 
-def _ensure_series(col) -> pd.Series:
+def compute_atr_from_ohlc(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+) -> pd.Series:
     """
-    yfinance niekedy vráti MultiIndex stĺpce, takže df["High"] môže byť DataFrame.
-    Táto funkcia zoberie prvý vnútorný stĺpec a vráti vždy Series.
+    ATR z troch jednoduchých sérií (High/Low/Close).
+    Vráti Series s rovnakým indexom ako vstup.
     """
-    if isinstance(col, pd.DataFrame):
-        # napr. ('High', 'AAPL') → vezmeme prvý vnútorný
-        col = col.iloc[:, 0]
-    return pd.Series(col)
-
-
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Wilder ATR.
-    Očakáva stĺpce: High, Low, Close (môžu byť aj MultiIndex).
-    Vráti vždy pd.Series so spoločným indexom.
-    """
-    high_raw = df["High"]
-    low_raw = df["Low"]
-    close_raw = df["Close"]
-
-    high = pd.to_numeric(_ensure_series(high_raw), errors="coerce")
-    low = pd.to_numeric(_ensure_series(low_raw), errors="coerce")
-    close = pd.to_numeric(_ensure_series(close_raw), errors="coerce")
-
     prev_close = close.shift(1)
 
     tr1 = (high - low).abs()
@@ -97,9 +78,8 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr3 = (low - prev_close).abs()
 
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
     atr = tr.rolling(window=period, min_periods=period).mean()
-    atr = pd.Series(atr, index=df.index, name="atr")
+    atr.name = "atr"
     return atr
 
 
@@ -114,39 +94,46 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Jednoduché featury – neskôr vieme doladiť tak, aby presne sedeli
-    s jobs/make_signals_ml.py (tréning).
+    Vstup: DataFrame s jednoduchými stĺpcami Open, High, Low, Close, Volume (bez MultiIndex).
+    Výstup: DataFrame s pridanými featurami (ATR, EMA, RSI, returns, volatila, vol_rel).
     """
     out = df.copy()
 
-    # Uistíme sa, že základné OHLCV sú Series a numerické
+    # Uistíme sa, že OHLCV sú jedno-dimenzionálne Series a numerické
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in out.columns:
-            out[c] = pd.to_numeric(_ensure_series(out[c]), errors="coerce")
+            out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # ATR
-    out["atr"] = compute_atr(out, ATR_PERIOD)
-    out["atr_pct"] = out["atr"] / out["Close"]
+    # Základné série
+    close = out["Close"]
+    high = out["High"]
+    low = out["Low"]
+    volume = out["Volume"]
+
+    # ATR ako Series
+    atr_series = compute_atr_from_ohlc(high, low, close, ATR_PERIOD)
+    out["atr"] = atr_series
+    out["atr_pct"] = atr_series / close
 
     # EMAs
-    out["ema_fast"] = out["Close"].ewm(span=10, adjust=False).mean()
-    out["ema_slow"] = out["Close"].ewm(span=30, adjust=False).mean()
-    out["ema_diff_pct"] = (out["ema_fast"] - out["ema_slow"]) / out["Close"]
+    out["ema_fast"] = close.ewm(span=10, adjust=False).mean()
+    out["ema_slow"] = close.ewm(span=30, adjust=False).mean()
+    out["ema_diff_pct"] = (out["ema_fast"] - out["ema_slow"]) / close
 
     # Returns
-    out["ret_1"] = out["Close"].pct_change(1)
-    out["ret_3"] = out["Close"].pct_change(3)
-    out["ret_5"] = out["Close"].pct_change(5)
+    out["ret_1"] = close.pct_change(1)
+    out["ret_3"] = close.pct_change(3)
+    out["ret_5"] = close.pct_change(5)
 
     # Volatility
-    out["vol_10"] = out["Close"].pct_change().rolling(10).std()
+    out["vol_10"] = close.pct_change().rolling(10).std()
 
     # RSI
-    out["rsi_14"] = compute_rsi(out["Close"], 14)
+    out["rsi_14"] = compute_rsi(close, 14)
 
     # Volume relative
-    vol_ma = out["Volume"].rolling(50).mean()
-    out["vol_rel"] = out["Volume"] / vol_ma
+    vol_ma = volume.rolling(50).mean()
+    out["vol_rel"] = volume / vol_ma
 
     out = out.dropna()
     return out
@@ -158,7 +145,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 class EnsembleModel:
     """
-    Jednoduchý wrapper – pokúsi sa použiť GBC model, ak zlyhá,
+    Wrapper – pokúsi sa použiť GBC model, ak zlyhá,
     spadne na rule-based skórovanie.
     """
 
@@ -239,7 +226,19 @@ def position_size(entry_px: float, sl_px: float, risk_usd: float) -> float:
     return max(0.0, math.floor(qty))
 
 
-def backtest_symbol(symbol: str, model: EnsembleModel) -> (pd.DataFrame, pd.DataFrame):
+def _flatten_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance môže vrátiť MultiIndex columns.
+    Pre single ticker si to zjednodušíme:
+    - ak je MultiIndex, vezmeme prvú úroveň (Open, High, Low, Close, Volume)
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # napr. ('Open', 'AAPL') → 'Open'
+        df.columns = [c[0] for c in df.columns]
+    return df
+
+
+def backtest_symbol(symbol: str, model: EnsembleModel) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Backtest pre jeden symbol.
     Vráti:
@@ -265,13 +264,15 @@ def backtest_symbol(symbol: str, model: EnsembleModel) -> (pd.DataFrame, pd.Data
         print(f"[backtest] No data for {symbol}, skipping.")
         return pd.DataFrame(), pd.DataFrame()
 
-    # Uistíme sa, že máme základné stĺpce
-    cols = []
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
-        if c in df.columns:
-            cols.append(c)
-    df = df[cols].copy()
+    df = _flatten_yf_df(df)
 
+    # Uistíme sa, že máme základné stĺpce
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if not cols:
+        print(f"[backtest] No OHLCV columns for {symbol}, skipping.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = df[cols].copy()
     df = build_features(df)
 
     if df.empty:
