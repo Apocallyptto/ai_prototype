@@ -5,18 +5,20 @@ jobs/backtest_ensemble.py
 Jednoduchý backtester pre tvoj 5m "ensemble / ML" prístup.
 
 - Sťahuje historické 5m sviečky (yfinance)
-- Vypočíta technické featury (ATR, EMA, RSI, returns)
-- Pokúsi sa načítať model models/gbc_5m.pkl (ak to zlyhá, ide bez modelu)
-- Simuluje len LONG obchody s ATR-based TP/SL
+- Vypočíta technické featury (ATR, EMA, RSI, returns, volume)
+- Pokúsi sa načítať model models/gbc_5m.pkl (ak to zlyhá, použije rule-based fallback)
+- Simuluje LONG obchody s ATR-based TP/SL
 - Ukladá výsledky do CSV a vypisuje štatistiky
 
-Toto je prvá verzia – neskôr ju prispôsobíme presne tvojim live pravidlám.
+Verzia je napísaná robustnejšie:
+- zvláda aj MultiIndex stĺpce z yfinance
+- ATR vždy vracia Series, nie DataFrame
 """
 
 import os
 import math
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
 import numpy as np
@@ -27,9 +29,9 @@ from joblib import load as joblib_load
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-# -----------------------------
+# =============================
 # Konfigurácia / env premenné
-# -----------------------------
+# =============================
 
 def get_env(name: str, default: str) -> str:
     v = os.getenv(name)
@@ -37,7 +39,7 @@ def get_env(name: str, default: str) -> str:
 
 
 BACKTEST_SYMBOLS = get_env("BACKTEST_SYMBOLS", "AAPL,MSFT,SPY").split(",")
-BACKTEST_DAYS = int(get_env("BACKTEST_DAYS", "60"))  # koľko dní dozadu
+BACKTEST_DAYS = int(get_env("BACKTEST_DAYS", "60"))
 BACKTEST_INTERVAL = get_env("BACKTEST_INTERVAL", "5m")
 
 # ATR-based exits
@@ -48,30 +50,45 @@ SL_ATR_MULT = float(get_env("BACKTEST_SL_ATR_MULT", "1.0"))
 # Model
 MODEL_DIR = get_env("MODEL_DIR", "models")
 MODEL_FILENAME = get_env("MODEL_FILENAME", "gbc_5m.pkl")
-MIN_STRENGTH = float(get_env("BACKTEST_MIN_STRENGTH", "0.55"))  # prah pre "silný" signál
+MIN_STRENGTH = float(get_env("BACKTEST_MIN_STRENGTH", "0.55"))
 
 # Obchodovanie
-MAX_HOLD_BARS = int(get_env("BACKTEST_MAX_HOLD_BARS", "30"))  # max počet barov v obchode
-RISK_PER_TRADE_USD = float(get_env("BACKTEST_RISK_PER_TRADE_USD", "1000"))  # len pre sizing v backteste
+MAX_HOLD_BARS = int(get_env("BACKTEST_MAX_HOLD_BARS", "30"))
+RISK_PER_TRADE_USD = float(get_env("BACKTEST_RISK_PER_TRADE_USD", "1000"))
 START_EQUITY = float(get_env("BACKTEST_START_EQUITY", "100000"))
 
 OUT_TRADES_CSV = get_env("BACKTEST_TRADES_CSV", "backtest_trades.csv")
 OUT_EQUITY_CSV = get_env("BACKTEST_EQUITY_CSV", "backtest_equity_curve.csv")
 
 
-# -----------------------------
-# Technické indikátory
-# -----------------------------
+# =============================
+# Technické indikátory / featury
+# =============================
+
+def _ensure_series(col) -> pd.Series:
+    """
+    yfinance niekedy vráti MultiIndex stĺpce, takže df["High"] môže byť DataFrame.
+    Táto funkcia zoberie prvý vnútorný stĺpec a vráti vždy Series.
+    """
+    if isinstance(col, pd.DataFrame):
+        # napr. ('High', 'AAPL') → vezmeme prvý vnútorný
+        col = col.iloc[:, 0]
+    return pd.Series(col)
+
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
     Wilder ATR.
-    Očakáva stĺpce: High, Low, Close.
+    Očakáva stĺpce: High, Low, Close (môžu byť aj MultiIndex).
     Vráti vždy pd.Series so spoločným indexom.
     """
-    high = pd.to_numeric(df["High"], errors="coerce")
-    low = pd.to_numeric(df["Low"], errors="coerce")
-    close = pd.to_numeric(df["Close"], errors="coerce")
+    high_raw = df["High"]
+    low_raw = df["Low"]
+    close_raw = df["Close"]
+
+    high = pd.to_numeric(_ensure_series(high_raw), errors="coerce")
+    low = pd.to_numeric(_ensure_series(low_raw), errors="coerce")
+    close = pd.to_numeric(_ensure_series(close_raw), errors="coerce")
 
     prev_close = close.shift(1)
 
@@ -79,15 +96,11 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
 
-    # TR je Series: max z troch sérii po riadkoch
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
     atr = tr.rolling(window=period, min_periods=period).mean()
-
-    # istota, že vrátime Series, nie DataFrame
     atr = pd.Series(atr, index=df.index, name="atr")
     return atr
-
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -101,13 +114,15 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Jednoduché featury – možno nebude 100% matchovať presné featury
-    pôvodného tréningu, ale dá nám základ.
-
-    Ak tvoj model očakáva iné featury, neskôr túto funkciu zladíme
-    s jobs/make_signals_ml.py.
+    Jednoduché featury – neskôr vieme doladiť tak, aby presne sedeli
+    s jobs/make_signals_ml.py (tréning).
     """
     out = df.copy()
+
+    # Uistíme sa, že základné OHLCV sú Series a numerické
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(_ensure_series(out[c]), errors="coerce")
 
     # ATR
     out["atr"] = compute_atr(out, ATR_PERIOD)
@@ -137,9 +152,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# -----------------------------
-# Model scoring
-# -----------------------------
+# =============================
+# Model scoring / ensemble
+# =============================
 
 class EnsembleModel:
     """
@@ -165,16 +180,14 @@ class EnsembleModel:
 
     def score(self, row: pd.Series) -> float:
         """
-        Vráti "strength" v intervale približne [-1, 1] (long / short edge).
-        Teraz implementujeme len LONG edge (0..1), short ignorujeme.
+        Vráti "strength" ~ [0,1] pre long edge.
 
-        - Ak je model k dispozícii a predikcia prebehne OK, použijeme jeho pravdepodobnosť
+        - Ak je model k dispozícii, použijeme jeho pravdepodobnosť
         - Inak použijeme rule-based kombináciu EMA + RSI
         """
         # Rule-based fallback (EMA + RSI)
         rule_strength = 0.0
         if row["ema_fast"] > row["ema_slow"] and 50 < row["rsi_14"] < 70:
-            # základný edge
             rule_strength = 0.6
         elif row["ema_fast"] > row["ema_slow"] and 40 < row["rsi_14"] <= 50:
             rule_strength = 0.5
@@ -183,13 +196,12 @@ class EnsembleModel:
         else:
             rule_strength = 0.3
 
-        # Ak nemáme model – len pravidlo
+        # Ak nemáme model – len pravidlá
         if not self.used_model or self.model is None:
             return rule_strength
 
         # Skús model
         try:
-            # vyberieme numeric featury (môžeš zmeniť podľa reálneho tréningu)
             feature_cols = [
                 "atr_pct",
                 "ema_diff_pct",
@@ -202,20 +214,19 @@ class EnsembleModel:
             ]
             X = row[feature_cols].values.reshape(1, -1)
             proba = self.model.predict_proba(X)[0][1]  # pravdepodobnosť "up"
+
             # Ensemble: 50% model, 50% rule
             strength = 0.5 * rule_strength + 0.5 * float(proba)
             return float(strength)
         except Exception as e:
-            # Ak nastane chyba (napr. iný počet featur) – log a fallback
-            # (v backteste nechceme crashnúť)
             print(f"[backtest] Model predict error: {e}, using rule_strength only")
             self.used_model = False
             return rule_strength
 
 
-# -----------------------------
+# =============================
 # Backtest jadro
-# -----------------------------
+# =============================
 
 def position_size(entry_px: float, sl_px: float, risk_usd: float) -> float:
     """Jednoduchý sizing: risk_usd / (entry - SL)."""
@@ -235,8 +246,10 @@ def backtest_symbol(symbol: str, model: EnsembleModel) -> (pd.DataFrame, pd.Data
       - trades_df
       - equity_df
     """
+    symbol = symbol.strip().upper()
     print(f"[backtest] Downloading data for {symbol}...")
-    end = datetime.utcnow()
+
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=BACKTEST_DAYS)
 
     df = yf.download(
@@ -252,7 +265,13 @@ def backtest_symbol(symbol: str, model: EnsembleModel) -> (pd.DataFrame, pd.Data
         print(f"[backtest] No data for {symbol}, skipping.")
         return pd.DataFrame(), pd.DataFrame()
 
-    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    # Uistíme sa, že máme základné stĺpce
+    cols = []
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c in df.columns:
+            cols.append(c)
+    df = df[cols].copy()
+
     df = build_features(df)
 
     if df.empty:
@@ -303,7 +322,11 @@ def backtest_symbol(symbol: str, model: EnsembleModel) -> (pd.DataFrame, pd.Data
 
             if exit_px is not None:
                 pnl = (exit_px - entry_px) * qty
-                r_multiple = pnl / (entry_px - sl_px) / qty if qty > 0 and entry_px > sl_px else np.nan
+                r_multiple = (
+                    pnl / ((entry_px - sl_px) * qty)
+                    if qty > 0 and entry_px > sl_px
+                    else np.nan
+                )
                 equity += pnl
 
                 trades.append(
@@ -329,20 +352,20 @@ def backtest_symbol(symbol: str, model: EnsembleModel) -> (pd.DataFrame, pd.Data
                 qty = 0.0
                 bars_in_trade = 0
 
-            # ak sme ešte neexituje, pokračujeme na ďalší bar
+            # pokračuj na ďalší bar
             continue
 
-        # Ak sme bez pozície – hľadáme nový long setup
+        # Bez pozície – hľadáme nový long setup
         strength = row["strength"]
 
         if strength < MIN_STRENGTH:
-            continue  # žiadny vstup
+            continue
 
         if pd.isna(atr) or atr <= 0:
             continue
 
         # ATR-based levels
-        entry_px = close  # vstup na close bar-u
+        entry_px = close
         sl_px = entry_px - SL_ATR_MULT * atr
         tp_px = entry_px + TP_ATR_MULT * atr
 
@@ -360,6 +383,10 @@ def backtest_symbol(symbol: str, model: EnsembleModel) -> (pd.DataFrame, pd.Data
     return trades_df, equity_df
 
 
+# =============================
+# Štatistiky a main()
+# =============================
+
 def summarize_trades(trades: pd.DataFrame):
     if trades.empty:
         print("[backtest] No trades generated.")
@@ -368,17 +395,16 @@ def summarize_trades(trades: pd.DataFrame):
     total_trades = len(trades)
     wins = (trades["pnl"] > 0).sum()
     losses = (trades["pnl"] < 0).sum()
-    winrate = wins / total_trades * 100 if total_trades > 0 else 0
+    winrate = wins / total_trades * 100 if total_trades > 0 else 0.0
 
     gross_pnl = trades["pnl"].sum()
     avg_pnl = trades["pnl"].mean()
     avg_r = trades["r_mult"].replace([np.inf, -np.inf], np.nan).dropna().mean()
 
-    # jednoduchý max drawdown z equity z trade-ov
     eq = trades["pnl"].cumsum()
     running_max = eq.cummax()
     drawdown = eq - running_max
-    max_dd = drawdown.min()
+    max_dd = drawdown.min() if not drawdown.empty else 0.0
 
     print("\n========== BACKTEST SUMMARY ==========")
     print(f"Total trades: {total_trades}")
@@ -398,7 +424,7 @@ def main():
     all_equity = []
 
     for sym in BACKTEST_SYMBOLS:
-        sym = sym.strip().upper()
+        sym = sym.strip()
         if not sym:
             continue
         trades_df, equity_df = backtest_symbol(sym, model)
