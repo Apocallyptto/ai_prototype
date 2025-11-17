@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 # --- Ensure project root (/app) is on sys.path inside Docker ---
 ROOT = Path(__file__).resolve().parent.parent  # /app
@@ -23,9 +25,6 @@ from jobs.risk_limits import (
     compute_qty_for_long,
     can_open_new_position,
 )
-
-# Your existing order router
-from services.order_router import place_entry
 
 log = logging.getLogger("signal_executor")
 logging.basicConfig(
@@ -207,12 +206,11 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
 
     # 3) entry price (simple approximation; no market data client)
     entry_px = DEFAULT_ENTRY_PRICE
-    # placeholder ATR and SL/TP just so risk sizing has some structure
     atr = entry_px * 0.01  # 1 % volatility proxy
-    sl_px = entry_px - atr  # 1 % down
-    tp_px = entry_px + 1.5 * atr  # 1.5 % up
+    sl_px = entry_px - atr
+    tp_px = entry_px + 1.5 * atr
 
-    # 4) risk-based sizing (still uses our limits)
+    # 4) risk-based sizing
     qty = compute_qty_for_long(
         entry_price=entry_px,
         stop_loss_price=sl_px,
@@ -232,34 +230,23 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
         mark_signal(conn, signal_id, status="skipped_risk", error="qty_zero")
         return
 
-    # 5) place order via router
+    # 5) submit simple market order (no TP/SL yet – aby sme nemali 'take_profit' chybu)
     client_id = str(uuid.uuid4())
-    try:
-        o = place_entry(
-            tc,
-            symbol=symbol,
-            side=side,
-            use_limit=False,
-            qty=qty,
-            client_order_id=client_id,
-            # TODO: keď budeš mať v routeri podporu TP/SL, možeš ich sem doplniť
-            # tp_price=tp_px,
-            # sl_price=sl_px,
-        )
-    except TypeError:
-        # fallback ak router nepodporuje client_order_id
-        o = place_entry(
-            tc,
-            symbol=symbol,
-            side=side,
-            use_limit=False,
-            qty=qty,
-        )
+    order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
+    order_req = MarketOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=order_side,
+        time_in_force=TimeInForce.DAY,
+        client_order_id=client_id,
+    )
+
+    o = tc.submit_order(order_req)
     oid, coid, xoid = _extract_ids(o)
 
     log.info(
-        "submitted with risk: %s %s | qty=%s | entry=%.2f | tp=%.2f | sl=%.2f | oid=%s client_order_id=%s",
+        "submitted with risk: %s %s | qty=%s | entry=%.2f (approx) | tp=%.2f | sl=%.2f | oid=%s client_order_id=%s",
         symbol,
         side,
         qty,
