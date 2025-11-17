@@ -12,25 +12,20 @@ import psycopg2
 import psycopg2.extras
 from alpaca.trading.client import TradingClient
 
-# Alpaca market data client (for latest trade / price)
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
-
 # --- Ensure project root (/app) is on sys.path inside Docker ---
 ROOT = Path(__file__).resolve().parent.parent  # /app
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# risk layer imports
+# Risk layer
 from jobs.risk_limits import (
     load_limits_from_env,
     compute_qty_for_long,
     can_open_new_position,
 )
 
-# Order router (your existing one)
+# Your existing order router
 from services.order_router import place_entry
-
 
 log = logging.getLogger("signal_executor")
 logging.basicConfig(
@@ -49,7 +44,7 @@ def _env_bool(name: str, default_true: bool = True) -> bool:
     v = os.getenv(name)
     if v is None:
         return default_true
-    return str(v).strip() not in ("0", "false", "False", "no", "No")
+    return str(v).strip().lower() not in ("0", "false", "no")
 
 
 SYMBOLS: List[str] = [
@@ -66,16 +61,15 @@ ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_API_SECRET")
 ALPACA_PAPER = _env_bool("ALPACA_PAPER", default_true=True)
 
-# Load risk limits at startup
+# Risk config
 RISK_LIMITS = load_limits_from_env()
 
-# Alpaca clients
-TRADING_CLIENT: Optional[TradingClient] = None
-DATA_CLIENT: Optional[StockHistoricalDataClient] = None
+# Fallback entry price (approximate, just for sizing)
+DEFAULT_ENTRY_PRICE: float = float(os.getenv("DEFAULT_ENTRY_PRICE", "200.0"))
 
 
 # -----------------------
-# DB Helpers
+# DB helpers
 # -----------------------
 
 def get_conn():
@@ -184,30 +178,6 @@ def _extract_ids(o: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
 
 
 # -----------------------
-# Helper: get entry price
-# -----------------------
-
-def get_entry_price(symbol: str) -> Optional[float]:
-    """
-    Use Alpaca StockHistoricalDataClient to fetch latest trade price.
-    Return None if not available.
-    """
-    global DATA_CLIENT
-    if DATA_CLIENT is None:
-        return None
-
-    try:
-        req = StockLatestTradeRequest(symbol_or_symbols=symbol)
-        trade = DATA_CLIENT.get_stock_latest_trade(req)
-        # For single symbol, this should be a LatestTrade object
-        price = float(trade.price)
-        return price
-    except Exception as e:
-        log.warning("failed to get latest trade for %s: %s", symbol, e)
-        return None
-
-
-# -----------------------
 # Risk-aware processing
 # -----------------------
 
@@ -235,21 +205,14 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
     except Exception:
         equity = 0.0
 
-    # 3) entry price from market data
-    entry_px = get_entry_price(symbol)
-    if entry_px is None or entry_px <= 0:
-        err = f"no_entry_price_for_{symbol}"
-        log.warning("risk_guard: %s, SKIPPING signal id=%s symbol=%s", err, signal_id, symbol)
-        mark_signal(conn, signal_id, status="error", error=err)
-        return
+    # 3) entry price (simple approximation; no market data client)
+    entry_px = DEFAULT_ENTRY_PRICE
+    # placeholder ATR and SL/TP just so risk sizing has some structure
+    atr = entry_px * 0.01  # 1 % volatility proxy
+    sl_px = entry_px - atr  # 1 % down
+    tp_px = entry_px + 1.5 * atr  # 1.5 % up
 
-    # TODO: neskôr nahradíme skutočným ATR/SL/TP z tvojich ATR nástrojov / DB
-    # Teraz iba placeholder, aby risk vrstvy fungovali.
-    atr = 0.5
-    sl_px = entry_px - 1.0 * atr
-    tp_px = entry_px + 1.5 * atr
-
-    # 4) risk-based sizing
+    # 4) risk-based sizing (still uses our limits)
     qty = compute_qty_for_long(
         entry_price=entry_px,
         stop_loss_price=sl_px,
@@ -279,12 +242,12 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
             use_limit=False,
             qty=qty,
             client_order_id=client_id,
-            # NOTE: if your router supports tp/sl, you can pass them here too
+            # TODO: keď budeš mať v routeri podporu TP/SL, možeš ich sem doplniť
             # tp_price=tp_px,
             # sl_price=sl_px,
         )
     except TypeError:
-        # fallback if router does not accept client_order_id
+        # fallback ak router nepodporuje client_order_id
         o = place_entry(
             tc,
             symbol=symbol,
@@ -327,11 +290,13 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
 
 def loop(tc: TradingClient, conn) -> None:
     log.info(
-        "signal_executor starting | MIN_STRENGTH=0.60 | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | RISK=%s",
+        "signal_executor starting | MIN_STRENGTH=%.2f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | RISK=%s | DEFAULT_ENTRY_PRICE=%.2f",
+        MIN_STRENGTH,
         ",".join(SYMBOLS),
         PORTFOLIO_ID or "",
         POLL_SECONDS,
         RISK_LIMITS,
+        DEFAULT_ENTRY_PRICE,
     )
     while True:
         try:
@@ -371,12 +336,19 @@ def loop(tc: TradingClient, conn) -> None:
 
 
 def main():
-    global TRADING_CLIENT, DATA_CLIENT
-
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET must be set")
 
-    # Trading client
-    TRADING_CLIENT = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
+    tc = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
+    conn = get_conn()
+    try:
+        loop(tc, conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-    # Market data client (same keys; for paper it uses free data where allow
+
+if __name__ == "__main__":
+    main()
