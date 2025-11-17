@@ -14,105 +14,93 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: trader
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
 
-  # 🔧 keep whatever you already have for executor image/build
-  executor:
-    image: ai_prototype-executor
-    container_name: trader_executor
-    depends_on:
-      - postgres
-    environment:
-      DB_URL: ${DB_URL}
-      ALPACA_API_KEY: ${ALPACA_API_KEY}
-      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: ${ALPACA_PAPER:-1}
-    # no command: used for one-off runs (docker compose run --rm executor ...)
-
-  # 🔧 your signal runner
   signal_executor:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
     container_name: trader_signal_executor
     depends_on:
       postgres:
-        condition: service_started
-        required: true
+        condition: service_healthy
+    restart: always
     environment:
-      ALLOW_AFTER_HOURS: "0"
-      ALPACA_API_KEY: PKQBHFISALV4GKDTBDHEFDN6K7
-      ALPACA_API_SECRET: ASnJK4UkkzVpSqzB1ZPPqEqEkd2U2zxybFpxRY8ZWUb6
-      ALPACA_PAPER: "1"
+      # --- DB ---
       DB_URL: postgresql://postgres:postgres@postgres:5432/trader
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/trader   # 👈 ADD THIS
-      FIXED_QTY: "0.05"
-      MIN_STRENGTH: "0.60"
-      NOTIONAL_USD: ""
-      PORTFOLIO_ID: paper-core
-      SYMBOLS: AAPL,MSFT,SPY,NVDA,AMD
-    image: ai_prototype-signal_executor
 
+      # --- Alpaca ---
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      ALPACA_PAPER: "1"
+
+      # --- Runtime ---
+      SYMBOLS: "AAPL,MSFT,SPY"
+      MIN_STRENGTH: "0.60"
+      SIGNAL_POLL_SECONDS: "20"
+      PORTFOLIO_ID: ""
+      LOG_LEVEL: "INFO"
+
+      # --- Risk limits ---
+      MAX_RISK_PER_TRADE_USD: "50"
+      MAX_RISK_PER_TRADE_PCT: "0.003"       # 0.3% of total equity
+      MAX_NOTIONAL_PER_TRADE_USD: "1000"
+      MAX_OPEN_POSITIONS: "3"
+
+    volumes:
+      - .:/app
+    command: >
+      sh -lc '
+        python -u services/signal_executor.py
+      '
 
   sync_orders:
-    image: ai_prototype-executor
+    build:
+      context: .
+      dockerfile: ./Dockerfile
     container_name: trader_sync_orders
     depends_on:
       postgres:
-        condition: service_started
+        condition: service_healthy
+    restart: always
     environment:
-      DB_URL: ${DB_URL}
+      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: ${ALPACA_PAPER:-1}
-      LOOKBACK_DAYS: "3"
-      STALE_MINUTES: "20"
+      ALPACA_PAPER: "1"
+      LOG_LEVEL: "INFO"
     volumes:
-      - .:/app    # dev bind mount so the container uses your latest code
+      - .:/app
     command: >
-      sh -lc 'while true; do
-        python -u tools/sync_orders.py || true;
-        sleep 60;
-      done'
-
+      sh -lc '
+        python -u services/sync_orders.py
+      '
 
   oco_exit_monitor:
-    image: ai_prototype-executor
+    build:
+      context: .
+      dockerfile: ./Dockerfile
     container_name: trader_oco_exit_monitor
     depends_on:
       postgres:
-        condition: service_started
-        required: true
+        condition: service_healthy
+    restart: always
     environment:
-      # --- DB ---
-      DB_URL: ${DB_URL}
-
-      # --- Broker ---
+      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
-      ALPACA_PAPER: ${ALPACA_PAPER:-1}
-
-      # --- Universe / risk knobs ---
-      SYMBOLS: "AAPL,MSFT,SPY,NVDA,AMD"
-      TP_ATR_MULT: "1.5"
-      SL_ATR_MULT: "1.0"
-      MIN_NOTIONAL: "1.00"
-      MIN_QTY: "0.001"
-
-      # --- Runtime behavior ---
-      EXIT_MONITOR_POLL_SECONDS: "15"
-      EXIT_COOLDOWN_SECONDS: "45"
-      ALLOW_AFTER_HOURS: "1"     # TP can be placed AH; SL will be respected only RTH by broker
+      ALPACA_PAPER: "1"
+      ALLOW_AFTER_HOURS: "1"
       LOG_LEVEL: "INFO"
-    # Dev convenience: always use your latest repo code inside the container
     volumes:
       - .:/app
     command: >
       sh -lc '
         python -u services/oco_exit_monitor.py
       '
-
-
 
 volumes:
   pgdata:
