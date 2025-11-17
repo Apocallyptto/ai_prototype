@@ -12,6 +12,10 @@ import psycopg2
 import psycopg2.extras
 from alpaca.trading.client import TradingClient
 
+# Alpaca market data client (for latest trade / price)
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
+
 # --- Ensure project root (/app) is on sys.path inside Docker ---
 ROOT = Path(__file__).resolve().parent.parent  # /app
 if str(ROOT) not in sys.path:
@@ -64,6 +68,10 @@ ALPACA_PAPER = _env_bool("ALPACA_PAPER", default_true=True)
 
 # Load risk limits at startup
 RISK_LIMITS = load_limits_from_env()
+
+# Alpaca clients
+TRADING_CLIENT: Optional[TradingClient] = None
+DATA_CLIENT: Optional[StockHistoricalDataClient] = None
 
 
 # -----------------------
@@ -176,6 +184,30 @@ def _extract_ids(o: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
 
 
 # -----------------------
+# Helper: get entry price
+# -----------------------
+
+def get_entry_price(symbol: str) -> Optional[float]:
+    """
+    Use Alpaca StockHistoricalDataClient to fetch latest trade price.
+    Return None if not available.
+    """
+    global DATA_CLIENT
+    if DATA_CLIENT is None:
+        return None
+
+    try:
+        req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+        trade = DATA_CLIENT.get_stock_latest_trade(req)
+        # For single symbol, this should be a LatestTrade object
+        price = float(trade.price)
+        return price
+    except Exception as e:
+        log.warning("failed to get latest trade for %s: %s", symbol, e)
+        return None
+
+
+# -----------------------
 # Risk-aware processing
 # -----------------------
 
@@ -203,9 +235,13 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
     except Exception:
         equity = 0.0
 
-    # 3) entry price (simple: last trade)
-    last_trade = tc.get_last_trade(symbol)
-    entry_px = float(last_trade.price)
+    # 3) entry price from market data
+    entry_px = get_entry_price(symbol)
+    if entry_px is None or entry_px <= 0:
+        err = f"no_entry_price_for_{symbol}"
+        log.warning("risk_guard: %s, SKIPPING signal id=%s symbol=%s", err, signal_id, symbol)
+        mark_signal(conn, signal_id, status="error", error=err)
+        return
 
     # TODO: neskôr nahradíme skutočným ATR/SL/TP z tvojich ATR nástrojov / DB
     # Teraz iba placeholder, aby risk vrstvy fungovali.
@@ -291,8 +327,7 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
 
 def loop(tc: TradingClient, conn) -> None:
     log.info(
-        "signal_executor starting | MIN_STRENGTH=%.2f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | RISK=%s",
-        MIN_STRENGTH,
+        "signal_executor starting | MIN_STRENGTH=0.60 | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | RISK=%s",
         ",".join(SYMBOLS),
         PORTFOLIO_ID or "",
         POLL_SECONDS,
@@ -336,19 +371,12 @@ def loop(tc: TradingClient, conn) -> None:
 
 
 def main():
+    global TRADING_CLIENT, DATA_CLIENT
+
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET must be set")
 
-    tc = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
-    conn = get_conn()
-    try:
-        loop(tc, conn)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    # Trading client
+    TRADING_CLIENT = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
 
-
-if __name__ == "__main__":
-    main()
+    # Market data client (same keys; for paper it uses free data where allow
