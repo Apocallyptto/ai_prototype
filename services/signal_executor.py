@@ -10,9 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
 import psycopg2.extras
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
 
 # --- Ensure project root (/app) is on sys.path inside Docker ---
 ROOT = Path(__file__).resolve().parent.parent  # /app
@@ -63,11 +67,11 @@ ALPACA_PAPER = _env_bool("ALPACA_PAPER", default_true=True)
 # Risk config
 RISK_LIMITS = load_limits_from_env()
 
-# Fallback entry price (approximate, just for sizing)
+# Fallback entry price (ak by zlyhalo data API)
 DEFAULT_ENTRY_PRICE: float = float(os.getenv("DEFAULT_ENTRY_PRICE", "200.0"))
 
-# ATR multipliers pre TP/SL (veľmi jednoduché,  ATR ~ 1 % ceny)
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))  # zatiaľ nepoužité, ale nech je pripravené
+# ATR multipliers pre TP/SL
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))  # zatiaľ len placeholder
 ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))    # 1 % ceny ako proxy ATR
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
@@ -183,6 +187,42 @@ def _extract_ids(o: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
 
 
 # -----------------------
+# Price helper (Alpaca data)
+# -----------------------
+
+_data_client: Optional[StockHistoricalDataClient] = None
+
+
+def get_data_client() -> StockHistoricalDataClient:
+    global _data_client
+    if _data_client is None:
+        _data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+    return _data_client
+
+
+def get_last_price(symbol: str) -> float:
+    """
+    Skúsi získať posledný trade z Alpaca data API.
+    Ak zlyhá, použije DEFAULT_ENTRY_PRICE.
+    """
+    try:
+        dc = get_data_client()
+        req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+        out = dc.get_stock_latest_trade(req)
+        trade = out[symbol]
+        price = float(trade.price)
+        return price
+    except Exception as e:
+        log.warning(
+            "failed to get last price for %s from data API (%s), using DEFAULT_ENTRY_PRICE=%.2f",
+            symbol,
+            e,
+            DEFAULT_ENTRY_PRICE,
+        )
+        return DEFAULT_ENTRY_PRICE
+
+
+# -----------------------
 # Risk-aware processing
 # -----------------------
 
@@ -210,17 +250,17 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
     except Exception:
         equity = 0.0
 
-    # 3) entry price (simple approximation; no market data client)
-    entry_px = DEFAULT_ENTRY_PRICE
+    # 3) entry price = reálna posledná cena z data API (alebo fallback)
+    entry_px = get_last_price(symbol)
 
-    # veľmi jednoduché ATR: percento z ceny (napr. 1 %)
+    # jednoduchý ATR: percento z ceny (napr. 1 %)
     atr = entry_px * ATR_PCT
 
     if side.lower() == "buy":
         sl_px = entry_px - SL_ATR_MULT * atr
         tp_px = entry_px + TP_ATR_MULT * atr
     else:
-        # pre short – len pre kompletnoť, aj keď teraz hlavne riešime long
+        # pre short – len pre úplnosť
         sl_px = entry_px + SL_ATR_MULT * atr
         tp_px = entry_px - TP_ATR_MULT * atr
 
@@ -263,7 +303,7 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
     oid, coid, xoid = _extract_ids(o)
 
     log.info(
-        "submitted BRACKET: %s %s | qty=%s | entry=%.2f (approx) | tp=%.2f | sl=%.2f | oid=%s client_order_id=%s",
+        "submitted BRACKET: %s %s | qty=%s | entry=%.2f | tp=%.2f | sl=%.2f | oid=%s client_order_id=%s",
         symbol,
         side,
         qty,
