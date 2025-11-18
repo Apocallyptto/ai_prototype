@@ -21,6 +21,7 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build numeric ML features from OHLCV dataframe.
     This function MUST remain torch-free so Docker can use it.
+    Expected columns: ['Open','High','Low','Close','Volume'] at least.
     """
     out = df.copy()
 
@@ -49,70 +50,85 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------
-# OPTIONAL TORCH-BASED MODEL (only used LOCALLY)
+# OPTIONAL TORCH-BASED MODEL (only defined if torch is present)
 # ------------------------------------------------------------
-class PriceDirectionModel(nn.Module):
-    """
-    Tiny neural network classifier.
-    Only available when torch is installed.
-    """
-    def __init__(self, n_features: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 2)  # up vs down
-        )
+if torch is not None and nn is not None and optim is not None:
 
-    def forward(self, x):
-        return self.net(x)
+    class PriceDirectionModel(nn.Module):
+        """
+        Tiny neural network classifier.
+        Only available when torch is installed.
+        """
+        def __init__(self, n_features: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(n_features, 32),
+                nn.ReLU(),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+                nn.Linear(16, 2)  # up vs down
+            )
+
+        def forward(self, x):
+            return self.net(x)
 
 
-def train_model(X: np.ndarray, y: np.ndarray, epochs=50, lr=1e-3):
-    """
-    Training function — ONLY AVAILABLE when PyTorch exists.
-    Used for offline training only.
-    """
-    if torch is None:
+    def train_model(X: np.ndarray, y: np.ndarray, epochs=50, lr=1e-3):
+        """
+        Training function — ONLY used in local/offline training.
+        Requires torch to be installed.
+        """
+        X_t = torch.tensor(X, dtype=torch.float32)
+        y_t = torch.tensor(y, dtype=torch.long)
+
+        model = PriceDirectionModel(X.shape[1])
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        loss_fn = nn.CrossEntropyLoss()
+
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            pred = model(X_t)
+            loss = loss_fn(pred, y_t)
+            loss.backward()
+            optimizer.step()
+
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}, Loss: {loss.item():.5f}")
+
+        return model
+
+
+    def save_model(model, path: str):
+        torch.save(model.state_dict(), path)
+
+
+    def load_model(path: str, n_features: int):
+        model = PriceDirectionModel(n_features)
+        model.load_state_dict(torch.load(path, map_location="cpu"))
+        model.eval()
+        return model
+
+else:
+    # Torch is NOT available => define safe stubs so imports still work,
+    # but trying to train/load will clearly tell you what's wrong.
+    class PriceDirectionModel:  # simple placeholder, not used in Docker
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "PriceDirectionModel is not available because PyTorch is not installed "
+                "in this environment. Use it only in a local environment with torch."
+            )
+
+    def train_model(*args, **kwargs):
         raise RuntimeError(
-            "PyTorch is not available. Install torch locally to train the model."
+            "train_model() requires PyTorch. Install torch locally to train the model."
         )
 
-    X = torch.tensor(X, dtype=torch.float32)
-    y = torch.tensor(y, dtype=torch.long)
+    def save_model(*args, **kwargs):
+        raise RuntimeError(
+            "save_model() requires PyTorch. Install torch locally to train/save models."
+        )
 
-    model = PriceDirectionModel(X.shape[1])
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
-
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        pred = model(X)
-        loss = loss_fn(pred, y)
-        loss.backward()
-        optimizer.step()
-
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}, Loss: {loss.item():.5f}")
-
-    return model
-
-
-# ------------------------------------------------------------
-# SAVE / LOAD WRAPPERS (optional)
-# ------------------------------------------------------------
-def save_model(model, path: str):
-    if torch is None:
-        raise RuntimeError("Cannot save model — torch not available.")
-    torch.save(model.state_dict(), path)
-
-
-def load_model(path: str, n_features: int):
-    if torch is None:
-        raise RuntimeError("Cannot load model — torch not available.")
-    model = PriceDirectionModel(n_features)
-    model.load_state_dict(torch.load(path, map_location="cpu"))
-    model.eval()
-    return model
+    def load_model(*args, **kwargs):
+        raise RuntimeError(
+            "load_model() requires PyTorch. Install torch locally to load models."
+        )
