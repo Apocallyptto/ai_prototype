@@ -23,7 +23,7 @@ services:
     container_name: trader_signal_executor
     build:
       context: .
-      target: signal_executor
+      # target: signal_executor    # <-- TOTO ZMAZAŤ / NEPOUŽÍVAŤ
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,14 +50,13 @@ services:
 
       # --- Per-trade risk limits ---
       MAX_RISK_PER_TRADE_USD: "50"
-      MAX_RISK_PER_TRADE_PCT: "0.003"      # = 0.3 % z equity
+      MAX_RISK_PER_TRADE_PCT: "0.003"
       MAX_NOTIONAL_PER_TRADE_USD: "1000"
       MAX_OPEN_POSITIONS: "3"
 
-      # --- Daily loss guard (nové) ---
-      MAX_DAILY_LOSS_USD: "200"            # napr. -200 USD denne
-      MAX_DAILY_LOSS_PCT: "0.02"           # alebo 2 % z equity
-    
+      # --- Daily loss guard ---
+      MAX_DAILY_LOSS_USD: "200"
+      MAX_DAILY_LOSS_PCT: "0.02"
 
     volumes:
       - .:/app
