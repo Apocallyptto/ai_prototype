@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # --- Ensure project root (/app) is on sys.path inside Docker ---
 ROOT = Path(__file__).resolve().parent.parent  # /app
@@ -65,6 +65,12 @@ RISK_LIMITS = load_limits_from_env()
 
 # Fallback entry price (approximate, just for sizing)
 DEFAULT_ENTRY_PRICE: float = float(os.getenv("DEFAULT_ENTRY_PRICE", "200.0"))
+
+# ATR multipliers pre TP/SL (veľmi jednoduché,  ATR ~ 1 % ceny)
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))  # zatiaľ nepoužité, ale nech je pripravené
+ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))    # 1 % ceny ako proxy ATR
+TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 
 
 # -----------------------
@@ -206,11 +212,19 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
 
     # 3) entry price (simple approximation; no market data client)
     entry_px = DEFAULT_ENTRY_PRICE
-    atr = entry_px * 0.01  # 1 % volatility proxy
-    sl_px = entry_px - atr
-    tp_px = entry_px + 1.5 * atr
 
-    # 4) risk-based sizing
+    # veľmi jednoduché ATR: percento z ceny (napr. 1 %)
+    atr = entry_px * ATR_PCT
+
+    if side.lower() == "buy":
+        sl_px = entry_px - SL_ATR_MULT * atr
+        tp_px = entry_px + TP_ATR_MULT * atr
+    else:
+        # pre short – len pre kompletnoť, aj keď teraz hlavne riešime long
+        sl_px = entry_px + SL_ATR_MULT * atr
+        tp_px = entry_px - TP_ATR_MULT * atr
+
+    # 4) risk-based sizing podľa entry a SL
     qty = compute_qty_for_long(
         entry_price=entry_px,
         stop_loss_price=sl_px,
@@ -230,7 +244,7 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
         mark_signal(conn, signal_id, status="skipped_risk", error="qty_zero")
         return
 
-    # 5) submit simple market order (no TP/SL yet – aby sme nemali 'take_profit' chybu)
+    # 5) BRACKET market order s TP/SL (nový alpaca-py štýl)
     client_id = str(uuid.uuid4())
     order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
@@ -239,6 +253,9 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
         qty=qty,
         side=order_side,
         time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.BRACKET,
+        take_profit=TakeProfitRequest(limit_price=tp_px),
+        stop_loss=StopLossRequest(stop_price=sl_px),
         client_order_id=client_id,
     )
 
@@ -246,7 +263,7 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
     oid, coid, xoid = _extract_ids(o)
 
     log.info(
-        "submitted with risk: %s %s | qty=%s | entry=%.2f (approx) | tp=%.2f | sl=%.2f | oid=%s client_order_id=%s",
+        "submitted BRACKET: %s %s | qty=%s | entry=%.2f (approx) | tp=%.2f | sl=%.2f | oid=%s client_order_id=%s",
         symbol,
         side,
         qty,
@@ -277,13 +294,16 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
 
 def loop(tc: TradingClient, conn) -> None:
     log.info(
-        "signal_executor starting | MIN_STRENGTH=%.2f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | RISK=%s | DEFAULT_ENTRY_PRICE=%.2f",
+        "signal_executor starting | MIN_STRENGTH=%.2f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | RISK=%s | DEFAULT_ENTRY_PRICE=%.2f | ATR_PCT=%.4f | TP_ATR_MULT=%.2f | SL_ATR_MULT=%.2f",
         MIN_STRENGTH,
         ",".join(SYMBOLS),
         PORTFOLIO_ID or "",
         POLL_SECONDS,
         RISK_LIMITS,
         DEFAULT_ENTRY_PRICE,
+        ATR_PCT,
+        TP_ATR_MULT,
+        SL_ATR_MULT,
     )
     while True:
         try:
