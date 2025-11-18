@@ -39,7 +39,7 @@ services:
 
       # --- Runtime ---
       SYMBOLS: "AAPL,MSFT,SPY"
-      MIN_STRENGTH: "0.60"
+      MIN_STRENGTH: "0.20"
       SIGNAL_POLL_SECONDS: "20"
       PORTFOLIO_ID: ""
       LOG_LEVEL: "INFO"
