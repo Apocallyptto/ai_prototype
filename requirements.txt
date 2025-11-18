@@ -7,7 +7,6 @@ SQLAlchemy>=2.0
 # --- ML ---
 scikit-learn
 joblib
-torch
 
 # --- data sources ---
 alpaca-py
