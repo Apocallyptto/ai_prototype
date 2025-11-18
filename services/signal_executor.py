@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import math
 import psycopg2
 import psycopg2.extras
 
@@ -75,6 +76,15 @@ ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))  # zatiaľ len placeholder
 ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))    # 1 % ceny ako proxy ATR
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
+
+
+# -----------------------
+# Helpers
+# -----------------------
+
+def round_to_cent(price: float) -> float:
+    """Zaokrúhli na najbližší cent (2 desatinné miesta)."""
+    return float(f"{price:.2f}")
 
 
 # -----------------------
@@ -252,6 +262,7 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
 
     # 3) entry price = reálna posledná cena z data API (alebo fallback)
     entry_px = get_last_price(symbol)
+    entry_px = round_to_cent(entry_px)
 
     # jednoduchý ATR: percento z ceny (napr. 1 %)
     atr = entry_px * ATR_PCT
@@ -259,10 +270,24 @@ def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
     if side.lower() == "buy":
         sl_px = entry_px - SL_ATR_MULT * atr
         tp_px = entry_px + TP_ATR_MULT * atr
+
+        # zaokrúhli na centy
+        sl_px = round_to_cent(sl_px)
+        tp_px = round_to_cent(tp_px)
+
+        # bezpečnostná poistka: TP musí byť aspoň entry + 0.01
+        min_tp = round_to_cent(entry_px + 0.01)
+        if tp_px < min_tp:
+            tp_px = min_tp
+
     else:
         # pre short – len pre úplnosť
         sl_px = entry_px + SL_ATR_MULT * atr
         tp_px = entry_px - TP_ATR_MULT * atr
+
+        sl_px = round_to_cent(sl_px)
+        tp_px = round_to_cent(tp_px)
+        # pri shorte by TP malo byť <= entry - 0.01, ale Alpaca to vie zvalidovať
 
     # 4) risk-based sizing podľa entry a SL
     qty = compute_qty_for_long(
