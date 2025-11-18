@@ -1,9 +1,9 @@
-# Use 3.12 for wider wheel availability
 FROM python:3.12-slim
 
+# Workdir inside container
 WORKDIR /app
 
-# System deps for psycopg2 & timezone/etc.
+# System deps (for psycopg2, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
@@ -13,11 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Python deps
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
 
-# App code
+RUN python -m pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    # --- NEW: install PyTorch for ml.nn_train / make_signals_ml ---
+    pip install --no-cache-dir torch
+
+# Copy project code
 COPY . /app
 
-# Default command: run your cron loop
-CMD ["python", "-m", "jobs.cron_v2"]
+# Default command (overridden by docker-compose services)
+CMD ["python", "-m", "services.signal_executor"]
