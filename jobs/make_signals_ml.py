@@ -32,10 +32,7 @@ MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
 
 MODEL_DIR = os.getenv("MODEL_DIR", "models")
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(MODEL_DIR, "gbc_5m.pkl"))
-SCALER_PATH = os.getenv(
-    "SCALER_PATH",
-    os.path.join(MODEL_DIR, "YOUR_SCALER_FILENAME_HERE"),  # <--- change only this
-)
+SCALER_PATH = os.getenv("SCALER_PATH", os.path.join(MODEL_DIR, "gbc_5m_scaler.pkl"))
 
 
 # DB URL – inside Docker we usually set DB_URL=postgresql://postgres:...@postgres:5432/trader
