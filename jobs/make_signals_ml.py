@@ -157,10 +157,8 @@ def insert_signals(preds, min_strength: float) -> int:
     """
     Insert ML signals into the `signals` table.
 
-    Assumes a schema roughly like:
-      signals(symbol, direction, strength, source, created_at, portfolio_id, timeframe)
-
-    Adjust column names if needed.
+    Assumes schema:
+      signals(symbol, side, strength, source, created_at, portfolio_id, timeframe)
     """
     if not preds:
         return 0
@@ -190,13 +188,13 @@ def insert_signals(preds, min_strength: float) -> int:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO signals (symbol, direction, strength, source, created_at, portfolio_id, timeframe)
-                        VALUES (:symbol, :direction, :strength, :source, :created_at, :portfolio_id, :timeframe)
+                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id, timeframe)
+                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id, :timeframe)
                         """
                     ),
                     {
                         "symbol": symbol,
-                        "direction": "BUY",
+                        "side": "BUY",
                         "strength": p_up,
                         "source": source,
                         "created_at": now,
@@ -211,13 +209,13 @@ def insert_signals(preds, min_strength: float) -> int:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO signals (symbol, direction, strength, source, created_at, portfolio_id, timeframe)
-                        VALUES (:symbol, :direction, :strength, :source, :created_at, :portfolio_id, :timeframe)
+                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id, timeframe)
+                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id, :timeframe)
                         """
                     ),
                     {
                         "symbol": symbol,
-                        "direction": "SELL",
+                        "side": "SELL",
                         "strength": p_down,
                         "source": source,
                         "created_at": now,
@@ -228,6 +226,7 @@ def insert_signals(preds, min_strength: float) -> int:
                 inserted += 1
 
     return inserted
+
 
 
 # -----------------------------------------------------------------------------
