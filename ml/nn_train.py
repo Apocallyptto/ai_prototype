@@ -17,17 +17,44 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     # 1) Flatten columns and normalize names
     # ------------------------------------------------------------------
     # Some data sources (or concatenations) can give MultiIndex columns
-    # like ('AAPL', 'Close'). We flatten those to 'Close'.
+    # like ('Open', 'AAPL') or ('AAPL', 'Open'). We want to pick the
+    # part that looks like OHLCV (open/high/low/close/volume).
     raw_cols = list(df.columns)
+
+    ohlcv_tokens = {
+        "open",
+        "high",
+        "low",
+        "close",
+        "adj close",
+        "adj_close",
+        "volume",
+        "vol",
+        "v",
+    }
 
     flat_names = []
     for c in raw_cols:
         if isinstance(c, tuple):
-            # take the last element that is non-empty / non-None
-            parts = [str(p) for p in c if p is not None and p != ""]
-            name = parts[-1] if parts else ""
+            # Normalize all tuple parts to lowercase strings
+            parts = [str(p) for p in c if p is not None and str(p).strip() != ""]
+            lower_parts = [p.strip().lower() for p in parts]
+
+            chosen = None
+            # 1) Try to find element that looks like OHLCV
+            for lp, orig_p in zip(lower_parts, parts):
+                if lp in ohlcv_tokens:
+                    chosen = str(orig_p)
+                    break
+
+            # 2) Fallback: first non-empty part
+            if chosen is None:
+                chosen = parts[0] if parts else ""
+
+            name = chosen
         else:
             name = str(c)
+
         flat_names.append(name)
 
     df = df.copy()
