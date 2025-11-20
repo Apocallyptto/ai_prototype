@@ -158,7 +158,7 @@ def insert_signals(preds, min_strength: float) -> int:
     Insert ML signals into the `signals` table.
 
     Assumes schema:
-      signals(symbol, side, strength, source, created_at, portfolio_id, timeframe)
+      signals(symbol, side, strength, source, created_at, portfolio_id)
     """
     if not preds:
         return 0
@@ -167,7 +167,6 @@ def insert_signals(preds, min_strength: float) -> int:
     now = datetime.utcnow()
     source = "ml_gbc_5m"
     portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
-    timeframe = "5m"
 
     inserted = 0
 
@@ -188,8 +187,8 @@ def insert_signals(preds, min_strength: float) -> int:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id, timeframe)
-                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id, :timeframe)
+                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id)
+                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id)
                         """
                     ),
                     {
@@ -199,7 +198,6 @@ def insert_signals(preds, min_strength: float) -> int:
                         "source": source,
                         "created_at": now,
                         "portfolio_id": portfolio_id,
-                        "timeframe": timeframe,
                     },
                 )
                 inserted += 1
@@ -209,8 +207,8 @@ def insert_signals(preds, min_strength: float) -> int:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id, timeframe)
-                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id, :timeframe)
+                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id)
+                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id)
                         """
                     ),
                     {
@@ -220,12 +218,12 @@ def insert_signals(preds, min_strength: float) -> int:
                         "source": source,
                         "created_at": now,
                         "portfolio_id": portfolio_id,
-                        "timeframe": timeframe,
                     },
                 )
                 inserted += 1
 
     return inserted
+
 
 
 
