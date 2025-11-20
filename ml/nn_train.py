@@ -20,27 +20,74 @@ except ImportError:
 def make_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build numeric ML features from OHLCV dataframe.
+
     This function MUST remain torch-free so Docker can use it.
-    Expected columns: ['Open','High','Low','Close','Volume'] at least.
+
+    It is robust to different column namings, e.g.:
+      - 'Open','High','Low','Close','Volume'
+      - 'open','high','low','close','volume'
+      - 'o','h','l','c','v' (Alpaca style)
     """
+
+    if df is None or df.empty:
+        raise ValueError("make_features(): received empty dataframe")
+
     out = df.copy()
 
+    # --- Normalize & detect column names ---
+    cols_lower = {c.lower(): c for c in out.columns}
+
+    def find_col(candidates):
+        """
+        Return the actual column name from df for any of the
+        given candidate names (case-insensitive).
+        """
+        for cand in candidates:
+            key = cand.lower()
+            if key in cols_lower:
+                return cols_lower[key]
+        raise KeyError(
+            f"None of columns {candidates} found in dataframe. "
+            f"Available columns: {list(out.columns)}"
+        )
+
+    close_col = find_col(["close", "c"])
+    open_col = find_col(["open", "o"])
+    high_col = find_col(["high", "h"])
+    low_col = find_col(["low", "l"])
+    vol_col = find_col(["volume", "v"])
+
+    # --- Use the detected columns to build features ---
+
+    close = out[close_col]
+    open_ = out[open_col]
+    high = out[high_col]
+    low = out[low_col]
+    vol = out[vol_col]
+
     # Basic returns
-    out["return_1"] = out["Close"].pct_change()
-    out["return_5"] = out["Close"].pct_change(5)
-    out["return_10"] = out["Close"].pct_change(10)
+    out["return_1"] = close.pct_change()
+    out["return_5"] = close.pct_change(5)
+    out["return_10"] = close.pct_change(10)
 
     # Rolling statistics
-    out["ma_10"] = out["Close"].rolling(10).mean()
-    out["ma_20"] = out["Close"].rolling(20).mean()
-    out["std_10"] = out["Close"].rolling(10).std()
-    out["std_20"] = out["Close"].rolling(20).std()
+    out["ma_10"] = close.rolling(10).mean()
+    out["ma_20"] = close.rolling(20).mean()
+    out["std_10"] = close.rolling(10).std()
+    out["std_20"] = close.rolling(20).std()
+
+    # High/low range type features
+    out["hl_range"] = (high - low) / close
+    out["oc_range"] = (close - open_) / open_
+
+    # Volume features
+    out["vol_zscore_20"] = (vol - vol.rolling(20).mean()) / (vol.rolling(20).std() + 1e-9)
 
     # RSI
-    delta = out["Close"].diff()
+    delta = close.diff()
     gain = (delta.where(delta > 0, 0)).abs()
     loss = (-delta.where(delta < 0, 0)).abs()
-    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
+    rs = gain.rolling(14).mean() / (loss.rolling(14).mean() + 1e-9)
     out["rsi_14"] = 100 - (100 / (1 + rs))
 
     # Drop the NaN rows (start of rolling windows)
@@ -114,8 +161,9 @@ else:
     class PriceDirectionModel:  # simple placeholder, not used in Docker
         def __init__(self, *args, **kwargs):
             raise RuntimeError(
-                "PriceDirectionModel is not available because PyTorch is not installed "
-                "in this environment. Use it only in a local environment with torch."
+                "PriceDirectionModel is not available because PyTorch is not "
+                "installed in this environment. Use it only in a local "
+                "environment with torch."
             )
 
     def train_model(*args, **kwargs):
