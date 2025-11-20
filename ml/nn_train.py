@@ -1,182 +1,108 @@
 import numpy as np
 import pandas as pd
 
-# ------------------------------------------------------------
-# TRY IMPORTING TORCH (OPTIONAL)
-# ------------------------------------------------------------
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-except ImportError:
-    torch = None  # running in lightweight environment (Docker)
-    nn = None
-    optim = None
-
-
-# ------------------------------------------------------------
-# FEATURE BUILDER USED BY make_signals_ml AND executor
-# ------------------------------------------------------------
 def make_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build numeric ML features from OHLCV dataframe.
+    Build a feature DataFrame from raw OHLCV bars.
 
-    This function MUST remain torch-free so Docker can use it.
-
-    It is robust to different column namings, e.g.:
-      - 'Open','High','Low','Close','Volume'
-      - 'open','high','low','close','volume'
-      - 'o','h','l','c','v' (Alpaca style)
+    - Normalizes column names (handles tuples / MultiIndex from some data sources)
+    - Ensures we have canonical columns: Open, High, Low, Close, Volume
+    - Adds the engineered features that jobs.make_signals_ml expects.
     """
 
-    if df is None or df.empty:
-        raise ValueError("make_features(): received empty dataframe")
+    if df is None or len(df) == 0:
+        raise ValueError("make_features() received empty DataFrame")
 
-    out = df.copy()
+    # ------------------------------------------------------------------
+    # 1) Flatten columns and normalize names
+    # ------------------------------------------------------------------
+    # Some data sources (or concatenations) can give MultiIndex columns
+    # like ('AAPL', 'Close'). We flatten those to 'Close'.
+    raw_cols = list(df.columns)
 
-    # --- Normalize & detect column names ---
-    cols_lower = {c.lower(): c for c in out.columns}
+    flat_names = []
+    for c in raw_cols:
+        if isinstance(c, tuple):
+            # take the last element that is non-empty / non-None
+            parts = [str(p) for p in c if p is not None and p != ""]
+            name = parts[-1] if parts else ""
+        else:
+            name = str(c)
+        flat_names.append(name)
 
-    def find_col(candidates):
+    df = df.copy()
+    df.columns = flat_names
+
+    # Build mapping from lower-case -> original column key
+    cols_lower = {}
+    for orig in df.columns:
+        key = str(orig).lower()
+        cols_lower[key] = orig
+
+    def pick(*candidates: str) -> str:
         """
-        Return the actual column name from df for any of the
-        given candidate names (case-insensitive).
+        Pick the first column name that exists (case-insensitive).
+        Raises KeyError if none found.
         """
         for cand in candidates:
-            key = cand.lower()
-            if key in cols_lower:
-                return cols_lower[key]
-        raise KeyError(
-            f"None of columns {candidates} found in dataframe. "
-            f"Available columns: {list(out.columns)}"
-        )
+            lc = cand.lower()
+            if lc in cols_lower:
+                return cols_lower[lc]
+        raise KeyError(f"None of {candidates} found in columns={list(df.columns)}")
 
-    close_col = find_col(["close", "c"])
-    open_col = find_col(["open", "o"])
-    high_col = find_col(["high", "h"])
-    low_col = find_col(["low", "l"])
-    vol_col = find_col(["volume", "v"])
+    # ------------------------------------------------------------------
+    # 2) Canonical OHLCV columns
+    # ------------------------------------------------------------------
+    open_col = pick("open", "o")
+    high_col = pick("high", "h")
+    low_col = pick("low", "l")
+    close_col = pick("close", "c", "adj close", "adj_close")
+    volume_col = pick("volume", "vol", "v")
 
-    # --- Use the detected columns to build features ---
+    out = pd.DataFrame(index=df.index)
+    out["Open"] = df[open_col].astype(float)
+    out["High"] = df[high_col].astype(float)
+    out["Low"] = df[low_col].astype(float)
+    out["Close"] = df[close_col].astype(float)
+    out["Volume"] = df[volume_col].astype(float)
 
-    close = out[close_col]
-    open_ = out[open_col]
-    high = out[high_col]
-    low = out[low_col]
-    vol = out[vol_col]
+    # ------------------------------------------------------------------
+    # 3) Engineered features (must match FEATURE_COLS in make_signals_ml)
+    # ------------------------------------------------------------------
+    # Simple returns
+    out["return_1"] = out["Close"].pct_change(1)
+    out["return_5"] = out["Close"].pct_change(5)
+    out["return_10"] = out["Close"].pct_change(10)
 
-    # Basic returns
-    out["return_1"] = close.pct_change()
-    out["return_5"] = close.pct_change(5)
-    out["return_10"] = close.pct_change(10)
+    # Moving averages
+    out["ma_10"] = out["Close"].rolling(window=10, min_periods=1).mean()
+    out["ma_20"] = out["Close"].rolling(window=20, min_periods=1).mean()
 
-    # Rolling statistics
-    out["ma_10"] = close.rolling(10).mean()
-    out["ma_20"] = close.rolling(20).mean()
-    out["std_10"] = close.rolling(10).std()
-    out["std_20"] = close.rolling(20).std()
+    # Rolling std (volatility)
+    out["std_10"] = out["Close"].rolling(window=10, min_periods=1).std()
+    out["std_20"] = out["Close"].rolling(window=20, min_periods=1).std()
 
-    # High/low range type features
-    out["hl_range"] = (high - low) / close
-    out["oc_range"] = (close - open_) / open_
+    # Ranges
+    out["hl_range"] = (out["High"] - out["Low"]) / out["Close"].replace(0, np.nan)
+    out["oc_range"] = (out["Close"] - out["Open"]) / out["Open"].replace(0, np.nan)
 
-    # Volume features
-    out["vol_zscore_20"] = (vol - vol.rolling(20).mean()) / (vol.rolling(20).std() + 1e-9)
+    # Volume Z-score
+    vol_mean_20 = out["Volume"].rolling(window=20, min_periods=1).mean()
+    vol_std_20 = out["Volume"].rolling(window=20, min_periods=1).std()
+    out["vol_zscore_20"] = (out["Volume"] - vol_mean_20) / vol_std_20.replace(0, np.nan)
 
-    # RSI
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).abs()
-    loss = (-delta.where(delta < 0, 0)).abs()
-    rs = gain.rolling(14).mean() / (loss.rolling(14).mean() + 1e-9)
+    # RSI(14)
+    delta = out["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    roll_up = gain.rolling(window=14, min_periods=1).mean()
+    roll_down = loss.rolling(window=14, min_periods=1).mean()
+
+    rs = roll_up / roll_down.replace(0, np.nan)
     out["rsi_14"] = 100 - (100 / (1 + rs))
 
-    # Drop the NaN rows (start of rolling windows)
+    # Drop initial NaNs where features are not defined, keep index aligned
     out = out.dropna()
 
     return out
-
-
-# ------------------------------------------------------------
-# OPTIONAL TORCH-BASED MODEL (only defined if torch is present)
-# ------------------------------------------------------------
-if torch is not None and nn is not None and optim is not None:
-
-    class PriceDirectionModel(nn.Module):
-        """
-        Tiny neural network classifier.
-        Only available when torch is installed.
-        """
-        def __init__(self, n_features: int):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(n_features, 32),
-                nn.ReLU(),
-                nn.Linear(32, 16),
-                nn.ReLU(),
-                nn.Linear(16, 2)  # up vs down
-            )
-
-        def forward(self, x):
-            return self.net(x)
-
-
-    def train_model(X: np.ndarray, y: np.ndarray, epochs=50, lr=1e-3):
-        """
-        Training function — ONLY used in local/offline training.
-        Requires torch to be installed.
-        """
-        X_t = torch.tensor(X, dtype=torch.float32)
-        y_t = torch.tensor(y, dtype=torch.long)
-
-        model = PriceDirectionModel(X.shape[1])
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        loss_fn = nn.CrossEntropyLoss()
-
-        for epoch in range(epochs):
-            optimizer.zero_grad()
-            pred = model(X_t)
-            loss = loss_fn(pred, y_t)
-            loss.backward()
-            optimizer.step()
-
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}, Loss: {loss.item():.5f}")
-
-        return model
-
-
-    def save_model(model, path: str):
-        torch.save(model.state_dict(), path)
-
-
-    def load_model(path: str, n_features: int):
-        model = PriceDirectionModel(n_features)
-        model.load_state_dict(torch.load(path, map_location="cpu"))
-        model.eval()
-        return model
-
-else:
-    # Torch is NOT available => define safe stubs so imports still work,
-    # but trying to train/load will clearly tell you what's wrong.
-    class PriceDirectionModel:  # simple placeholder, not used in Docker
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError(
-                "PriceDirectionModel is not available because PyTorch is not "
-                "installed in this environment. Use it only in a local "
-                "environment with torch."
-            )
-
-    def train_model(*args, **kwargs):
-        raise RuntimeError(
-            "train_model() requires PyTorch. Install torch locally to train the model."
-        )
-
-    def save_model(*args, **kwargs):
-        raise RuntimeError(
-            "save_model() requires PyTorch. Install torch locally to train/save models."
-        )
-
-    def load_model(*args, **kwargs):
-        raise RuntimeError(
-            "load_model() requires PyTorch. Install torch locally to load models."
-        )
