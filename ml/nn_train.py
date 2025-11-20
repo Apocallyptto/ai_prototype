@@ -64,6 +64,7 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     cols_lower = {}
     for orig in df.columns:
         key = str(orig).lower()
+        # last one wins; that's ok, we'll still handle duplicates later
         cols_lower[key] = orig
 
     def pick(*candidates: str) -> str:
@@ -77,6 +78,18 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
                 return cols_lower[lc]
         raise KeyError(f"None of {candidates} found in columns={list(df.columns)}")
 
+    def _one_column(col_key):
+        """
+        Return a float Series for a given column key.
+        If there are multiple columns with the same name, take the first one.
+        """
+        obj = df[col_key]
+        # If duplicate column names exist, df[col_key] can be a DataFrame
+        if isinstance(obj, pd.DataFrame):
+            # take the first column
+            obj = obj.iloc[:, 0]
+        return pd.to_numeric(obj, errors="coerce")
+
     # ------------------------------------------------------------------
     # 2) Canonical OHLCV columns
     # ------------------------------------------------------------------
@@ -87,11 +100,11 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     volume_col = pick("volume", "vol", "v")
 
     out = pd.DataFrame(index=df.index)
-    out["Open"] = df[open_col].astype(float)
-    out["High"] = df[high_col].astype(float)
-    out["Low"] = df[low_col].astype(float)
-    out["Close"] = df[close_col].astype(float)
-    out["Volume"] = df[volume_col].astype(float)
+    out["Open"] = _one_column(open_col)
+    out["High"] = _one_column(high_col)
+    out["Low"] = _one_column(low_col)
+    out["Close"] = _one_column(close_col)
+    out["Volume"] = _one_column(volume_col)
 
     # ------------------------------------------------------------------
     # 3) Engineered features (must match FEATURE_COLS in make_signals_ml)
