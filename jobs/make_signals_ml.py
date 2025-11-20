@@ -193,7 +193,7 @@ def insert_signals(preds, min_strength: float) -> int:
                     ),
                     {
                         "symbol": symbol,
-                        "side": "BUY",
+                        "side": "buy",   # <<< dôležité: malé písmená
                         "strength": p_up,
                         "source": source,
                         "created_at": now,
@@ -213,7 +213,7 @@ def insert_signals(preds, min_strength: float) -> int:
                     ),
                     {
                         "symbol": symbol,
-                        "side": "SELL",
+                        "side": "sell",  # <<< tiež malé
                         "strength": p_down,
                         "source": source,
                         "created_at": now,
@@ -223,6 +223,7 @@ def insert_signals(preds, min_strength: float) -> int:
                 inserted += 1
 
     return inserted
+
 
 
 
