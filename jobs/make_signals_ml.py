@@ -1,191 +1,299 @@
 # jobs/make_signals_ml.py
-from __future__ import annotations
-import os, json
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Sequence, Set, Dict
+
+import os
+import time
+import logging
+import datetime as dt
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import joblib
+import psycopg2
+from psycopg2.extras import register_uuid
 
-# DB: prefer psycopg3, fallback to psycopg2
-try:
-    import psycopg  # psycopg3
-    HAVE3 = True
-except Exception:
-    HAVE3 = False
-    import psycopg2
+from ml.nn_train import make_features  # uses pandas/numpy only, no torch
 
-# Reuse your feature recipe used by NN training
-from ml.nn_train import make_features
 
-# If you have an Alpaca bars helper, we use it and silently fallback to yfinance
-try:
-    from lib.broker_alpaca import get_bars
-    HAVE_APCA = True
-except Exception:
-    HAVE_APCA = False
+# -----------------------------------------------------------------------------
+# Config & logging
+# -----------------------------------------------------------------------------
 
-# ---------------- Config ---------------- #
-TIMEFRAME     = os.getenv("ML_TIMEFRAME", "5Min")
-OUTDIR        = os.getenv("ML_OUTDIR", "models")
-MODEL_PATH    = os.path.join(OUTDIR, "ml_5m.pkl")             # joblib dump of your sklearn model
-SCALER_PATH   = os.path.join(OUTDIR, "ml_5m_scaler.pkl")      # joblib dump of StandardScaler
-FEAT_JSON     = os.path.join(OUTDIR, "ml_5m_features.json")   # optional: list of feature names
-SYMBOLS       = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-PORTFOLIO_ID  = int(os.getenv("PORTFOLIO_ID", "1"))
-MIN_STRENGTH  = float(os.getenv("MIN_STRENGTH", "0.60"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("make_signals_ml")
 
-# Use yfinance fallback for inference if Alpaca is unavailable
-USE_YF = os.getenv("USE_YFINANCE_INFER", "0").lower() in {"1","true","yes","y"}
+SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
+SYMBOLS = [s.strip().upper() for s in SYMBOLS if s.strip()]
 
-# -------------- DB helpers -------------- #
-def _pg_conn():
-    dsn = os.getenv("DATABASE_URL")
-    if HAVE3:
-        return psycopg.connect(dsn) if dsn else psycopg.connect(
-            host=os.getenv("PGHOST","localhost"),
-            user=os.getenv("PGUSER","postgres"),
-            password=os.getenv("PGPASSWORD","postgres"),
-            dbname=os.getenv("PGDATABASE","ai_prototype"),
-            port=os.getenv("PGPORT","5432"),
-        )
-    else:
-        return psycopg2.connect(dsn) if dsn else psycopg2.connect(
-            host=os.getenv("PGHOST","localhost"),
-            user=os.getenv("PGUSER","postgres"),
-            password=os.getenv("PGPASSWORD","postgres"),
-            dbname=os.getenv("PGDATABASE","ai_prototype"),
-            port=os.getenv("PGPORT","5432"),
-        )
+MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
 
-def _signal_columns() -> Set[str]:
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='signals'
+MODEL_DIR = os.getenv("MODEL_DIR", "models")
+MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(MODEL_DIR, "gbc_5m.pkl"))
+SCALER_PATH = os.getenv("SCALER_PATH", os.path.join(MODEL_DIR, "gbc_5m_scaler.pkl"))
+
+# DB URL – inside Docker we usually set DB_URL=postgresql://postgres:...@postgres:5432/trader
+DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
+
+LOOKBACK_DAYS = int(os.getenv("ML_LOOKBACK_DAYS", "30"))
+
+# -----------------------------------------------------------------------------
+# ✅ THIS IS THE CRUCIAL PART: feature columns (11) that match your StandardScaler
+# -----------------------------------------------------------------------------
+
+FEATURE_COLS = [
+    "return_1",
+    "return_5",
+    "return_10",
+    "ma_10",
+    "ma_20",
+    "std_10",
+    "std_20",
+    "hl_range",
+    "oc_range",
+    "vol_zscore_20",
+    "rsi_14",
+]
+
+
+# -----------------------------------------------------------------------------
+# Data loader – use Alpaca to fetch recent bars
+# If you already have your own loader, you can keep it and ignore this function.
+# -----------------------------------------------------------------------------
+
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+
+if ALPACA_API_KEY and ALPACA_API_SECRET:
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+
+    data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+else:
+    data_client = None
+    log.warning("ALPACA_API_KEY / SECRET not set – data loader may fail.")
+
+
+def load_recent_bars(symbol: str, lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     """
-    with _pg_conn() as c:
-        with c.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
-    return {r[0] for r in rows}
+    Fetch recent minute bars from Alpaca and normalize to columns:
+    [timestamp, Open, High, Low, Close, Volume]
 
-def _insert_signal(symbol: str, side: str, strength: float, ts: datetime):
-    cols = _signal_columns()
-    names, vals = ["symbol","side","strength"], [symbol, side, float(strength)]
+    If you already had your own data loader in this file,
+    you can replace this implementation with your original one.
+    """
+    if data_client is None:
+        raise RuntimeError("Alpaca data client is not configured (missing API keys).")
 
-    ts_col = "ts" if "ts" in cols else ("created_at" if "created_at" in cols else None)
-    if ts_col:
-        names.append(ts_col); vals.append(ts)
+    end = dt.datetime.now(dt.timezone.utc)
+    start = end - dt.timedelta(days=lookback_days)
 
-    if "portfolio_id" in cols:
-        names.append("portfolio_id"); vals.append(PORTFOLIO_ID)
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Minute,  # 1-minute bars
+        start=start,
+        end=end,
+        adjustment="raw",
+    )
+    bars = data_client.get_stock_bars(req).df
 
-    # Optional: mark source
-    if "source" in cols:
-        names.append("source"); vals.append("ml")
+    if bars.empty:
+        raise RuntimeError(f"No bars returned for symbol {symbol}")
 
-    placeholders = ",".join(["%s"]*len(vals))
-    sql = f"INSERT INTO public.signals ({','.join(names)}) VALUES ({placeholders})"
-    with _pg_conn() as c:
-        with c.cursor() as cur:
-            cur.execute(sql, tuple(vals))
-        c.commit()
-
-# --------- Market data / features --------- #
-def _bars_yf(symbol: str) -> pd.DataFrame:
-    import yfinance as yf
-    df = yf.download(symbol, period="7d", interval="5m", progress=False, auto_adjust=False)
-    if df.empty:
-        raise RuntimeError(f"yfinance empty for {symbol}")
-    df = df.tz_localize("UTC") if df.index.tz is None else df.tz_convert("UTC")
-    df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}, inplace=True)
-    return df[["open","high","low","close","volume"]]
-
-def _fetch_bars(symbol: str) -> pd.DataFrame:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=7)
-    if HAVE_APCA:
+    # When multiple symbols, df is MultiIndex; for a single symbol, pick that slice
+    if isinstance(bars.index, pd.MultiIndex) and "symbol" in bars.index.names:
         try:
-            bars = get_bars(symbol, TIMEFRAME, start, end, limit=2000)
-            df = pd.DataFrame(bars)
-            df.rename(columns={"t":"timestamp","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-            df.set_index("timestamp", inplace=True)
-            return df[["open","high","low","close","volume"]]
-        except Exception as e:
-            if not USE_YF:
-                raise
-            print(f"[WARN] Alpaca bars failed for {symbol}: {e}. Falling back to yfinance.")
-    # fallback:
-    return _bars_yf(symbol)
+            bars = bars.xs(symbol, level="symbol")
+        except KeyError:
+            raise RuntimeError(f"No data in dataframe for symbol {symbol}")
 
-def _latest_features(symbol: str) -> Optional[np.ndarray]:
-    df = _fetch_bars(symbol)
+    bars = bars.reset_index().rename(
+        columns={
+            "timestamp": "Timestamp",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
+
+    # sort just in case
+    bars = bars.sort_values("Timestamp").reset_index(drop=True)
+    return bars
+
+
+# -----------------------------------------------------------------------------
+# ✅ NEW VERSION: _latest_features returns EXACTLY FEATURE_COLS (11 features)
+# -----------------------------------------------------------------------------
+
+def _latest_features(symbol: str) -> np.ndarray:
+    """
+    Load recent bars for a symbol, build features with make_features(),
+    and return a 2D numpy array with exactly FEATURE_COLS in the right order
+    (shape: (1, len(FEATURE_COLS))).
+    """
+    df = load_recent_bars(symbol)  # uses Alpaca loader above (or your own, if you replace it)
+
     feats = make_features(df)
-    if feats.empty:
-        return None
-    # keep the latest row; ensure float32 dtype
-    return feats.iloc[-1:].values.astype("float32")
 
-# -------------- Predictor (reusable) -------------- #
-def predict_for_symbols(symbols: Sequence[str]) -> Dict[str, Dict[str, float | str]]:
+    # Ensure all expected feature columns exist
+    missing = [c for c in FEATURE_COLS if c not in feats.columns]
+    if missing:
+        raise RuntimeError(
+            f"Missing feature columns {missing} for symbol {symbol}. "
+            f"Got columns: {list(feats.columns)}"
+        )
+
+    # Take the last row, only selected feature columns, keep it 2D
+    latest = feats[FEATURE_COLS].iloc[-1:]
+    return latest.values.astype("float32")
+
+
+# -----------------------------------------------------------------------------
+# Model loading
+# -----------------------------------------------------------------------------
+
+def load_model_and_scaler():
+    log.info("Loading model from %s", MODEL_PATH)
+    model = joblib.load(MODEL_PATH)
+
+    log.info("Loading scaler from %s", SCALER_PATH)
+    scaler = joblib.load(SCALER_PATH)
+
+    return model, scaler
+
+
+# -----------------------------------------------------------------------------
+# DB helpers
+# -----------------------------------------------------------------------------
+
+def get_db_conn():
+    if not DB_URL:
+        raise RuntimeError("DB_URL (or DATABASE_URL) is not set in environment.")
+    register_uuid()
+    return psycopg2.connect(DB_URL)
+
+
+def insert_signal(
+    conn,
+    symbol: str,
+    side: str,
+    strength: float,
+    portfolio_id: str | None = None,
+):
     """
-    Returns:
-        {'AAPL': {'side': 'buy', 'strength': 0.63}, ...}
-    Note: does NOT write to DB (safe for import/ensemble).
+    Insert a new ML signal into signals table with status='pending'.
+    Assumes table columns: created_at, symbol, side, strength, portfolio_id, status.
     """
-    # Load artifacts
-    model = joblib.load(MODEL_PATH)   # e.g., GradientBoostingClassifier
-    scaler = joblib.load(SCALER_PATH) # StandardScaler
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO signals (created_at, symbol, side, strength, portfolio_id, status)
+            VALUES (NOW(), %s, %s, %s, %s, 'pending');
+            """,
+            (symbol, side, strength, portfolio_id),
+        )
+    conn.commit()
 
-    # Optional: validate features signature if you saved it
-    if os.path.exists(FEAT_JSON):
+
+# -----------------------------------------------------------------------------
+# Prediction logic
+# -----------------------------------------------------------------------------
+
+def predict_for_symbols(symbols: List[str]) -> Dict[str, np.ndarray]:
+    """
+    Return dict: symbol -> class probabilities (e.g. [p_down, p_flat, p_up])
+    """
+    model, scaler = load_model_and_scaler()
+    preds: Dict[str, np.ndarray] = {}
+
+    for sym in symbols:
         try:
-            with open(FEAT_JSON, "r") as f:
-                _ = json.load(f)  # reserved for future checks
-        except Exception:
-            pass
+            x = _latest_features(sym)  # (1, len(FEATURE_COLS)) = (1, 11)
+            xs = scaler.transform(x).astype("float32")
+            proba = model.predict_proba(xs)[0]
+            preds[sym] = proba
+            log.info("Pred for %s: %s", sym, proba)
+        except Exception as e:
+            log.exception("Failed to build features/predict for %s: %s", sym, e)
 
-    out: Dict[str, Dict[str, float | str]] = {}
-    for sym in [s.strip().upper() for s in symbols if s and s.strip()]:
-        x = _latest_features(sym)
-        if x is None:
-            continue
-        xs = scaler.transform(x).astype("float32")
+    return preds
 
-        # Prob of "up" (class 1). If your model is not probabilistic, fallback to decision_function
-        try:
-            proba = float(model.predict_proba(xs)[0, 1])
-        except Exception:
-            # e.g., if model has no predict_proba; map decision_function to [0,1]
-            from math import tanh
-            d = float(model.decision_function(xs).ravel()[0])
-            proba = 0.5 * (tanh(d) + 1.0)
 
-        if proba >= 0.5:
-            side, strength = "buy", proba
-        else:
-            side, strength = "sell", 1.0 - proba
+def pick_side_from_proba(proba: np.ndarray) -> tuple[str, float]:
+    """
+    Example mapping:
+      index 0 -> down, 1 -> flat, 2 -> up
+    You can adjust depending on how you trained the model.
+    Returns (side, strength) where side is 'buy'/'sell' or 'flat'.
+    """
+    # assume 3-class [down, flat, up]
+    if len(proba) != 3:
+        raise RuntimeError(f"Expected 3-class output, got shape {proba.shape}")
 
-        out[sym] = {"side": side, "strength": float(strength)}
-    return out
+    p_down, p_flat, p_up = proba
+    strength = float(max(p_down, p_up))
 
-# ------------------ CLI main ------------------ #
+    if strength < MIN_STRENGTH:
+        return "flat", strength
+
+    side = "buy" if p_up >= p_down else "sell"
+    return side, strength
+
+
+# -----------------------------------------------------------------------------
+# Main job
+# -----------------------------------------------------------------------------
+
 def main():
+    log.info(
+        "make_signals_ml starting | SYMBOLS=%s | MIN_STRENGTH=%.2f",
+        SYMBOLS,
+        MIN_STRENGTH,
+    )
+
     preds = predict_for_symbols(SYMBOLS)
-    for sym in SYMBOLS:
-        p = preds.get(sym)
-        if not p:
-            print(f"{sym}: no features")
-            continue
-        if p["strength"] >= MIN_STRENGTH:
-            ts = datetime.now(timezone.utc)
-            _insert_signal(sym, p["side"], float(p["strength"]), ts)
-            print(f"{sym}: {p['side']} strength={p['strength']:.2f} at {ts.isoformat()} (ml)")
-        else:
-            print(f"{sym}: below MIN_STRENGTH ({p['strength']:.2f} < {MIN_STRENGTH}) (ml)")
+
+    if not preds:
+        log.warning("No predictions produced.")
+        return
+
+    conn = get_db_conn()
+    try:
+        for sym, proba in preds.items():
+            if proba is None:
+                continue
+
+            side, strength = pick_side_from_proba(proba)
+            if side == "flat":
+                log.info("Symbol %s: signal flat (strength=%.3f), skipping insert.", sym, strength)
+                continue
+
+            log.info(
+                "Inserting signal: %s %s (strength=%.3f)",
+                sym,
+                side,
+                strength,
+            )
+            insert_signal(conn, symbol=sym, side=side, strength=strength, portfolio_id=None)
+    finally:
+        conn.close()
+
+    log.info("make_signals_ml done.")
+
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except Exception as e:
+            log.exception("make_signals_ml iteration failed: %s", e)
+        # In Docker this will be run as a long-lived job; adjust sleep via env if you want
+        sleep_sec = int(os.getenv("ML_CRON_SLEEP_SECONDS", "180"))
+        log.info("Sleeping %d seconds before next run...", sleep_sec)
+        time.sleep(sleep_sec)
