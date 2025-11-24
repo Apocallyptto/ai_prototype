@@ -24,7 +24,7 @@ logger = logging.getLogger("signal_executor")
 MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.20"))
 SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
 POLL_SECONDS = int(os.getenv("CRON_SLEEP_SECONDS", "20"))
-PORTFOLIO_ID = os.getenv("PORTFOLIO_ID", "1")     # default 1
+PORTFOLIO_ID = os.getenv("PORTFOLIO_ID", "1")  # default 1
 DEFAULT_ENTRY_PRICE = float(os.getenv("DEFAULT_ENTRY_PRICE", "200.0"))
 
 ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))
@@ -39,7 +39,7 @@ engine = get_engine()
 trading_client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
     secret_key=os.getenv("ALPACA_API_SECRET"),
-    paper=os.getenv("TRADING_MODE", "paper") == "paper"
+    paper=os.getenv("TRADING_MODE", "paper") == "paper",
 )
 
 
@@ -52,11 +52,14 @@ def fetch_new_signals() -> List[dict]:
       - strength >= MIN_STRENGTH
       - symbol in SYMBOLS
       - source IN ('rules', 'ml_gbc_5m')
-      - matches portfolio_id
-      - created in last 30 min
+      - matches portfolio_id (or portfolio_id IS NULL)
+      - created in last 30 minutes
     """
 
-    sql = text("""
+    # Vytvoríme presne taký IN zoznam, ako používaš v ručnom psql dotaze
+    symbols_list = ",".join(f"'{s.strip()}'" for s in SYMBOLS if s.strip())
+
+    sql_str = f"""
         SELECT
             id,
             created_at,
@@ -67,19 +70,23 @@ def fetch_new_signals() -> List[dict]:
             portfolio_id
         FROM signals
         WHERE strength >= :min_strength
-          AND symbol = ANY(:symbols)
+          AND symbol IN ({symbols_list})
           AND source IN ('rules', 'ml_gbc_5m')
           AND (portfolio_id = :pid OR portfolio_id IS NULL)
           AND created_at >= (NOW() - INTERVAL '30 minutes')
         ORDER BY created_at ASC
-    """)
+    """
+
+    sql = text(sql_str)
 
     with engine.begin() as conn:
-        rows = conn.execute(sql, {
-            "min_strength": MIN_STRENGTH,
-            "symbols": SYMBOLS,
-            "pid": int(PORTFOLIO_ID)
-        }).mappings().all()
+        rows = conn.execute(
+            sql,
+            {
+                "min_strength": MIN_STRENGTH,
+                "pid": int(PORTFOLIO_ID),
+            },
+        ).mappings().all()
 
     return list(rows)
 
@@ -96,27 +103,32 @@ def create_limit_order(symbol: str, side: str, strength: float):
     atr_val, last_price = compute_atr(symbol)
 
     if last_price is None:
-        # fallback for safety
+        # Fallback pre istotu
         last_price = DEFAULT_ENTRY_PRICE
 
     # Price adjustment
-    entry_price = last_price * (1 + ATR_PCT) if side.lower() == "buy" else last_price * (1 - ATR_PCT)
+    if side.lower() == "buy":
+        entry_price = last_price * (1 + ATR_PCT)
+    else:
+        entry_price = last_price * (1 - ATR_PCT)
+
     entry_price = round(entry_price, 2)
 
     qty = 1
 
-    # Limit order request
     req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
         side=OrderSide(side),
         limit_price=entry_price,
-        time_in_force=TimeInForce.DAY
+        time_in_force=TimeInForce.DAY,
     )
 
     try:
         order = trading_client.submit_order(req)
-        logger.info(f"Created order: {symbol} {side.upper()} @ {entry_price} | order_id={order.id}")
+        logger.info(
+            f"Created order: {symbol} {side.upper()} @ {entry_price} | order_id={order.id}"
+        )
     except Exception as e:
         logger.error(f"Failed to create order: {symbol} {side} | {e}")
 
@@ -148,7 +160,8 @@ def main_loop():
                     source = sig["source"]
 
                     logger.info(
-                        f"EXEC: {symbol} {side.upper()} | strength={strength:.4f} | source={source}"
+                        f"EXEC: {symbol} {side.upper()} | "
+                        f"strength={strength:.4f} | source={source}"
                     )
 
                     create_limit_order(symbol, side, strength)
