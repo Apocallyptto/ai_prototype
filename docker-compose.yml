@@ -63,7 +63,6 @@ services:
   signal_executor:
     build:
       context: .
-    image: ai_prototype-signal_executor
     container_name: trader_signal_executor
     depends_on:
       postgres:
@@ -74,14 +73,18 @@ services:
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
       ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
       ALPACA_DATA_URL: "https://data.alpaca.markets"
+
       MIN_STRENGTH: "0.20"
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "20"
       PORTFOLIO_ID: "1"
+      DEFAULT_ENTRY_PRICE: "200.0"
+
+      PYTHONPATH: "/app"        # ⬅ dôležité, aby vedel o balíku 'utils'
     volumes:
       - .:/app
     command: >
-      sh -lc "python -u services/signal_executor.py"
+      sh -lc "python -m services.signal_executor"   # ⬅ spúšťame modul, nie .py súbor
     restart: always
 
 
