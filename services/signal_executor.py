@@ -1,426 +1,167 @@
-# services/signal_executor.py
-
 import os
-import sys
 import time
-import uuid
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import datetime as dt
+from typing import List, Optional
 
-import math
-import psycopg2
-import psycopg2.extras
-
+import sqlalchemy as sa
+from sqlalchemy import text
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import LimitOrderRequest
+from alpaca.common.types import OrderSide, TimeInForce
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
-
-# --- Ensure project root (/app) is on sys.path inside Docker ---
-ROOT = Path(__file__).resolve().parent.parent  # /app
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-# Risk layer
-from jobs.risk_limits import (
-    load_limits_from_env,
-    compute_qty_for_long,
-    can_open_new_position,
-)
-
-log = logging.getLogger("signal_executor")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(levelname)s:%(name)s:%(message)s",
-)
-
-# -----------------------
-# ENV
-# -----------------------
-
-DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
+from utils.db import get_engine
+from utils.atr import compute_atr
 
 
-def _env_bool(name: str, default_true: bool = True) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default_true
-    return str(v).strip().lower() not in ("0", "false", "no")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("signal_executor")
 
 
-SYMBOLS: List[str] = [
-    s.strip().upper()
-    for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
-    if s.strip()
-]
+# ---------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------
+MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.20"))
+SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
+POLL_SECONDS = int(os.getenv("CRON_SLEEP_SECONDS", "20"))
+PORTFOLIO_ID = os.getenv("PORTFOLIO_ID", "1")     # default 1
+DEFAULT_ENTRY_PRICE = float(os.getenv("DEFAULT_ENTRY_PRICE", "200.0"))
 
-PORTFOLIO_ID: Optional[str] = os.getenv("PORTFOLIO_ID") or None
-MIN_STRENGTH: float = float(os.getenv("MIN_STRENGTH", "0.60"))
-POLL_SECONDS: int = int(os.getenv("SIGNAL_POLL_SECONDS", "20"))
-
-ALPACA_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_API_SECRET")
-ALPACA_PAPER = _env_bool("ALPACA_PAPER", default_true=True)
-
-# Risk config
-RISK_LIMITS = load_limits_from_env()
-
-# Fallback entry price (ak by zlyhalo data API)
-DEFAULT_ENTRY_PRICE: float = float(os.getenv("DEFAULT_ENTRY_PRICE", "200.0"))
-
-# ATR multipliers pre TP/SL
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))  # zatiaľ len placeholder
-ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))    # 1 % ceny ako proxy ATR
+ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 
 
-# -----------------------
-# Helpers
-# -----------------------
-
-def round_to_cent(price: float) -> float:
-    """Zaokrúhli na najbližší cent (2 desatinné miesta)."""
-    return float(f"{price:.2f}")
-
-
-# -----------------------
-# DB helpers
-# -----------------------
-
-def get_conn():
-    conn = psycopg2.connect(DB_URL)
-    conn.autocommit = True
-    return conn
+# ---------------------------------------------------------
+# DB + ALPACA CLIENT
+# ---------------------------------------------------------
+engine = get_engine()
+trading_client = TradingClient(
+    api_key=os.getenv("ALPACA_API_KEY"),
+    secret_key=os.getenv("ALPACA_API_SECRET"),
+    paper=os.getenv("TRADING_MODE", "paper") == "paper"
+)
 
 
-def fetch_unprocessed_signals(conn) -> List[Dict[str, Any]]:
-    q = """
-    SELECT id, created_at, symbol, side, strength, portfolio_id, status
-    FROM signals
-    WHERE
-        status = 'pending'
-        AND processed_at IS NULL
-        AND strength >= %s
-        AND symbol = ANY(%s)
-        AND (%s IS NULL OR portfolio_id = %s)
-    ORDER BY created_at ASC
-    LIMIT 20;
+# ---------------------------------------------------------
+# FETCH NEW SIGNALS
+# ---------------------------------------------------------
+def fetch_new_signals() -> List[dict]:
     """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(q, (MIN_STRENGTH, SYMBOLS, PORTFOLIO_ID, PORTFOLIO_ID))
-        rows = cur.fetchall()
-        return list(rows)
-
-
-def mark_signal(
-    conn,
-    signal_id: int,
-    status: str,
-    error: Optional[str] = None,
-    order_id: Optional[str] = None,
-    client_order_id: Optional[str] = None,
-    exec_order_id: Optional[str] = None,
-) -> None:
-    q = """
-    UPDATE signals
-    SET
-        status = %s,
-        processed_at = NOW(),
-        error = %s,
-        order_id = %s,
-        client_order_id = %s,
-        exec_order_id = %s
-    WHERE id = %s;
+    Fetch ML + RULES signals that match:
+      - strength >= MIN_STRENGTH
+      - symbol in SYMBOLS
+      - source IN ('rules', 'ml_gbc_5m')
+      - matches portfolio_id
+      - created in last 30 min
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            q,
-            (status, error, order_id, client_order_id, exec_order_id, signal_id),
-        )
 
-
-# -----------------------
-# Order ID extractor
-# -----------------------
-
-def _extract_ids(o: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    if o is None:
-        return (None, None, None)
-
-    # Alpaca Order object
-    if hasattr(o, "id"):
-        return (
-            str(getattr(o, "id", None)) if getattr(o, "id", None) is not None else None,
-            str(getattr(o, "client_order_id", None))
-            if getattr(o, "client_order_id", None) is not None
-            else None,
-            None,
-        )
-
-    # dict
-    if isinstance(o, dict):
-        oid = o.get("id")
-        coid = o.get("client_order_id")
-        xoid = o.get("exec_order_id")
-        return (
-            str(oid) if oid is not None else None,
-            str(coid) if coid is not None else None,
-            str(xoid) if xoid is not None else None,
-        )
-
-    # tuple/list
-    if isinstance(o, (tuple, list)):
-        oid = o[0] if len(o) > 0 else None
-        coid = o[1] if len(o) > 1 else None
-        xoid = o[2] if len(o) > 2 else None
-        return (
-            str(oid) if oid is not None else None,
-            str(coid) if coid is not None else None,
-            str(xoid) if xoid is not None else None,
-        )
-
-    # fallback
-    try:
-        return (
-            str(getattr(o, "id", None)) if getattr(o, "id", None) is not None else None,
-            str(getattr(o, "client_order_id", None))
-            if getattr(o, "client_order_id", None) is not None
-            else None,
-            None,
-        )
-    except Exception:
-        return (None, None, None)
-
-
-# -----------------------
-# Price helper (Alpaca data)
-# -----------------------
-
-_data_client: Optional[StockHistoricalDataClient] = None
-
-
-def get_data_client() -> StockHistoricalDataClient:
-    global _data_client
-    if _data_client is None:
-        _data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
-    return _data_client
-
-
-def get_last_price(symbol: str) -> float:
-    """
-    Skúsi získať posledný trade z Alpaca data API.
-    Ak zlyhá, použije DEFAULT_ENTRY_PRICE.
-    """
-    try:
-        dc = get_data_client()
-        req = StockLatestTradeRequest(symbol_or_symbols=symbol)
-        out = dc.get_stock_latest_trade(req)
-        trade = out[symbol]
-        price = float(trade.price)
-        return price
-    except Exception as e:
-        log.warning(
-            "failed to get last price for %s from data API (%s), using DEFAULT_ENTRY_PRICE=%.2f",
+    sql = text("""
+        SELECT
+            id,
+            created_at,
             symbol,
-            e,
-            DEFAULT_ENTRY_PRICE,
-        )
-        return DEFAULT_ENTRY_PRICE
+            side,
+            strength,
+            source,
+            portfolio_id
+        FROM signals
+        WHERE strength >= :min_strength
+          AND symbol = ANY(:symbols)
+          AND source IN ('rules', 'ml_gbc_5m')
+          AND (portfolio_id = :pid OR portfolio_id IS NULL)
+          AND created_at >= (NOW() - INTERVAL '30 minutes')
+        ORDER BY created_at ASC
+    """)
+
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {
+            "min_strength": MIN_STRENGTH,
+            "symbols": SYMBOLS,
+            "pid": int(PORTFOLIO_ID)
+        }).mappings().all()
+
+    return list(rows)
 
 
-# -----------------------
-# Risk-aware processing
-# -----------------------
+# ---------------------------------------------------------
+# ORDER CREATION
+# ---------------------------------------------------------
+def create_limit_order(symbol: str, side: str, strength: float):
+    """
+    Place limit order using ATR-based logic.
+    """
 
-def process_one(tc: TradingClient, sig: Dict[str, Any], conn) -> None:
-    symbol = sig["symbol"]
-    side = sig["side"]
-    signal_id = sig["id"]
+    # Compute ATR on recent data (Yahoo-based via utils.atr)
+    atr_val, last_price = compute_atr(symbol)
 
-    # 1) max open positions guard
-    open_positions = tc.get_all_positions()
-    if not can_open_new_position(len(open_positions), RISK_LIMITS):
-        log.info(
-            "risk_guard: max_open_positions=%s reached, SKIPPING signal id=%s symbol=%s",
-            RISK_LIMITS.max_open_positions,
-            signal_id,
-            symbol,
-        )
-        mark_signal(conn, signal_id, status="skipped_risk", error="max_open_positions")
-        return
+    if last_price is None:
+        # fallback for safety
+        last_price = DEFAULT_ENTRY_PRICE
 
-    # 2) account equity
-    account = tc.get_account()
-    try:
-        equity = float(account.equity)
-    except Exception:
-        equity = 0.0
+    # Price adjustment
+    entry_price = last_price * (1 + ATR_PCT) if side.lower() == "buy" else last_price * (1 - ATR_PCT)
+    entry_price = round(entry_price, 2)
 
-    # 3) entry price = reálna posledná cena z data API (alebo fallback)
-    entry_px = get_last_price(symbol)
-    entry_px = round_to_cent(entry_px)
+    qty = 1
 
-    # jednoduchý ATR: percento z ceny (napr. 1 %)
-    atr = entry_px * ATR_PCT
-
-    if side.lower() == "buy":
-        sl_px = entry_px - SL_ATR_MULT * atr
-        tp_px = entry_px + TP_ATR_MULT * atr
-
-        # zaokrúhli na centy
-        sl_px = round_to_cent(sl_px)
-        tp_px = round_to_cent(tp_px)
-
-        # bezpečnostná poistka: TP musí byť aspoň entry + 0.01
-        min_tp = round_to_cent(entry_px + 0.01)
-        if tp_px < min_tp:
-            tp_px = min_tp
-
-    else:
-        # pre short – len pre úplnosť
-        sl_px = entry_px + SL_ATR_MULT * atr
-        tp_px = entry_px - TP_ATR_MULT * atr
-
-        sl_px = round_to_cent(sl_px)
-        tp_px = round_to_cent(tp_px)
-        # pri shorte by TP malo byť <= entry - 0.01, ale Alpaca to vie zvalidovať
-
-    # 4) risk-based sizing podľa entry a SL
-    qty = compute_qty_for_long(
-        entry_price=entry_px,
-        stop_loss_price=sl_px,
-        equity=equity,
-        limits=RISK_LIMITS,
-    )
-
-    if qty <= 0:
-        log.info(
-            "risk_guard: qty=0, SKIPPING signal id=%s symbol=%s entry=%.2f sl=%.2f equity=%.2f",
-            signal_id,
-            symbol,
-            entry_px,
-            sl_px,
-            equity,
-        )
-        mark_signal(conn, signal_id, status="skipped_risk", error="qty_zero")
-        return
-
-    # 5) BRACKET market order s TP/SL (nový alpaca-py štýl)
-    client_id = str(uuid.uuid4())
-    order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-
-    order_req = MarketOrderRequest(
+    # Limit order request
+    req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
-        side=order_side,
-        time_in_force=TimeInForce.DAY,
-        order_class=OrderClass.BRACKET,
-        take_profit=TakeProfitRequest(limit_price=tp_px),
-        stop_loss=StopLossRequest(stop_price=sl_px),
-        client_order_id=client_id,
+        side=OrderSide(side),
+        limit_price=entry_price,
+        time_in_force=TimeInForce.DAY
     )
 
-    o = tc.submit_order(order_req)
-    oid, coid, xoid = _extract_ids(o)
+    try:
+        order = trading_client.submit_order(req)
+        logger.info(f"Created order: {symbol} {side.upper()} @ {entry_price} | order_id={order.id}")
+    except Exception as e:
+        logger.error(f"Failed to create order: {symbol} {side} | {e}")
 
-    log.info(
-        "submitted BRACKET: %s %s | qty=%s | entry=%.2f | tp=%.2f | sl=%.2f | oid=%s client_order_id=%s",
-        symbol,
-        side,
-        qty,
-        entry_px,
-        tp_px,
-        sl_px,
-        oid,
-        coid,
+
+# ---------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------
+def main_loop():
+    logger.info(
+        f"signal_executor starting | "
+        f"MIN_STRENGTH={MIN_STRENGTH} | SYMBOLS={SYMBOLS} | "
+        f"PORTFOLIO_ID={PORTFOLIO_ID} | POLL={POLL_SECONDS}s | "
+        f"ATR_PCT={ATR_PCT:.4f} | TP_ATR_MULT={TP_ATR_MULT} | SL_ATR_MULT={SL_ATR_MULT}"
     )
 
-    if oid is None and coid is None:
-        raise RuntimeError("broker returned no order IDs")
-
-    mark_signal(
-        conn,
-        signal_id,
-        status="submitted",
-        error=None,
-        order_id=oid,
-        client_order_id=coid,
-        exec_order_id=xoid,
-    )
-
-
-# -----------------------
-# Main loop
-# -----------------------
-
-def loop(tc: TradingClient, conn) -> None:
-    log.info(
-        "signal_executor starting | MIN_STRENGTH=%.2f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | RISK=%s | DEFAULT_ENTRY_PRICE=%.2f | ATR_PCT=%.4f | TP_ATR_MULT=%.2f | SL_ATR_MULT=%.2f",
-        MIN_STRENGTH,
-        ",".join(SYMBOLS),
-        PORTFOLIO_ID or "",
-        POLL_SECONDS,
-        RISK_LIMITS,
-        DEFAULT_ENTRY_PRICE,
-        ATR_PCT,
-        TP_ATR_MULT,
-        SL_ATR_MULT,
-    )
     while True:
         try:
-            sigs = fetch_unprocessed_signals(conn)
-            if not sigs:
-                log.info("no new signals")
-                time.sleep(POLL_SECONDS)
-                continue
+            signals = fetch_new_signals()
 
-            for sig in sigs:
-                try:
-                    process_one(tc, sig, conn)
-                except Exception as e:
-                    err = str(e)
-                    log.warning(
-                        "signal %s %s failed: %s", sig["symbol"], sig["side"], err
+            if not signals:
+                logger.info("no new signals")
+            else:
+                logger.info(f"Processing {len(signals)} signal(s)")
+
+                for sig in signals:
+                    symbol = sig["symbol"]
+                    side = sig["side"].lower()
+                    strength = sig["strength"]
+                    source = sig["source"]
+
+                    logger.info(
+                        f"EXEC: {symbol} {side.upper()} | strength={strength:.4f} | source={source}"
                     )
-                    try:
-                        mark_signal(
-                            conn,
-                            sig["id"],
-                            status="error",
-                            error=err,
-                            order_id=None,
-                            client_order_id=None,
-                            exec_order_id=None,
-                        )
-                    except Exception as inner:
-                        log.error(
-                            "failed to mark error for signal id=%s: %s",
-                            sig["id"],
-                            inner,
-                        )
+
+                    create_limit_order(symbol, side, strength)
+
+            time.sleep(POLL_SECONDS)
+
         except Exception as e:
-            log.error("main loop error: %s", e)
+            logger.exception(f"Loop error: {e}")
             time.sleep(POLL_SECONDS)
 
 
-def main():
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET must be set")
-
-    tc = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
-    conn = get_conn()
-    try:
-        loop(tc, conn)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
+# ---------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    main_loop()
