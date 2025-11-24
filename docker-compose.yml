@@ -63,7 +63,7 @@ services:
   signal_executor:
     build:
       context: .
-      image: ai_prototype-signal_executor
+    image: ai_prototype-signal_executor
     container_name: trader_signal_executor
     depends_on:
       postgres:
@@ -78,7 +78,6 @@ services:
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "20"
       PORTFOLIO_ID: "1"
-      PYTHONPATH: "/app"          # ⬅⬅⬅ TOTO PRIDAJ
     volumes:
       - .:/app
     command: >
