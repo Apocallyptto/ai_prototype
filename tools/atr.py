@@ -1,90 +1,104 @@
+# tools/atr.py
 """
-Ultra-robust ATR helper.
-1️⃣ Tries Alpaca data first (if API keys exist).
-2️⃣ Falls back to yfinance.
-3️⃣ If both fail, computes synthetic ATR using last known mid-price.
+ATR helper utilities.
+
+compute_atr(symbol: str, period: int = 14, lookback_days: int = 30)
+  -> (atr_value, last_close_price)
+
+Používa Yahoo Finance (yfinance) na stiahnutie OHLC dát.
 """
 
-from __future__ import annotations
-import math, os
+import datetime as dt
+import logging
+from typing import Tuple, Optional
+
 import pandas as pd
 import yfinance as yf
-from typing import Tuple, Optional
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+
+logger = logging.getLogger(__name__)
 
 
-def _true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["Close"].shift(1)
-    h_l = (df["High"] - df["Low"]).abs()
-    h_pc = (df["High"] - prev_close).abs()
-    l_pc = (df["Low"] - prev_close).abs()
-    return pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
-
-
-def _atr_from_df(df: pd.DataFrame, period: int) -> Tuple[float, float]:
-    tr = _true_range(df)
-    atr = tr.rolling(window=period, min_periods=period).mean().iloc[-1]
-    if not pd.notna(atr):
-        raise ValueError("ATR nan")
-    last_close = float(df["Close"].iloc[-1])
-    return float(atr), last_close
-
-
-def _fetch_alpaca(symbol: str, days: int) -> Optional[pd.DataFrame]:
-    key, sec = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET")
-    if not key or not sec:
-        return None
-    try:
-        cli = StockHistoricalDataClient(key, sec)
-        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=max(60, days + 10))
-        bars = cli.get_stock_bars(req)
-        df = bars.df
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(symbol, level="symbol")
-        return df.rename(columns=str.title)[["Open", "High", "Low", "Close"]]
-    except Exception:
-        return None
-
-
-def _fetch_yf(symbol: str, days: int) -> Optional[pd.DataFrame]:
-    try:
-        hist = yf.Ticker(symbol).history(period=f"{max(days,60)}d", interval="1d", auto_adjust=False)
-        if hist is None or hist.empty:
-            return None
-        return hist.rename(columns=str.title)[["Open", "High", "Low", "Close"]]
-    except Exception:
-        return None
-
-
-def get_atr(symbol: str, lookback_days: int = 30, period: int = 14) -> Tuple[float, float]:
+def _download_ohlc(symbol: str,
+                   lookback_days: int = 30,
+                   interval: str = "1d") -> Optional[pd.DataFrame]:
     """
-    Compute ATR(period) using Alpaca or Yahoo fallback.
-    Returns (atr, last_close). Never raises on network failures.
+    Stiahne OHLC dáta z Yahoo pre daný symbol.
     """
-    # 1️⃣ Try Alpaca
-    df = _fetch_alpaca(symbol, lookback_days)
-    if df is not None and not df.empty:
-        try:
-            return _atr_from_df(df.tail(max(lookback_days, period + 2)), period)
-        except Exception:
-            pass
+    end = dt.datetime.utcnow()
+    start = end - dt.timedelta(days=lookback_days + 5)  # +5 buffer
 
-    # 2️⃣ Try yfinance
-    df = _fetch_yf(symbol, lookback_days)
-    if df is not None and not df.empty:
-        try:
-            return _atr_from_df(df.tail(max(lookback_days, period + 2)), period)
-        except Exception:
-            pass
+    try:
+        df = yf.download(
+            symbol,
+            start=start,
+            end=end,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+        )
+    except Exception as e:
+        logger.error(f"Failed to download data for {symbol}: {e}")
+        return None
 
-    # 3️⃣ Last resort: synthetic ATR ≈ 0.25% of current price
-    from tools.quotes import get_bid_ask_mid
-    q = get_bid_ask_mid(symbol)
-    if q:
-        _, _, mid = q
-        return mid * 0.0025, mid
-    else:
-        # totally offline fallback
-        return 1.0, 100.0
+    if df is None or df.empty:
+        logger.warning(f"No data returned for {symbol}")
+        return None
+
+    # normalize columns
+    df = df.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+        }
+    )
+
+    return df
+
+
+def compute_atr(
+    symbol: str,
+    period: int = 14,
+    lookback_days: int = 30,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Compute Average True Range (ATR) a poslednú close cenu.
+
+    Returns:
+        (atr_value, last_close_price) – oboje môžu byť None, ak nie sú dáta.
+    """
+    df = _download_ohlc(symbol, lookback_days=lookback_days, interval="1d")
+    if df is None or len(df) < period + 1:
+        logger.warning(
+            f"Not enough data to compute ATR for {symbol} "
+            f"(len={0 if df is None else len(df)})"
+        )
+        return None, None
+
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    # True Range
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # ATR = SMA of TR
+    atr = tr.rolling(window=period).mean()
+
+    atr_val = float(atr.iloc[-1])
+    last_close = float(close.iloc[-1])
+
+    return atr_val, last_close
+
+
+if __name__ == "__main__":
+    # simple manual test
+    logging.basicConfig(level=logging.INFO)
+    for sym in ["AAPL", "MSFT", "SPY"]:
+        atr_val, last = compute_atr(sym)
+        print(f"{sym}: close={last}, ATR={atr_val}")
