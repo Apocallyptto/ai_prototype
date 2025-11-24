@@ -8,7 +8,7 @@ import sqlalchemy as sa
 from sqlalchemy import text
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
-from alpaca.common.types import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 from utils.db import get_engine
 from utils.atr import compute_atr
