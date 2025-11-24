@@ -56,7 +56,6 @@ def fetch_new_signals() -> List[dict]:
       - created in last 30 minutes
     """
 
-    # Vytvoríme presne taký IN zoznam, ako používaš v ručnom psql dotaze
     symbols_list = ",".join(f"'{s.strip()}'" for s in SYMBOLS if s.strip())
 
     sql_str = f"""
@@ -99,21 +98,17 @@ def create_limit_order(symbol: str, side: str, strength: float):
     Place limit order using ATR-based logic.
     """
 
-    # Compute ATR on recent data (Yahoo-based via utils.atr)
     atr_val, last_price = compute_atr(symbol)
 
     if last_price is None:
-        # Fallback pre istotu
         last_price = DEFAULT_ENTRY_PRICE
 
-    # Price adjustment
     if side.lower() == "buy":
         entry_price = last_price * (1 + ATR_PCT)
     else:
         entry_price = last_price * (1 - ATR_PCT)
 
     entry_price = round(entry_price, 2)
-
     qty = 1
 
     req = LimitOrderRequest(
