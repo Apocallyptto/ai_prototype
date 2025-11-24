@@ -77,7 +77,7 @@ services:
       MIN_STRENGTH: "0.20"
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "20"
-      PORTFOLIO_ID: "1" 
+      PORTFOLIO_ID: "1"
     volumes:
       - .:/app
     command: >
