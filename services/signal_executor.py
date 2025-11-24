@@ -1,8 +1,7 @@
 import os
 import time
 import logging
-import datetime as dt
-from typing import List, Optional
+from typing import List
 
 import sqlalchemy as sa
 from sqlalchemy import text
@@ -10,8 +9,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-from utils.db import get_engine
-from utils.atr import compute_atr
+from utils import get_engine, compute_atr
 
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +34,7 @@ SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 # DB + ALPACA CLIENT
 # ---------------------------------------------------------
 engine = get_engine()
+
 trading_client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
     secret_key=os.getenv("ALPACA_API_SECRET"),
@@ -98,9 +97,11 @@ def create_limit_order(symbol: str, side: str, strength: float):
     Place limit order using ATR-based logic.
     """
 
+    # Compute ATR on recent data (Yahoo-based via tools.atr -> utils.compute_atr)
     atr_val, last_price = compute_atr(symbol)
 
     if last_price is None:
+        # Fallback pre istotu
         last_price = DEFAULT_ENTRY_PRICE
 
     if side.lower() == "buy":
@@ -109,6 +110,7 @@ def create_limit_order(symbol: str, side: str, strength: float):
         entry_price = last_price * (1 - ATR_PCT)
 
     entry_price = round(entry_price, 2)
+
     qty = 1
 
     req = LimitOrderRequest(
