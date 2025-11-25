@@ -91,7 +91,8 @@ def compute_atr(
     atr = tr.rolling(window=period).mean()
 
     atr_val = float(atr.iloc[-1])
-    last_close = float(close.iloc[-1])
+    last_close = float(close.iloc[-1].item())
+
 
     return atr_val, last_close
 
