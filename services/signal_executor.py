@@ -59,7 +59,6 @@ def fetch_new_signals() -> List[dict]:
       - created_at v posledných 30 minútach
     """
 
-    # spravíme presný IN zoznam, aby to bolo identické ako ručné psql
     symbols_list = ",".join(f"'{s}'" for s in SYMBOLS)
 
     sql = text(
@@ -87,11 +86,13 @@ def fetch_new_signals() -> List[dict]:
             sql,
             {
                 "min_strength": MIN_STRENGTH,
-                "pid": int(PORTFOLIO_ID),
+                # 👇 POSIELAME STRING, NIE int()
+                "pid": PORTFOLIO_ID,
             },
         ).mappings().all()
 
     return list(rows)
+
 
 
 # ---------------------------------------------------------
