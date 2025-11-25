@@ -30,23 +30,23 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      # DB
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
+      # --- DB (lokálny postgres kontajner) ---
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
 
-      # ML settings
+      # --- ML / signály ---
       SYMBOLS: "AAPL,MSFT,SPY"
       MIN_STRENGTH: "0.20"
       CRON_SLEEP_SECONDS: "180"
 
-      # Alpaca
+      # --- Alpaca ---
       ALPACA_API_KEY: "${ALPACA_API_KEY}"
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
       ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
       ALPACA_DATA_URL: "https://data.alpaca.markets"
 
+      PYTHONPATH: "/app"
     volumes:
       - .:/app
-
     command: >
       sh -lc "
         echo 'signal_maker starting...';
@@ -63,28 +63,33 @@ services:
   signal_executor:
     build:
       context: .
+    image: ai_prototype-signal_executor
     container_name: trader_signal_executor
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
+      # --- DB (rovnaká ako signal_maker) ---
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+
+      # --- Alpaca ---
       ALPACA_API_KEY: "${ALPACA_API_KEY}"
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
       ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
       ALPACA_DATA_URL: "https://data.alpaca.markets"
 
+      # --- Executor config ---
       MIN_STRENGTH: "0.20"
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "20"
       PORTFOLIO_ID: "1"
       DEFAULT_ENTRY_PRICE: "200.0"
 
-      PYTHONPATH: "/app"        # ⬅ dôležité, aby vedel o balíku 'utils'
+      PYTHONPATH: "/app"
     volumes:
       - .:/app
     command: >
-      sh -lc "python -m services.signal_executor"   # ⬅ spúšťame modul, nie .py súbor
+      sh -lc "python -m services.signal_executor"
     restart: always
 
 
@@ -97,9 +102,15 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
+      # --- DB ---
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+      # --- Alpaca ---
       ALPACA_API_KEY: "${ALPACA_API_KEY}"
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+
+      PYTHONPATH: "/app"
     volumes:
       - .:/app
     command: >
@@ -116,9 +127,15 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DB_URL: postgresql://postgres:postgres@postgres:5432/trader
+      # --- DB ---
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+      # --- Alpaca ---
       ALPACA_API_KEY: "${ALPACA_API_KEY}"
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+
+      PYTHONPATH: "/app"
     volumes:
       - .:/app
     command: >
