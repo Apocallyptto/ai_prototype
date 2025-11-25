@@ -3,7 +3,6 @@ import time
 import logging
 from typing import List
 
-import sqlalchemy as sa
 from sqlalchemy import text
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
@@ -20,11 +19,16 @@ logger = logging.getLogger("signal_executor")
 # CONFIG
 # ---------------------------------------------------------
 MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.20"))
+
+# napr. "AAPL,MSFT,SPY"
 SYMBOLS = os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",")
+SYMBOLS = [s.strip().upper() for s in SYMBOLS if s.strip()]
+
 POLL_SECONDS = int(os.getenv("CRON_SLEEP_SECONDS", "20"))
 PORTFOLIO_ID = os.getenv("PORTFOLIO_ID", "1")  # default 1
 DEFAULT_ENTRY_PRICE = float(os.getenv("DEFAULT_ENTRY_PRICE", "200.0"))
 
+# ATR / entry tuning
 ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
@@ -47,17 +51,19 @@ trading_client = TradingClient(
 # ---------------------------------------------------------
 def fetch_new_signals() -> List[dict]:
     """
-    Fetch ML + RULES signals that match:
+    Fetch RULES + ML (gbc_5m) signály, ktoré spĺňajú:
       - strength >= MIN_STRENGTH
-      - symbol in SYMBOLS
+      - symbol v SYMBOLS
       - source IN ('rules', 'ml_gbc_5m')
-      - matches portfolio_id (or portfolio_id IS NULL)
-      - created in last 30 minutes
+      - (portfolio_id = PORTFOLIO_ID alebo NULL)
+      - created_at v posledných 30 minútach
     """
 
-    symbols_list = ",".join(f"'{s.strip()}'" for s in SYMBOLS if s.strip())
+    # spravíme presný IN zoznam, aby to bolo identické ako ručné psql
+    symbols_list = ",".join(f"'{s}'" for s in SYMBOLS)
 
-    sql_str = f"""
+    sql = text(
+        f"""
         SELECT
             id,
             created_at,
@@ -73,9 +79,8 @@ def fetch_new_signals() -> List[dict]:
           AND (portfolio_id = :pid OR portfolio_id IS NULL)
           AND created_at >= (NOW() - INTERVAL '30 minutes')
         ORDER BY created_at ASC
-    """
-
-    sql = text(sql_str)
+        """
+    )
 
     with engine.begin() as conn:
         rows = conn.execute(
@@ -94,29 +99,28 @@ def fetch_new_signals() -> List[dict]:
 # ---------------------------------------------------------
 def create_limit_order(symbol: str, side: str, strength: float):
     """
-    Place limit order using ATR-based logic.
+    Vytvorí limitný príkaz pomocou ATR logiky (compute_atr).
     """
 
-    # Compute ATR on recent data (Yahoo-based via tools.atr -> utils.compute_atr)
+    # ATR + posledná cena z utils.compute_atr()
     atr_val, last_price = compute_atr(symbol)
 
     if last_price is None:
-        # Fallback pre istotu
         last_price = DEFAULT_ENTRY_PRICE
 
-    if side.lower() == "buy":
+    side_l = side.lower()
+    if side_l == "buy":
         entry_price = last_price * (1 + ATR_PCT)
     else:
         entry_price = last_price * (1 - ATR_PCT)
 
     entry_price = round(entry_price, 2)
-
-    qty = 1
+    qty = 1  # zatiaľ fixne, neskôr môžeme napojiť risk mgmt
 
     req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
-        side=OrderSide(side),
+        side=OrderSide(side_l),
         limit_price=entry_price,
         time_in_force=TimeInForce.DAY,
     )
@@ -124,10 +128,11 @@ def create_limit_order(symbol: str, side: str, strength: float):
     try:
         order = trading_client.submit_order(req)
         logger.info(
-            f"Created order: {symbol} {side.upper()} @ {entry_price} | order_id={order.id}"
+            f"Created order: {symbol} {side_l.upper()} @ {entry_price} | "
+            f"order_id={order.id} | strength={strength:.4f}"
         )
     except Exception as e:
-        logger.error(f"Failed to create order: {symbol} {side} | {e}")
+        logger.error(f"Failed to create order: {symbol} {side_l} | {e}")
 
 
 # ---------------------------------------------------------
@@ -135,10 +140,11 @@ def create_limit_order(symbol: str, side: str, strength: float):
 # ---------------------------------------------------------
 def main_loop():
     logger.info(
-        f"signal_executor starting | "
+        "signal_executor starting | "
         f"MIN_STRENGTH={MIN_STRENGTH} | SYMBOLS={SYMBOLS} | "
         f"PORTFOLIO_ID={PORTFOLIO_ID} | POLL={POLL_SECONDS}s | "
-        f"ATR_PCT={ATR_PCT:.4f} | TP_ATR_MULT={TP_ATR_MULT} | SL_ATR_MULT={SL_ATR_MULT}"
+        f"ATR_PCT={ATR_PCT:.4f} | TP_ATR_MULT={TP_ATR_MULT} | "
+        f"SL_ATR_MULT={SL_ATR_MULT}"
     )
 
     while True:
@@ -152,8 +158,8 @@ def main_loop():
 
                 for sig in signals:
                     symbol = sig["symbol"]
-                    side = sig["side"].lower()
-                    strength = sig["strength"]
+                    side = sig["side"]
+                    strength = float(sig["strength"])
                     source = sig["source"]
 
                     logger.info(
