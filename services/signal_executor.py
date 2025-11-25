@@ -6,7 +6,7 @@ from typing import List
 import sqlalchemy as sa
 from sqlalchemy import text
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
 from utils import get_engine, compute_atr
@@ -29,6 +29,11 @@ ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 
+# cooldown na chyby typu "insufficient buying power" / "insufficient qty"
+INSUFFICIENT_COOLDOWN_SECONDS = int(
+    os.getenv("INSUFFICIENT_COOLDOWN_SECONDS", "900")  # 15 min default
+)
+
 
 # ---------------------------------------------------------
 # DB + ALPACA CLIENT
@@ -39,6 +44,9 @@ trading_client = TradingClient(
     secret_key=os.getenv("ALPACA_API_SECRET"),
     paper=os.getenv("TRADING_MODE", "paper") == "paper",
 )
+
+# (symbol, side) -> timestamp (do kedy skipnúť kvôli insufficient error)
+INSUFFICIENT_COOLDOWN = {}  # type: ignore[var-annotated]
 
 
 # ---------------------------------------------------------
@@ -102,14 +110,21 @@ def fetch_new_signals() -> List[dict]:
 def get_open_orders_for_symbol(symbol: str):
     """
     Return all OPEN orders for given symbol from Alpaca.
+    Používa nový alpaca-py štýl: GetOrdersRequest + filter=
     """
     try:
-        orders = trading_client.get_orders(
+        req = GetOrdersRequest(
             status=QueryOrderStatus.OPEN,
             symbols=[symbol],
-            nested=False,
         )
-        return list(orders)
+        orders = trading_client.get_orders(filter=req)
+        orders_list = list(orders) if orders is not None else []
+        logger.info(
+            "get_open_orders_for_symbol(%s) -> %d open order(s)",
+            symbol,
+            len(orders_list),
+        )
+        return orders_list
     except Exception as e:
         logger.error("get_open_orders_for_symbol(%s) failed: %s", symbol, e)
         return []
@@ -137,7 +152,7 @@ def cleanup_and_check(symbol: str, side: str) -> bool:
                 desired_side.upper(),
                 o_side.upper(),
                 o.id,
-                o.limit_price,
+                getattr(o, "limit_price", None),
             )
             return False
 
@@ -152,7 +167,7 @@ def cleanup_and_check(symbol: str, side: str) -> bool:
                     o_side.upper(),
                     o.id,
                     symbol,
-                    o.limit_price,
+                    getattr(o, "limit_price", None),
                     desired_side.upper(),
                 )
             except Exception as e:
@@ -170,22 +185,38 @@ def cleanup_and_check(symbol: str, side: str) -> bool:
 # ---------------------------------------------------------
 def create_limit_order(symbol: str, side: str, strength: float):
     """
-    Place limit order using ATR-based logic + wash-trade guard:
+    Place limit order using ATR-based logic + guardrails:
       - skip if same-side open order already exists
       - cancel opposite-side open order before placing new
+      - cooldown po 'insufficient buying power/qty' errore
     """
+    side = side.lower()
+    key = (symbol, side)
+    now_ts = time.time()
 
+    # 0) cooldown po insufficient error
+    until = INSUFFICIENT_COOLDOWN.get(key)
+    if until is not None and now_ts < until:
+        logger.info(
+            "Skip %s %s: still in insufficient cooldown until %s",
+            symbol,
+            side.upper(),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)),
+        )
+        return
+
+    # 1) wash-trade guard
     if not cleanup_and_check(symbol, side):
         # same-side order already exists, skip
         return
 
-    # Compute ATR / last price
+    # 2) Compute ATR / last price
     atr_val, last_price = compute_atr(symbol)
 
     if last_price is None:
         last_price = DEFAULT_ENTRY_PRICE
 
-    if side.lower() == "buy":
+    if side == "buy":
         entry_price = last_price * (1 + ATR_PCT)
     else:
         entry_price = last_price * (1 - ATR_PCT)
@@ -211,7 +242,21 @@ def create_limit_order(symbol: str, side: str, strength: float):
             order.id,
         )
     except Exception as e:
-        logger.error("Failed to create order: %s %s | %s", symbol, side, e)
+        msg = str(e)
+        logger.error("Failed to create order: %s %s | %s", symbol, side, msg)
+
+        # jednoduchý risk guard – ak nemáš buying power/qty,
+        # nastavíme cooldown, aby to nespamovalo každých 20 sekúnd
+        if "insufficient buying power" in msg or "insufficient qty available" in msg:
+            cooldown_until = now_ts + INSUFFICIENT_COOLDOWN_SECONDS
+            INSUFFICIENT_COOLDOWN[key] = cooldown_until
+            logger.warning(
+                "Set insufficient cooldown for %s %s for %d seconds (until %s)",
+                symbol,
+                side.upper(),
+                INSUFFICIENT_COOLDOWN_SECONDS,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cooldown_until)),
+            )
 
 
 # ---------------------------------------------------------
