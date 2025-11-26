@@ -30,14 +30,14 @@ TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 
 # --- RISK / SIZING ---
-MAX_RISK_PER_TRADE_USD = float(os.getenv("MAX_RISK_PER_TRADE_USD", "50"))       # $ riziko na obchod
-MAX_QTY_PER_TRADE = int(os.getenv("MAX_QTY_PER_TRADE", "10"))                   # max shares
-MAX_NOTIONAL_PER_TRADE_USD = float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "1000"))  # max $ veľkosť
-MAX_BP_PCT_PER_TRADE = float(os.getenv("MAX_BP_PCT_PER_TRADE", "0.25"))         # max 25% buying power na obchod
+MAX_RISK_PER_TRADE_USD = float(os.getenv("MAX_RISK_PER_TRADE_USD", "50"))
+MAX_QTY_PER_TRADE = int(os.getenv("MAX_QTY_PER_TRADE", "10"))
+MAX_NOTIONAL_PER_TRADE_USD = float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "1000"))
+MAX_BP_PCT_PER_TRADE = float(os.getenv("MAX_BP_PCT_PER_TRADE", "0.25"))
 
 # cooldown na chyby typu "insufficient buying power" / "insufficient qty"
 INSUFFICIENT_COOLDOWN_SECONDS = int(
-    os.getenv("INSUFFICIENT_COOLDOWN_SECONDS", "900")  # 15 min default
+    os.getenv("INSUFFICIENT_COOLDOWN_SECONDS", "900")  # 15 min
 )
 
 
@@ -53,6 +53,9 @@ trading_client = TradingClient(
 
 # (symbol, side) -> timestamp (do kedy skipnúť kvôli insufficient error)
 INSUFFICIENT_COOLDOWN: dict[Tuple[str, str], float] = {}
+
+# ID-čka signálov, ktoré už boli spracované (aby sme ich nerobili stále dokola)
+PROCESSED_SIGNAL_IDS: set[int] = set()
 
 
 # ---------------------------------------------------------
@@ -111,6 +114,59 @@ def fetch_new_signals() -> List[dict]:
 
 
 # ---------------------------------------------------------
+# SIGNAL SELECTION / DEDUPE
+# ---------------------------------------------------------
+def select_signals(signals: List[dict]) -> List[dict]:
+    """
+    - odfiltruje signály, ktoré už boli spracované (podľa id)
+    - pre každé (symbol, side) nechá len 1 "najlepší" signál (najvyšší strength)
+    """
+    global PROCESSED_SIGNAL_IDS
+
+    if not signals:
+        return []
+
+    # 1) preskoč už spracované id-čka
+    new_signals = [s for s in signals if s["id"] not in PROCESSED_SIGNAL_IDS]
+
+    if not new_signals:
+        logger.info(
+            "select_signals | fetched=%d | new=0 | unique=0 (all already processed)",
+            len(signals),
+        )
+        return []
+
+    # 2) pre každý (symbol, side) nechaj signál s najvyšším strength
+    best_by_key: dict[Tuple[str, str], dict] = {}
+    for s in new_signals:
+        key = (s["symbol"], s["side"].lower())
+        current = best_by_key.get(key)
+        if current is None or s["strength"] > current["strength"]:
+            best_by_key[key] = s
+
+    selected = list(best_by_key.values())
+
+    logger.info(
+        "select_signals | fetched=%d | new=%d | unique_symbol_side=%d",
+        len(signals),
+        len(new_signals),
+        len(selected),
+    )
+
+    # jednoduchá ochrana, aby set nerástol donekonečna
+    if len(PROCESSED_SIGNAL_IDS) > 10000:
+        logger.info("select_signals | resetting PROCESSED_SIGNAL_IDS (size>10000)")
+        PROCESSED_SIGNAL_IDS = set()
+
+    return selected
+
+
+def mark_signal_processed(sig: dict):
+    sig_id = sig["id"]
+    PROCESSED_SIGNAL_IDS.add(sig_id)
+
+
+# ---------------------------------------------------------
 # HELPERS – ACCOUNT & ORDERS
 # ---------------------------------------------------------
 def get_buying_power() -> float:
@@ -133,7 +189,7 @@ def get_open_orders_for_symbol(symbol: str):
         req = GetOrdersRequest(
             status=QueryOrderStatus.OPEN,
             symbols=[symbol],
-            limit=500,  # nech vidíme naozaj všetko
+            limit=500,
         )
         orders = trading_client.get_orders(filter=req)
         orders_list = list(orders) if orders is not None else []
@@ -190,7 +246,7 @@ def cleanup_and_check(symbol: str, side: str) -> bool:
                 )
             except Exception as e:
                 msg = str(e)
-                if "order is already in \"filled\" state" in msg:
+                if 'order is already in "filled" state' in msg:
                     logger.info(
                         "Opposite order %s for %s already filled, continuing with new %s",
                         o.id,
@@ -245,7 +301,7 @@ def compute_order_qty(symbol: str, side: str, entry_price: float, atr_val: float
     qty = min(qty_by_risk, qty_by_notional, MAX_QTY_PER_TRADE)
     if qty < 1:
         logger.info(
-            "compute_order_qty(%s %s) -> qty<1 (risk=%s, notional=%s, bp=%s)",
+            "compute_order_qty(%s %s) -> qty<1 (risk=%.2f, notional=%.2f, bp=%.2f)",
             symbol,
             side.upper(),
             max_risk_dollars,
@@ -375,26 +431,30 @@ def main_loop():
         try:
             signals = fetch_new_signals()
 
-            if not signals:
-                logger.info("no new signals")
-            else:
-                logger.info("Processing %d signal(s)", len(signals))
+            selected = select_signals(signals)
 
-                for sig in signals:
+            if not selected:
+                logger.info("no new signals to execute")
+            else:
+                logger.info("Executing %d selected signal(s)", len(selected))
+
+                for sig in selected:
                     symbol = sig["symbol"]
                     side = sig["side"].lower()
                     strength = sig["strength"]
                     source = sig["source"]
 
                     logger.info(
-                        "EXEC: %s %s | strength=%.4f | source=%s",
+                        "EXEC: %s %s | strength=%.4f | source=%s | signal_id=%s",
                         symbol,
                         side.upper(),
                         strength,
                         source,
+                        sig["id"],
                     )
 
                     create_limit_order(symbol, side, strength)
+                    mark_signal_processed(sig)
 
             time.sleep(POLL_SECONDS)
 
