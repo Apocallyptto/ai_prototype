@@ -189,12 +189,21 @@ def cleanup_and_check(symbol: str, side: str) -> bool:
                     desired_side.upper(),
                 )
             except Exception as e:
-                logger.error(
-                    "Failed to cancel opposite order %s for %s: %s",
-                    o.id,
-                    symbol,
-                    e,
-                )
+                msg = str(e)
+                if "order is already in \"filled\" state" in msg:
+                    logger.info(
+                        "Opposite order %s for %s already filled, continuing with new %s",
+                        o.id,
+                        symbol,
+                        desired_side.upper(),
+                    )
+                else:
+                    logger.error(
+                        "Failed to cancel opposite order %s for %s: %s",
+                        o.id,
+                        symbol,
+                        msg,
+                    )
     return True
 
 
