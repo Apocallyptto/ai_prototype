@@ -44,6 +44,7 @@ services:
       ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
       ALPACA_DATA_URL: "https://data.alpaca.markets"
 
+      TRADING_MODE: "paper"
       PYTHONPATH: "/app"
     volumes:
       - .:/app
@@ -77,6 +78,7 @@ services:
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
       ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
       ALPACA_DATA_URL: "https://data.alpaca.markets"
+      TRADING_MODE: "paper"
 
       # --- Executor config ---
       MIN_STRENGTH: "0.20"
@@ -84,6 +86,18 @@ services:
       CRON_SLEEP_SECONDS: "20"
       PORTFOLIO_ID: "1"
       DEFAULT_ENTRY_PRICE: "200.0"
+
+      # --- ATR / TP / SL ---
+      ATR_PCT: "0.01"
+      TP_ATR_MULT: "1.5"
+      SL_ATR_MULT: "1.0"
+
+      # --- Risk / sizing guardrails ---
+      MAX_RISK_PER_TRADE_USD: "50"
+      MAX_QTY_PER_TRADE: "10"
+      MAX_NOTIONAL_PER_TRADE_USD: "1000"
+      MAX_BP_PCT_PER_TRADE: "1.0"          # dôležité – dovolí 1 share aj na malom účte
+      INSUFFICIENT_COOLDOWN_SECONDS: "900" # 15 min cooldown po insufficient chybe
 
       PYTHONPATH: "/app"
     volumes:
@@ -110,6 +124,7 @@ services:
       ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
       ALPACA_DATA_URL: "https://data.alpaca.markets"
 
+      TRADING_MODE: "paper"
       PYTHONPATH: "/app"
     volumes:
       - .:/app
@@ -135,6 +150,7 @@ services:
       ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
       ALPACA_DATA_URL: "https://data.alpaca.markets"
 
+      TRADING_MODE: "paper"
       PYTHONPATH: "/app"
     volumes:
       - .:/app
