@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from typing import List
+from typing import List, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy import text
@@ -29,6 +29,12 @@ ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.5"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 
+# --- RISK / SIZING ---
+MAX_RISK_PER_TRADE_USD = float(os.getenv("MAX_RISK_PER_TRADE_USD", "50"))       # $ riziko na obchod
+MAX_QTY_PER_TRADE = int(os.getenv("MAX_QTY_PER_TRADE", "10"))                   # max shares
+MAX_NOTIONAL_PER_TRADE_USD = float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "1000"))  # max $ veľkosť
+MAX_BP_PCT_PER_TRADE = float(os.getenv("MAX_BP_PCT_PER_TRADE", "0.25"))         # max 25% buying power na obchod
+
 # cooldown na chyby typu "insufficient buying power" / "insufficient qty"
 INSUFFICIENT_COOLDOWN_SECONDS = int(
     os.getenv("INSUFFICIENT_COOLDOWN_SECONDS", "900")  # 15 min default
@@ -46,7 +52,7 @@ trading_client = TradingClient(
 )
 
 # (symbol, side) -> timestamp (do kedy skipnúť kvôli insufficient error)
-INSUFFICIENT_COOLDOWN = {}  # type: ignore[var-annotated]
+INSUFFICIENT_COOLDOWN: dict[Tuple[str, str], float] = {}
 
 
 # ---------------------------------------------------------
@@ -105,8 +111,19 @@ def fetch_new_signals() -> List[dict]:
 
 
 # ---------------------------------------------------------
-# HELPERS AROUND OPEN ORDERS
+# HELPERS – ACCOUNT & ORDERS
 # ---------------------------------------------------------
+def get_buying_power() -> float:
+    try:
+        acc = trading_client.get_account()
+        bp = float(acc.buying_power)
+        return bp
+    except Exception as e:
+        logger.error("get_buying_power() failed: %s", e)
+        # fallback – radšej žiadny trade ako random
+        return 0.0
+
+
 def get_open_orders_for_symbol(symbol: str):
     """
     Return all OPEN orders for given symbol from Alpaca.
@@ -116,6 +133,7 @@ def get_open_orders_for_symbol(symbol: str):
         req = GetOrdersRequest(
             status=QueryOrderStatus.OPEN,
             symbols=[symbol],
+            limit=500,  # nech vidíme naozaj všetko
         )
         orders = trading_client.get_orders(filter=req)
         orders_list = list(orders) if orders is not None else []
@@ -181,6 +199,66 @@ def cleanup_and_check(symbol: str, side: str) -> bool:
 
 
 # ---------------------------------------------------------
+# POSITION SIZING
+# ---------------------------------------------------------
+def compute_order_qty(symbol: str, side: str, entry_price: float, atr_val: float | None) -> int:
+    """
+    Vypočíta qty podľa:
+      - MAX_RISK_PER_TRADE_USD
+      - MAX_NOTIONAL_PER_TRADE_USD
+      - MAX_BP_PCT_PER_TRADE
+      - ATR & SL_ATR_MULT
+    """
+    bp = get_buying_power()
+    if bp <= 0:
+        logger.warning("compute_order_qty(%s %s) -> buying power <= 0, skip", symbol, side.upper())
+        return 0
+
+    # max $ risk na jeden trade – obmedzené aj buying power
+    max_risk_dollars = min(MAX_RISK_PER_TRADE_USD, bp * MAX_BP_PCT_PER_TRADE)
+
+    # risk na 1 share = ATR * SL_MULT, fallback 2% ceny
+    if atr_val is not None and atr_val > 0:
+        risk_per_share = atr_val * SL_ATR_MULT
+    else:
+        risk_per_share = entry_price * 0.02
+
+    if risk_per_share <= 0:
+        logger.warning("compute_order_qty(%s %s) -> risk_per_share <= 0, skip", symbol, side.upper())
+        return 0
+
+    qty_by_risk = int(max_risk_dollars / risk_per_share)
+
+    # notional limit = min( MAX_NOTIONAL, MAX_BP_PCT * BP )
+    notional_limit = min(MAX_NOTIONAL_PER_TRADE_USD, bp * MAX_BP_PCT_PER_TRADE)
+    qty_by_notional = int(notional_limit / entry_price)
+
+    qty = min(qty_by_risk, qty_by_notional, MAX_QTY_PER_TRADE)
+    if qty < 1:
+        logger.info(
+            "compute_order_qty(%s %s) -> qty<1 (risk=%s, notional=%s, bp=%s)",
+            symbol,
+            side.upper(),
+            max_risk_dollars,
+            notional_limit,
+            bp,
+        )
+        return 0
+
+    logger.info(
+        "compute_order_qty(%s %s) -> qty=%d (risk_per_share=%.4f, max_risk=%.2f, notional_limit=%.2f, bp=%.2f)",
+        symbol,
+        side.upper(),
+        qty,
+        risk_per_share,
+        max_risk_dollars,
+        notional_limit,
+        bp,
+    )
+    return qty
+
+
+# ---------------------------------------------------------
 # ORDER CREATION
 # ---------------------------------------------------------
 def create_limit_order(symbol: str, side: str, strength: float):
@@ -189,6 +267,7 @@ def create_limit_order(symbol: str, side: str, strength: float):
       - skip if same-side open order already exists
       - cancel opposite-side open order before placing new
       - cooldown po 'insufficient buying power/qty' errore
+      - position sizing podľa risk parametrov
     """
     side = side.lower()
     key = (symbol, side)
@@ -222,7 +301,12 @@ def create_limit_order(symbol: str, side: str, strength: float):
         entry_price = last_price * (1 - ATR_PCT)
 
     entry_price = round(entry_price, 2)
-    qty = 1  # TODO: neskôr prepočítať podľa risku
+
+    # 3) position sizing
+    qty = compute_order_qty(symbol, side, entry_price, atr_val)
+    if qty < 1:
+        logger.info("Skip %s %s: computed qty < 1, no trade", symbol, side.upper())
+        return
 
     req = LimitOrderRequest(
         symbol=symbol,
@@ -235,10 +319,11 @@ def create_limit_order(symbol: str, side: str, strength: float):
     try:
         order = trading_client.submit_order(req)
         logger.info(
-            "Created order: %s %s @ %s | order_id=%s",
+            "Created order: %s %s @ %s x%d | order_id=%s",
             symbol,
             side.upper(),
             entry_price,
+            qty,
             order.id,
         )
     except Exception as e:
