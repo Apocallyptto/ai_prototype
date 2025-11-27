@@ -34,6 +34,19 @@ def load_pnl():
         return None
 
     df = pd.DataFrame(rows)
+
+    # --- Dôležité: pretypovať numerické stĺpce na float ---
+    numeric_cols = [
+        "equity",
+        "cash",
+        "buying_power",
+        "portfolio_value",
+        "long_market_value",
+        "short_market_value",
+    ]
+    for col in numeric_cols:
+        df[col] = df[col].astype(float)
+
     return df
 
 
@@ -41,10 +54,12 @@ def add_changes(df: pd.DataFrame) -> pd.DataFrame:
     # Sort pre istotu
     df = df.sort_values(["portfolio_id", "as_of_date"]).reset_index(drop=True)
 
-    # Pre každý portfolio_id spočítať day-over-day zmenu equity
+    # Day-over-day zmena equity pre každý portfolio_id
     df["equity_change"] = df.groupby("portfolio_id")["equity"].diff()
     df["equity_change_pct"] = (
-        df["equity_change"] / df.groupby("portfolio_id")["equity"].shift(1) * 100.0
+        df["equity_change"]
+        / df.groupby("portfolio_id")["equity"].shift(1)
+        * 100.0
     )
 
     return df
@@ -53,7 +68,6 @@ def add_changes(df: pd.DataFrame) -> pd.DataFrame:
 def print_report(df: pd.DataFrame):
     print("\n==== DAILY PnL (equity by day) ====\n")
 
-    # Kratší pohľad
     cols = [
         "as_of_date",
         "portfolio_id",
@@ -75,12 +89,14 @@ def print_report(df: pd.DataFrame):
     df_print["buying_power"] = df_print["buying_power"].round(2)
     df_print["portfolio_value"] = df_print["portfolio_value"].round(2)
 
-    # Vytlačiť
     print(df_print.to_string(index=False))
 
-    # Zhrnutie
     print("\n==== SUMMARY ====\n")
-    latest = df.sort_values(["as_of_date", "portfolio_id"]).groupby("portfolio_id").tail(1)
+    latest = (
+        df.sort_values(["as_of_date", "portfolio_id"])
+        .groupby("portfolio_id")
+        .tail(1)
+    )
 
     for _, row in latest.iterrows():
         pid = int(row["portfolio_id"])
