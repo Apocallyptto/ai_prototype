@@ -180,7 +180,7 @@ services:
 
       # --- PnL config ---
       PORTFOLIO_ID: "1"
-      PNL_POLL_SECONDS: "3600"   # 1x za hodinu, môžeš neskôr znížiť napr. na 300
+      PNL_POLL_SECONDS: "300"   # napr. každých 5 minút počas testu
 
       PYTHONPATH: "/app"
     volumes:
