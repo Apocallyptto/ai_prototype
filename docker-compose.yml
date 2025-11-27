@@ -96,8 +96,8 @@ services:
       MAX_RISK_PER_TRADE_USD: "50"
       MAX_QTY_PER_TRADE: "10"
       MAX_NOTIONAL_PER_TRADE_USD: "1000"
-      MAX_BP_PCT_PER_TRADE: "1.0"          # dôležité – dovolí 1 share aj na malom účte
-      INSUFFICIENT_COOLDOWN_SECONDS: "900" # 15 min cooldown po insufficient chybe
+      MAX_BP_PCT_PER_TRADE: "1.0"
+      INSUFFICIENT_COOLDOWN_SECONDS: "900"
 
       PYTHONPATH: "/app"
     volumes:
@@ -156,6 +156,36 @@ services:
       - .:/app
     command: >
       sh -lc "python -u services/oco_exit_monitor.py"
+    restart: always
+
+
+  pnl_recorder:
+    build:
+      context: .
+    image: ai_prototype-pnl_recorder
+    container_name: trader_pnl_recorder
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- DB ---
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+
+      # --- Alpaca ---
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+      TRADING_MODE: "paper"
+
+      PORTFOLIO_ID: "1"
+      PNL_POLL_SECONDS: "3600"   # raz za hodinu skúsi lognúť PnL
+
+      PYTHONPATH: "/app"
+    volumes:
+      - .:/app
+    command: >
+      sh -lc "python -u services.record_pnl"
     restart: always
 
 
