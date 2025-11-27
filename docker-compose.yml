@@ -79,7 +79,7 @@ services:
       TRADING_MODE: "paper"
 
       # --- Executor config ---
-      MIN_STRENGTH: "0.20"
+      MIN_STRENGTH: "0.60"
       SYMBOLS: "AAPL,MSFT,SPY"
       CRON_SLEEP_SECONDS: "20"
       PORTFOLIO_ID: "1"
