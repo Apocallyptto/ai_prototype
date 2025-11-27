@@ -178,14 +178,15 @@ services:
       ALPACA_DATA_URL: "https://data.alpaca.markets"
       TRADING_MODE: "paper"
 
+      # --- PnL config ---
       PORTFOLIO_ID: "1"
-      PNL_POLL_SECONDS: "3600"   # raz za hodinu skúsi lognúť PnL
+      PNL_POLL_SECONDS: "3600"   # 1x za hodinu, môžeš neskôr znížiť napr. na 300
 
       PYTHONPATH: "/app"
     volumes:
       - .:/app
     command: >
-      sh -lc "python -u services.record_pnl"
+      sh -lc "python -m services.record_pnl"
     restart: always
 
 
