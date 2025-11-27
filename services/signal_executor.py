@@ -40,6 +40,11 @@ INSUFFICIENT_COOLDOWN_SECONDS = int(
     os.getenv("INSUFFICIENT_COOLDOWN_SECONDS", "900")  # 15 min
 )
 
+# --- DAILY RISK GUARD (DD / max daily loss) ---
+ENABLE_DAILY_RISK_GUARD = os.getenv("ENABLE_DAILY_RISK_GUARD", "1") == "1"
+MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "200"))
+MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "2.0"))  # napr. -2 % za deň
+
 
 # ---------------------------------------------------------
 # DB + ALPACA CLIENT
@@ -324,6 +329,90 @@ def compute_order_qty(symbol: str, side: str, entry_price: float, atr_val: float
 
 
 # ---------------------------------------------------------
+# DAILY RISK GUARD
+# ---------------------------------------------------------
+def check_daily_risk_guard() -> bool:
+    """
+    Skontroluje, či sme neprekročili dennú stratu / drawdown.
+
+    Používa:
+      - equity z daily_pnl pre dnešný deň (začiatok dňa),
+      - aktuálnu equity z Alpacy.
+
+    Ak:
+      - daily_pnl <= -MAX_DAILY_LOSS_USD
+        alebo
+      - drawdown_pct <= -MAX_DRAWDOWN_PCT
+    => blokuje nové obchody (vráti False).
+    """
+    if not ENABLE_DAILY_RISK_GUARD:
+        return True
+
+    try:
+        # 1) dnesny start equity z daily_pnl
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT equity
+                    FROM daily_pnl
+                    WHERE as_of_date = CURRENT_DATE
+                      AND portfolio_id = :pid
+                    LIMIT 1
+                    """
+                ),
+                {"pid": int(PORTFOLIO_ID)},
+            ).first()
+    except Exception as e:
+        logger.error("check_daily_risk_guard: failed to read daily_pnl: %s", e)
+        return True  # ak nevieme zistiť, radšej neblokujeme
+
+    if row is None or row[0] is None:
+        logger.info(
+            "check_daily_risk_guard: no daily_pnl for today (portfolio_id=%s), guard skipped",
+            PORTFOLIO_ID,
+        )
+        return True
+
+    try:
+        start_equity = float(row[0])
+    except Exception as e:
+        logger.error("check_daily_risk_guard: failed to parse start_equity: %s", e)
+        return True
+
+    try:
+        acc = trading_client.get_account()
+        current_equity = float(acc.equity)
+    except Exception as e:
+        logger.error("check_daily_risk_guard: failed to fetch current equity: %s", e)
+        return True
+
+    daily_pnl = current_equity - start_equity
+    drawdown_pct = (daily_pnl / start_equity * 100.0) if start_equity > 0 else 0.0
+
+    logger.info(
+        "daily_risk_check | start_eq=%.2f current_eq=%.2f pnl=%.2f dd_pct=%.2f",
+        start_equity,
+        current_equity,
+        daily_pnl,
+        drawdown_pct,
+    )
+
+    if daily_pnl <= -MAX_DAILY_LOSS_USD or drawdown_pct <= -MAX_DRAWDOWN_PCT:
+        logger.warning(
+            "DAILY RISK LIMIT HIT! pnl=%.2f, dd_pct=%.2f <= limits (loss_usd=%.2f, dd_pct=%.2f). "
+            "No new trades will be opened today.",
+            daily_pnl,
+            drawdown_pct,
+            MAX_DAILY_LOSS_USD,
+            MAX_DRAWDOWN_PCT,
+        )
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------
 # ORDER CREATION
 # ---------------------------------------------------------
 def create_limit_order(symbol: str, side: str, strength: float):
@@ -417,7 +506,8 @@ def main_loop():
         "signal_executor starting | "
         "MIN_STRENGTH=%s | SYMBOLS=%s | "
         "PORTFOLIO_ID=%s | POLL=%ss | "
-        "ATR_PCT=%.4f | TP_ATR_MULT=%.1f | SL_ATR_MULT=%.1f",
+        "ATR_PCT=%.4f | TP_ATR_MULT=%.1f | SL_ATR_MULT=%.1f | "
+        "ENABLE_DAILY_RISK_GUARD=%s | MAX_DAILY_LOSS_USD=%.2f | MAX_DRAWDOWN_PCT=%.2f",
         MIN_STRENGTH,
         SYMBOLS,
         PORTFOLIO_ID,
@@ -425,12 +515,21 @@ def main_loop():
         ATR_PCT,
         TP_ATR_MULT,
         SL_ATR_MULT,
+        ENABLE_DAILY_RISK_GUARD,
+        MAX_DAILY_LOSS_USD,
+        MAX_DRAWDOWN_PCT,
     )
 
     while True:
         try:
-            signals = fetch_new_signals()
+            # 0) denný risk guard – ak sme už over limit, neotvárame nové obchody
+            if not check_daily_risk_guard():
+                logger.info("Daily risk guard active – skipping signal execution this loop")
+                time.sleep(POLL_SECONDS)
+                continue
 
+            # 1) fetch + výber signálov
+            signals = fetch_new_signals()
             selected = select_signals(signals)
 
             if not selected:
