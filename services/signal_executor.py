@@ -177,12 +177,25 @@ def mark_signal_processed(sig: dict):
 def get_buying_power() -> float:
     try:
         acc = trading_client.get_account()
+
         bp = float(acc.buying_power)
+
+        # Fallback: ak Alpaca vráti 0, ale máme cash, použijeme cash
+        if bp <= 0:
+            cash = float(acc.cash)
+            logger.warning(
+                "get_buying_power(): bp<=0 (%.2f), using cash instead (%.2f)",
+                bp,
+                cash,
+            )
+            bp = cash
+
         return bp
     except Exception as e:
         logger.error("get_buying_power() failed: %s", e)
-        # fallback – radšej žiadny trade ako random
+        # radšej žiadny trade ako random
         return 0.0
+
 
 
 def get_open_orders_for_symbol(symbol: str):
