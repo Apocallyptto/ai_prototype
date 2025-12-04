@@ -135,6 +135,8 @@ def print_table(rows):
         else:
             created_str = ""
 
+        status = r["status"] if r["status"] is not None else ""
+
         data.append(
             [
                 r["id"],
@@ -142,7 +144,7 @@ def print_table(rows):
                 r["symbol"],
                 r["side"],
                 float(r["strength"]) if r["strength"] is not None else None,
-                r["status"],
+                status,
                 str(r["order_id"]) if r["order_id"] else "",
                 str(r["client_order_id"]) if r["client_order_id"] else "",
                 error_short,
@@ -170,13 +172,17 @@ def print_summary(rows):
     by_status = {}
 
     for r in rows:
-        st = r["status"]
+        st_raw = r["status"]
+        # None -> "None" kvôli prehľadnosti
+        st = st_raw if st_raw is not None else "None"
         by_status[st] = by_status.get(st, 0) + 1
 
     print("Summary:")
     print(f"  Total signals in this view: {total}")
     for status, cnt in sorted(by_status.items(), key=lambda x: x[0]):
-        print(f"  {status:10s}: {cnt}")
+        status_str = str(status)
+        # formátuj ako text (šírka 10)
+        print(f"  {status_str:10s}: {cnt}")
     print()
 
 
