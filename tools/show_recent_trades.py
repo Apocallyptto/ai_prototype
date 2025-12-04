@@ -4,7 +4,7 @@ tools/show_recent_trades.py
 Rýchly prehľad posledných signálov zo signals tabuľky.
 Spúšťanie:
 
-  # lokálne (mimo dockeru):
+  # lokálne:
   PYTHONPATH=. python -m tools.show_recent_trades
 
   # v kontajneri:
@@ -22,15 +22,29 @@ import psycopg2.extras
 
 def get_db_url() -> str:
     """
-    Vráti DB URL z prostredia.
-    Použije prioritne DB_URL, inak fallback na localhost.
+    Vráti správne DB URL podľa projektu:
+    1) Preferuje DATABASE_URL (náš globálny štandard v projekte)
+    2) Potom PGHOST / PGUSER / PGPASSWORD / PGDATABASE ak existujú
+    3) Nakoniec padne na docker fallback
     """
-    url = os.getenv("DB_URL")
+
+    # HLAVNÁ PREMENNÁ – používame v celom projekte
+    url = os.getenv("DATABASE_URL")
     if url:
         return url
 
-    # fallback pre docker-compose setup
-    return "postgresql://postgres:postgres@postgres:5432/trader"
+    # sekundárna možnosť
+    url2 = os.getenv("DB_URL")
+    if url2:
+        return url2
+
+    # fallback pre docker compose
+    host = os.getenv("PGHOST", "postgres")
+    user = os.getenv("PGUSER", "postgres")
+    pwd = os.getenv("PGPASSWORD", "postgres")
+    db  = os.getenv("PGDATABASE", "trader")
+
+    return f"postgresql://{user}:{pwd}@{host}:5432/{db}"
 
 
 def fetch_recent_signals(limit: int = 20):
@@ -68,7 +82,6 @@ def print_table(rows):
         print("No signals found.")
         return
 
-    # hlavička tabuľky
     headers = [
         "id",
         "created_at_utc",
@@ -93,20 +106,21 @@ def print_table(rows):
             [
                 r["id"],
                 r["created_at_utc"].replace(tzinfo=timezone.utc).isoformat()
-                if r["created_at_utc"] is not None
-                else "",
+                if r["created_at_utc"] is not None else "",
                 r["symbol"],
                 r["side"],
                 float(r["strength"]) if r["strength"] is not None else None,
                 r["status"],
-                str(r["order_id"]) if r["order_id"] is not None else "",
-                str(r["client_order_id"]) if r["client_order_id"] is not None else "",
+                str(r["order_id"]) if r["order_id"] else "",
+                str(r["client_order_id"]) if r["client_order_id"] else "",
                 error_short,
             ]
         )
 
-    # jednoduché zarovnanie bez extra knižníc – fixed-width stĺpce
-    col_widths = [max(len(str(x)) for x in [h] + [row[i] for row in data]) for i, h in enumerate(headers)]
+    col_widths = [
+        max(len(str(x)) for x in [h] + [row[i] for row in data])
+        for i, h in enumerate(headers)
+    ]
 
     def fmt_row(row_vals):
         return " | ".join(str(val).ljust(col_widths[i]) for i, val in enumerate(row_vals))
@@ -122,6 +136,7 @@ def print_table(rows):
 def print_summary(rows):
     total = len(rows)
     by_status = {}
+
     for r in rows:
         st = r["status"]
         by_status[st] = by_status.get(st, 0) + 1
