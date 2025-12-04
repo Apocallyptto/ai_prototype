@@ -20,35 +20,62 @@ import psycopg2
 import psycopg2.extras
 
 
+def normalize_db_url_for_psycopg2(url: str) -> str:
+    """
+    Ak je URL vo forme SQLAlchemy (postgresql+psycopg2://),
+    pre psycopg2 ju musíme zmeniť na postgresql://
+    """
+    if not url:
+        return url
+
+    # Najčastejší prípad: postgresql+psycopg2://...
+    if url.startswith("postgresql+psycopg2://"):
+        return url.replace("postgresql+psycopg2://", "postgresql://", 1)
+
+    # Generalizovane: stripni čokoľvek po "+"
+    # napr. "postgresql+asyncpg://..."
+    if url.startswith("postgresql+") and "://" in url:
+        scheme, rest = url.split("://", 1)
+        base_scheme = scheme.split("+", 1)[0]  # "postgresql"
+        return f"{base_scheme}://{rest}"
+
+    return url
+
+
 def get_db_url() -> str:
     """
     Vráti správne DB URL podľa projektu:
     1) Preferuje DATABASE_URL (náš globálny štandard v projekte)
-    2) Potom PGHOST / PGUSER / PGPASSWORD / PGDATABASE ak existujú
-    3) Nakoniec padne na docker fallback
+    2) Potom DB_URL, ak existuje
+    3) Potom fallback PGHOST / PGUSER / PGPASSWORD / PGDATABASE
+    4) Nakoniec úplný docker fallback
     """
 
-    # HLAVNÁ PREMENNÁ – používame v celom projekte
+    # HLAVNÁ PREMENNÁ – používame v celom projekte (SQLAlchemy štýl)
     url = os.getenv("DATABASE_URL")
     if url:
-        return url
+        return normalize_db_url_for_psycopg2(url)
 
     # sekundárna možnosť
     url2 = os.getenv("DB_URL")
     if url2:
-        return url2
+        return normalize_db_url_for_psycopg2(url2)
 
     # fallback pre docker compose
     host = os.getenv("PGHOST", "postgres")
     user = os.getenv("PGUSER", "postgres")
     pwd = os.getenv("PGPASSWORD", "postgres")
-    db  = os.getenv("PGDATABASE", "trader")
+    db = os.getenv("PGDATABASE", "trader")
 
-    return f"postgresql://{user}:{pwd}@{host}:5432/{db}"
+    fallback = f"postgresql://{user}:{pwd}@{host}:5432/{db}"
+    return fallback
 
 
 def fetch_recent_signals(limit: int = 20):
     db_url = get_db_url()
+    # pre debug môžeš si odkomentovať:
+    # print(f"[DEBUG] Using DB URL for psycopg2: {db_url}", file=sys.stderr)
+
     conn = psycopg2.connect(db_url)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -102,11 +129,16 @@ def print_table(rows):
         else:
             error_short = error
 
+        created = r["created_at_utc"]
+        if created is not None:
+            created_str = created.replace(tzinfo=timezone.utc).isoformat()
+        else:
+            created_str = ""
+
         data.append(
             [
                 r["id"],
-                r["created_at_utc"].replace(tzinfo=timezone.utc).isoformat()
-                if r["created_at_utc"] is not None else "",
+                created_str,
                 r["symbol"],
                 r["side"],
                 float(r["strength"]) if r["strength"] is not None else None,
