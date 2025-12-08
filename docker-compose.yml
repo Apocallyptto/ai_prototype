@@ -188,6 +188,30 @@ services:
     command: >
       sh -lc "python -m services.record_pnl"
     restart: always
+    
+  eod_closer:
+    build:
+      context: .
+    image: ai_prototype-eod_closer
+    container_name: trader_eod_closer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- Alpaca ---
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
 
+      # --- EOD config ---
+      EOD_FLATTEN_ENABLE: "1"
+      EOD_FLATTEN_MIN_BEFORE_CLOSE: "5"
+
+      # nie je nutné, ale nevadí keď zdielame DB_URL
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+
+    command: sh -lc "python -m jobs.close_positions_eod"
+    restart: always
 volumes:
   pgdata:
