@@ -23,6 +23,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
 
+
+# -----------------------
+# Helpers
+# -----------------------
 def _to_str(x):
     return str(x) if x is not None else None
 
@@ -32,12 +36,20 @@ def _to_float_or_none(x):
     except Exception:
         return None
 
+
+# -----------------------
+# Main sync logic
+# -----------------------
 def main():
     paper = os.getenv("ALPACA_PAPER", "1") != "0"
     lookback_days = int(os.getenv("LOOKBACK_DAYS", "3"))
     stale_minutes = int(os.getenv("STALE_MINUTES", "0"))
 
-    tc = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=paper)
+    tc = TradingClient(
+        os.getenv("ALPACA_API_KEY"),
+        os.getenv("ALPACA_API_SECRET"),
+        paper=paper
+    )
 
     # Fetch both OPEN and CLOSED orders
     open_orders   = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN,   limit=500))
@@ -81,7 +93,24 @@ def main():
         "replaced":            ("error",   "broker replaced"),
     }
 
-    db_url = os.environ["DB_URL"]
+
+    # ---------------------------------------------------
+    # ⭐ FIX DB_URL (convert SQLAlchemy DSN → psycopg2 DSN)
+    # ---------------------------------------------------
+    raw_url = (
+        os.getenv("DB_URL")
+        or os.getenv("DATABASE_URL")
+        or "postgresql://postgres:postgres@postgres:5432/trader"
+    )
+
+    # Convert: postgresql+psycopg2:// → postgresql://
+    if raw_url.startswith("postgresql+psycopg2://"):
+        raw_url = raw_url.replace("postgresql+psycopg2://", "postgresql://", 1)
+
+    db_url = raw_url
+    # ---------------------------------------------------
+
+
     checked = 0
     updated = 0
     stale_updated = 0
@@ -127,7 +156,6 @@ def main():
                     if mapped:
                         new_status, reason = mapped
                         if new_status == "filled":
-                            # best-effort pull of fills
                             fq = _to_float_or_none(getattr(o, "filled_qty", None))
                             fp = _to_float_or_none(getattr(o, "filled_avg_price", None))
                             if has_filled_qty and fq is not None:
@@ -135,7 +163,7 @@ def main():
                             if has_avg_fill_price and fp is not None:
                                 set_fill_fields["avg_fill_price"] = fp
 
-                # If still not decided and it's old enough, mark as stale
+                # stale detection
                 if not new_status and stale_minutes > 0 and created_at is not None:
                     now = datetime.now(timezone.utc)
                     if created_at.tzinfo is None:
@@ -148,7 +176,6 @@ def main():
 
                 if new_status:
                     if set_fill_fields:
-                        # Update including fill fields if available
                         set_clauses = ["status=%s", "processed_at=NOW()", "status_reason=%s"]
                         params = [new_status, reason]
                         if has_filled_qty and "filled_qty" in set_fill_fields:
@@ -164,7 +191,6 @@ def main():
                              WHERE id=%s;
                         """, params)
                     else:
-                        # Basic update without fill fields
                         cur.execute("""
                             UPDATE signals
                                SET status=%s,
@@ -177,6 +203,7 @@ def main():
             conn.commit()
 
     print(f"checked {checked} submitted rows, updated {updated} (stale={stale_updated})")
+
 
 if __name__ == "__main__":
     main()
