@@ -131,7 +131,7 @@ services:
     volumes:
       - .:/app
     command: >
-      sh -lc "python -u -m services.sync_orders"
+      sh -lc "python -u tools/sync_orders.py"
     restart: always
 
   oco_exit_monitor:
