@@ -37,7 +37,7 @@ logger = logging.getLogger("eod_closer")
 # ---- helpers ----
 
 def seconds_to_close(now_utc: datetime, close_time_utc: dtime) -> float:
-    """Return seconds from now_utc until today's close_time_utc (can be negative after close)."""
+    """Return seconds from now_utc until today's close_time_utc."""
     close_dt = datetime.combine(now_utc.date(), close_time_utc)
     if close_dt.tzinfo is None:
         close_dt = close_dt.replace(tzinfo=timezone.utc)
@@ -50,7 +50,6 @@ def flatten_all(tc: TradingClient) -> None:
     logger.info("Canceling ALL open orders...")
     try:
         resp = tc.cancel_orders()
-        # Alpaca vracia 207 Multi-Status; zalogujeme si raw odpoveď
         logger.warning("Cancel orders returned 207: %s", resp)
     except Exception as exc:
         logger.error("Error canceling orders: %s", exc)
@@ -112,10 +111,9 @@ def main() -> None:
 
         sec_to_close = seconds_to_close(now_utc, close_time_utc)
 
-        # Logika:
-        # - ak sme v okne [0, buffer_min] min pred close
-        # - a ešte sme dnes flatten nerobili
-        if sec_to_close <= buffer_min * 60 and sec_to_close >= -3600:
+        # Spustíme flatten IBA ak sme ešte PRED close:
+        #   0 <= sec_to_close <= buffer_min * 60
+        if 0 <= sec_to_close <= buffer_min * 60:
             if last_flatten_date != today:
                 logger.info(
                     "EOD FLATTEN TRIGGERED: %.1f sec to close (<= %s min).",
