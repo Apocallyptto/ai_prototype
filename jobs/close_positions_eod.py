@@ -1,141 +1,162 @@
-# jobs/close_positions_eod.py
+#!/usr/bin/env python3
+"""
+End-of-day closer for Alpaca.
+
+- Sleduje čas do konca US session (default 21:00 UTC).
+- Keď sme v okne BUFFER_MIN minút pred close a dnes ešte neflattenovalo:
+    - zruší všetky open orders
+    - pošle market príkazy na zatvorenie všetkých pozícií
+    - po krátkej pauze spraví DRUHÝ CHECK:
+        - ak ešte ostali pozície, skúsi flatten ešte raz
+
+Env vars:
+    ALPACA_API_KEY / ALPACA_API_SECRET (required)
+    ALPACA_PAPER           (default "1")
+    EOD_BUFFER_MINUTES     (default "5")     # koľko minút pred close spustiť flatten
+    EOD_CLOSE_HOUR_UTC     (default "21")    # hodina close v UTC
+    EOD_CLOSE_MINUTE_UTC   (default "0")     # minúta close v UTC
+    EOD_SLEEP_SECONDS      (default "60")    # sleep medzi jednotlivými loop cyklami
+"""
 
 import os
 import time
 import logging
-from datetime import datetime, timezone
-import requests
+from datetime import datetime, time as dtime, timezone
+
+from alpaca.trading.client import TradingClient
+
+# ---- logging ----
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-ALPACA_BASE_URL = os.environ["ALPACA_BASE_URL"].rstrip("/")
-ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
-ALPACA_API_SECRET = os.environ["ALPACA_API_SECRET"]
-
-EOD_FLATTEN_ENABLE = os.getenv("EOD_FLATTEN_ENABLE", "1") == "1"
-EOD_FLATTEN_MIN_BEFORE_CLOSE = int(os.getenv("EOD_FLATTEN_MIN_BEFORE_CLOSE", "5"))
-
-SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
-        "Content-Type": "application/json",
-    }
-)
+logger = logging.getLogger("eod_closer")
 
 
-def get_clock():
-    resp = SESSION.get(f"{ALPACA_BASE_URL}/v2/clock", timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+# ---- helpers ----
+
+def seconds_to_close(now_utc: datetime, close_time_utc: dtime) -> float:
+    """Return seconds from now_utc until today's close_time_utc (can be negative after close)."""
+    close_dt = datetime.combine(now_utc.date(), close_time_utc)
+    if close_dt.tzinfo is None:
+        close_dt = close_dt.replace(tzinfo=timezone.utc)
+    return (close_dt - now_utc).total_seconds()
 
 
-def seconds_to_close(clock: dict) -> float:
-    """
-    clock["next_close"] je ISO string napr. '2025-12-05T21:00:00Z'
-    """
-    next_close_str = clock["next_close"].replace("Z", "+00:00")
-    next_close = datetime.fromisoformat(next_close_str)
-    now = datetime.now(timezone.utc)
-    return (next_close - now).total_seconds()
-
-
-def cancel_all_orders():
-    logging.info("Canceling ALL open orders...")
-    resp = SESSION.delete(f"{ALPACA_BASE_URL}/v2/orders", timeout=15)
-    if resp.status_code not in (200, 204):
-        logging.warning("Cancel orders returned %s: %s", resp.status_code, resp.text)
-    else:
-        logging.info("Cancel orders OK (%s)", resp.status_code)
-
-
-def close_all_positions():
-    logging.info("Closing ALL open positions (market)...")
-    # cancel_orders=true pre istotu, aj keď už rušíme predtým
-    resp = SESSION.delete(
-        f"{ALPACA_BASE_URL}/v2/positions", params={"cancel_orders": "true"}, timeout=30
-    )
-    if resp.status_code not in (200, 204):
-        logging.warning("Close positions returned %s: %s", resp.status_code, resp.text)
-    else:
-        logging.info("Close positions OK (%s)", resp.status_code)
-
-
-def flatten_eod_if_needed(last_done_date: str | None):
-    """
-    Vráti nový last_done_date (aby sme flatten nerobili viackrát za jeden deň).
-    """
-    if not EOD_FLATTEN_ENABLE:
-        logging.debug("EOD flatten disabled via EOD_FLATTEN_ENABLE")
-        return last_done_date
-
+def flatten_all(tc: TradingClient) -> None:
+    """Cancel all open orders and close all positions with market orders."""
+    # Cancel orders
+    logger.info("Canceling ALL open orders...")
     try:
-        clock = get_clock()
-    except Exception as e:
-        logging.error("Failed to fetch Alpaca clock: %s", e)
-        return last_done_date
+        resp = tc.cancel_orders()
+        # Alpaca vracia 207 Multi-Status; zalogujeme si raw odpoveď
+        logger.warning("Cancel orders returned 207: %s", resp)
+    except Exception as exc:
+        logger.error("Error canceling orders: %s", exc)
 
-    if not clock.get("is_open", False):
-        # trh je zatvorený => nový deň ešte nezačal / skončil
-        return None
+    # Close positions
+    logger.info("Closing ALL open positions (market)...")
+    try:
+        resp = tc.close_all_positions()
+        logger.warning("Close positions returned 207: %s", resp)
+    except Exception as exc:
+        logger.error("Error closing positions: %s", exc)
 
-    secs = seconds_to_close(clock)
-    trading_day = clock["next_close"][:10]  # 'YYYY-MM-DD'
 
-    logging.debug(
-        "Clock: is_open=%s, secs_to_close=%.1f, trading_day=%s",
-        clock.get("is_open"),
-        secs,
-        trading_day,
+def log_open_positions(tc: TradingClient, prefix: str) -> None:
+    """Helper na zalogovanie aktuálnych pozícií (symbol, qty)."""
+    try:
+        positions = tc.get_all_positions()
+    except Exception as exc:
+        logger.error("%s: error loading positions: %s", prefix, exc)
+        return
+
+    if not positions:
+        logger.info("%s: no open positions.", prefix)
+        return
+
+    summary = [(p.symbol, p.qty) for p in positions]
+    logger.warning("%s: still open positions: %s", prefix, summary)
+
+
+# ---- main loop ----
+
+def main() -> None:
+    paper = os.getenv("ALPACA_PAPER", "1") != "0"
+    api_key = os.environ["ALPACA_API_KEY"]
+    api_secret = os.environ["ALPACA_API_SECRET"]
+
+    buffer_min = int(os.getenv("EOD_BUFFER_MINUTES", os.getenv("BUFFER_MIN", "5")))
+    close_hour = int(os.getenv("EOD_CLOSE_HOUR_UTC", "21"))
+    close_minute = int(os.getenv("EOD_CLOSE_MINUTE_UTC", "0"))
+    sleep_seconds = int(os.getenv("EOD_SLEEP_SECONDS", "60"))
+
+    close_time_utc = dtime(hour=close_hour, minute=close_minute, tzinfo=timezone.utc)
+
+    tc = TradingClient(api_key, api_secret, paper=paper)
+
+    logger.info(
+        "Starting close_positions_eod loop | ENABLE=True | BUFFER_MIN=%s | CLOSE=%02d:%02d UTC",
+        buffer_min,
+        close_hour,
+        close_minute,
     )
 
-    if secs <= EOD_FLATTEN_MIN_BEFORE_CLOSE * 60 and secs > 0:
-        if last_done_date == trading_day:
-            # už sme dnes flatten robili
-            logging.info(
-                "EOD flatten already done today (%s), skipping.", trading_day
-            )
-            return last_done_date
-
-        logging.info(
-            "EOD FLATTEN TRIGGERED: %.1f sec to close (<= %d min).",
-            secs,
-            EOD_FLATTEN_MIN_BEFORE_CLOSE,
-        )
-
-        try:
-            cancel_all_orders()
-        except Exception as e:
-            logging.error("Error while canceling orders: %s", e)
-
-        try:
-            close_all_positions()
-        except Exception as e:
-            logging.error("Error while closing positions: %s", e)
-
-        logging.info("EOD flatten finished for trading day %s", trading_day)
-        return trading_day
-
-    return last_done_date
-
-
-def main():
-    logging.info(
-        "Starting close_positions_eod loop | ENABLE=%s | BUFFER_MIN=%d",
-        EOD_FLATTEN_ENABLE,
-        EOD_FLATTEN_MIN_BEFORE_CLOSE,
-    )
-
-    last_done_date = None
+    # aby sme flatten nerobili viackrát za jeden deň
+    last_flatten_date = None
 
     while True:
-        last_done_date = flatten_eod_if_needed(last_done_date)
-        # stačí raz za minútu
-        time.sleep(60)
+        now_utc = datetime.now(timezone.utc)
+        today = now_utc.date()
+
+        sec_to_close = seconds_to_close(now_utc, close_time_utc)
+
+        # Logika:
+        # - ak sme v okne [0, buffer_min] min pred close
+        # - a ešte sme dnes flatten nerobili
+        if sec_to_close <= buffer_min * 60 and sec_to_close >= -3600:
+            if last_flatten_date != today:
+                logger.info(
+                    "EOD FLATTEN TRIGGERED: %.1f sec to close (<= %s min).",
+                    sec_to_close,
+                    buffer_min,
+                )
+
+                # 1) prvý pokus o flatten
+                log_open_positions(tc, "Before first flatten")
+                flatten_all(tc)
+
+                # uložíme si, že dnešný deň už má flatten
+                last_flatten_date = today
+
+                # 2) DRUHÝ CHECK po krátkej pauze
+                time.sleep(10)
+                try:
+                    positions = tc.get_all_positions()
+                except Exception as exc:
+                    logger.error("Error checking positions after first flatten: %s", exc)
+                    positions = []
+
+                if positions:
+                    summary = [(p.symbol, p.qty) for p in positions]
+                    logger.warning(
+                        "Positions still open after first flatten: %s. Retrying flatten...",
+                        summary,
+                    )
+                    flatten_all(tc)
+
+                    # posledný check – už len zalogujeme stav
+                    time.sleep(5)
+                    log_open_positions(tc, "After second flatten")
+                else:
+                    logger.info("No positions remain after EOD flatten.")
+            else:
+                logger.info(
+                    "EOD flatten already done today (%s), skipping.", today
+                )
+
+        time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
