@@ -87,7 +87,7 @@ services:
 
       # --- ATR / TP / SL ---
       ATR_PCT: "0.01"
-      TP_ATR_MULT: "1.5"
+      TP_ATR_MULT: "1.0"
       SL_ATR_MULT: "1.0"
 
       # --- Risk / sizing guardrails ---
