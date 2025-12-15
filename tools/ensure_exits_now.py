@@ -11,7 +11,7 @@ from alpaca.trading.enums import (
     QueryOrderStatus, OrderClass
 )
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
-from alpaca.trading.requests import StopLossRequest
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
@@ -24,7 +24,6 @@ def _f(x, default=0.0) -> float:
 
 
 def _qt_price(x: float) -> float:
-    # US equities typically 0.01 tick; keep it simple here
     return round(float(x) + 1e-9, 2)
 
 
@@ -41,7 +40,6 @@ class ExitCoverage:
 
 
 def _paper_flag() -> bool:
-    # robust: TRADING_MODE=paper OR ALPACA_PAPER=1 (even if missing)
     tm = (os.getenv("TRADING_MODE", "paper") or "paper").lower().strip()
     ap = os.getenv("ALPACA_PAPER", "1")
     return (tm == "paper") or (ap != "0")
@@ -66,7 +64,6 @@ def _scan_exit_coverage(open_orders_nested, sym: str, exit_side: OrderSide) -> E
 
         oq = _f(getattr(o, "qty", 0.0), 0.0)
 
-        # Parent OCO: take-profit is the parent LIMIT; stop is in legs (nested=True)
         if getattr(o, "order_class", None) == OrderClass.OCO:
             cov.has_any_oco = True
             if getattr(o, "type", None) == OrderType.LIMIT:
@@ -74,14 +71,10 @@ def _scan_exit_coverage(open_orders_nested, sym: str, exit_side: OrderSide) -> E
 
             legs = getattr(o, "legs", None) or []
             for l in legs:
-                ltype = getattr(l, "type", None)
-                if ltype == OrderType.STOP:
-                    # leg.qty may be missing → fallback to parent qty
+                if getattr(l, "type", None) == OrderType.STOP:
                     lq = _f(getattr(l, "qty", None), oq)
                     cov.stop_qty += lq
-
         else:
-            # Non-OCO exits (less ideal, but count them)
             otype = getattr(o, "type", None)
             if otype == OrderType.LIMIT:
                 cov.tp_qty += oq
@@ -96,6 +89,15 @@ def _cancel_symbol_side(tc: TradingClient, sym: str, side: OrderSide):
     for o in tc.get_orders(req):
         if (o.symbol or "").upper() == sym and o.side == side:
             tc.cancel_order_by_id(o.id)
+
+
+def _build_tp_sl(tp: float, sl: float):
+    # Compatibility across alpaca-py versions
+    try:
+        from alpaca.trading.requests import TakeProfitRequest, StopLossRequest  # <-- correct in many versions
+        return TakeProfitRequest(limit_price=tp), StopLossRequest(stop_price=sl)
+    except Exception:
+        return {"limit_price": tp}, {"stop_price": sl}
 
 
 def main(argv: list[str] | None = None):
@@ -115,7 +117,6 @@ def main(argv: list[str] | None = None):
     tp_mult = _f(os.getenv("TP_ATR_MULT", "1.0"), 1.0)
     sl_mult = _f(os.getenv("SL_ATR_MULT", "1.0"), 1.0)
     min_notional = _f(os.getenv("MIN_NOTIONAL", "1.00"), 1.00)
-
     allow_ah = (os.getenv("ALLOW_AFTER_HOURS", "0") == "1")
 
     tc = TradingClient(k, s, paper=paper)
@@ -135,19 +136,15 @@ def main(argv: list[str] | None = None):
     is_long = qty > 0
     exit_side = OrderSide.SELL if is_long else OrderSide.BUY
 
-    # Get OPEN orders for symbol with nested legs
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, symbols=[sym])
     open_orders = tc.get_orders(req)
 
-    # Coverage detection (prevents “TP only”)
     cov = _scan_exit_coverage(open_orders, sym, exit_side)
 
-    # If we already cover full size with both TP and STOP → done
     if cov.tp_qty >= abs_qty and cov.stop_qty >= abs_qty:
         print("exits already present")
         return
 
-    # If TP exists for full size but STOP missing: that's dangerous → optionally auto-fix
     if cov.tp_qty >= abs_qty and cov.stop_qty < abs_qty:
         msg = f"[ensure_exits_now] WARNING: TP-only detected (tp_qty={cov.tp_qty}, stop_qty={cov.stop_qty}, abs_qty={abs_qty})"
         if not force_fix:
@@ -155,22 +152,18 @@ def main(argv: list[str] | None = None):
             return
         print(msg + " → auto-repair: canceling existing exit-side orders and placing OCO.")
         _cancel_symbol_side(tc, sym, exit_side)
-        # refresh after cancel
         open_orders = tc.get_orders(req)
         cov = _scan_exit_coverage(open_orders, sym, exit_side)
 
-    # Compute how much is still not covered
     covered = min(cov.tp_qty, cov.stop_qty) if (cov.tp_qty > 0 and cov.stop_qty > 0) else 0.0
     remaining = _qt_qty(abs_qty - covered)
     if remaining <= 0:
         print("exits already present")
         return
 
-    # Anchor price
     avg_entry = _f(getattr(pos[0], "avg_entry_price", 0.0), 0.0)
     mid = _get_mid(dc, sym, fallback=avg_entry if avg_entry > 0 else 1.0)
 
-    # ATR-proxy pricing (percent-based)
     if is_long:
         tp = _qt_price(mid * (1.0 + atr_pct * tp_mult))
         sl = _qt_price(max(0.01, mid * (1.0 - atr_pct * sl_mult)))
@@ -178,18 +171,16 @@ def main(argv: list[str] | None = None):
         tp = _qt_price(max(0.01, mid * (1.0 - atr_pct * tp_mult)))
         sl = _qt_price(mid * (1.0 + atr_pct * sl_mult))
 
-    # Ensure min notional (mostly relevant for tiny fractional qty)
     if tp * remaining < min_notional:
         tp = _qt_price(min_notional / remaining)
     if sl * remaining < min_notional:
         sl = _qt_price(min_notional / remaining)
 
-    print(f"[ensure_exits_now] {sym} pos={'LONG' if is_long else 'SHORT'} qty={qty} abs_qty={abs_qty} "
-          f"tp_qty={cov.tp_qty} stop_qty={cov.stop_qty} remaining={remaining}")
-    print(f"[ensure_exits_now] mid={mid:.4f} atr_pct={atr_pct:.4f} tp={tp} sl={sl} exit_side={exit_side.value} "
-          f"tif=day paper={paper} allow_ah={allow_ah}")
+    print(f"[ensure_exits_now] {sym} pos={'LONG' if is_long else 'SHORT'} qty={qty} abs_qty={abs_qty} held_tp={cov.tp_qty} held_sl={cov.stop_qty} free={remaining}")
+    print(f"[ensure_exits_now] mid={mid:.4f} atr_pct={atr_pct:.4f} tp={tp} sl={sl} exit_side={exit_side.value} tif=day paper={paper} allow_ah={allow_ah}")
 
-    # Submit ONE atomic OCO (prevents held qty issue)
+    tp_req, sl_req = _build_tp_sl(tp, sl)
+
     oco = tc.submit_order(
         LimitOrderRequest(
             symbol=sym,
@@ -198,10 +189,12 @@ def main(argv: list[str] | None = None):
             time_in_force=TimeInForce.DAY,
             limit_price=tp,
             order_class=OrderClass.OCO,
-            stop_loss=StopLossRequest(stop_price=sl),
+            take_profit=tp_req,
+            stop_loss=sl_req,
             extended_hours=allow_ah,
         )
     )
+
     print("OCO submitted:", oco.id, "status:", oco.status, "order_class:", oco.order_class)
 
 
