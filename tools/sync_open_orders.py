@@ -32,10 +32,10 @@ def main():
                 sa.text(
                     """
                     UPDATE orders
-                    SET status=:st, limit_price=:lim
-                    WHERE ticker=:t
-                      AND status IN ('pending_new','submitted')
-                      AND abs(extract(epoch from (now()-ts))) < 86400
+                    SET status=%(st)s, limit_price=%(lim)s
+                    WHERE symbol=%(t)s
+                    AND status IN ('pending_new','submitted')
+                    AND abs(extract(epoch from (now()-ts))) < 86400
                     """
                 ),
                 {"t": sym, "st": st, "lim": lim},
