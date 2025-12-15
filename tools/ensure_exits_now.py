@@ -11,7 +11,7 @@ from alpaca.trading.enums import (
     QueryOrderStatus, OrderClass
 )
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
-from alpaca.trading.models import TakeProfitRequest, StopLossRequest
+from alpaca.trading.requests import StopLossRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
@@ -198,7 +198,6 @@ def main(argv: list[str] | None = None):
             time_in_force=TimeInForce.DAY,
             limit_price=tp,
             order_class=OrderClass.OCO,
-            take_profit=TakeProfitRequest(limit_price=tp),
             stop_loss=StopLossRequest(stop_price=sl),
             extended_hours=allow_ah,
         )
