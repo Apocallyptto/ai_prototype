@@ -3,223 +3,218 @@ from __future__ import annotations
 
 import os
 import time
-import math
+import json
 import logging
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 import requests
-from typing import Optional
 
-from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("oco_exit_monitor")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# ---------------- ENV ----------------
-POLL_SECONDS = int(os.getenv("EXIT_MONITOR_POLL_SECONDS", "15"))
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+API_KEY = os.getenv("ALPACA_API_KEY", "")
+API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
-# Percent-based "ATR" like your ensure_exits_now logs (1% default)
-ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
+
+ATR_PCT = float(os.getenv("ATR_PCT", "0.0100"))
 TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.0"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 
-MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "1.00"))
-MIN_QTY = float(os.getenv("MIN_QTY", "0.001"))
-
-COOLDOWN_SECONDS = int(os.getenv("EXIT_COOLDOWN_SECONDS", "45"))
+# keď je 1, monitor “opraví” TP-only / SL-only stavy tým, že zruší exits a pošle nový OCO
 FORCE_FIX_EXITS = os.getenv("FORCE_FIX_EXITS", "0") == "1"
 
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+# bezpečnostný prepínač (keď 0, monitor nič neposiela)
+EXIT_MONITOR_ENABLED = os.getenv("EXIT_MONITOR_ENABLED", "1") != "0"
 
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
-# prefer TRADING_MODE like signal_executor.py
-ALPACA_PAPER = os.getenv("TRADING_MODE", "paper") == "paper"
+CLIENT_ID_PREFIX = os.getenv("EXIT_CLIENT_ID_PREFIX", "EXIT-OCO")
 
 S = requests.Session()
 S.headers.update({
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+    "APCA-API-KEY-ID": API_KEY,
+    "APCA-API-SECRET-KEY": API_SECRET,
 })
 
-_last_action_ts = 0.0
+dc = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+EPS = 1e-6
 
 
-# ---------------- helpers ----------------
-def _qt(x: float, p: int = 2) -> float:
-    return round(float(x) + 1e-9, p)
+def _round2(x: float) -> float:
+    return round(float(x) + 1e-12, 2)
 
-def _qq(q: float) -> float:
-    q = float(q)
-    if q <= 0:
-        return 0.0
-    return math.floor(q * 1000.0 + 1e-9) / 1000.0
 
-def _min_notional_price(px: float, qty: float) -> float:
-    if qty <= 0:
-        return px
-    need = MIN_NOTIONAL / qty
-    return max(px, _qt(need, 2))
-
-def _latest_mid(dc: StockHistoricalDataClient, sym: str) -> Optional[float]:
+def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        q = dc.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=sym))[sym]
-        bid = float(q.bid_price) if q.bid_price is not None else None
-        ask = float(q.ask_price) if q.ask_price is not None else None
-        if bid and ask and bid > 0 and ask > 0:
-            return (bid + ask) / 2.0
+        return float(x)
     except Exception:
-        pass
-    return None
+        return default
 
-def _get_open_orders_nested(symbol: str):
-    # nested=true lets us see oco legs too
-    url = f"{ALPACA_BASE_URL}/v2/orders?status=open&direction=desc&nested=true&symbols={symbol}"
+
+def _get_positions() -> List[Dict[str, Any]]:
+    r = S.get(f"{ALPACA_BASE_URL}/v2/positions", timeout=15)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_open_orders(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    url = f"{ALPACA_BASE_URL}/v2/orders?status=open&direction=desc&nested=true"
+    if symbol:
+        url += f"&symbols={symbol}"
     r = S.get(url, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def _cancel_order(order_id: str):
-    url = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
-    r = S.delete(url, timeout=15)
-    # Alpaca returns 204 on success
+
+def _cancel_order(order_id: str) -> None:
+    r = S.delete(f"{ALPACA_BASE_URL}/v2/orders/{order_id}", timeout=15)
+    # Alpaca vracia 204 pri OK
     if r.status_code not in (200, 204):
         r.raise_for_status()
 
-def _submit_oco_exit(symbol: str, exit_side: str, qty: float, tp: float, sl: float):
-    qty = _qq(qty)
-    if qty < MIN_QTY:
-        return None
 
-    tp = _min_notional_price(_qt(tp, 2), qty)
-    sl = _min_notional_price(_qt(sl, 2), qty)
+def _cancel_exit_orders_for_symbol(symbol: str) -> int:
+    """
+    Zruší len OCO exit objednávky pre symbol (parent).
+    Zrušenie parentu zruší aj leg.
+    """
+    count = 0
+    for o in _get_open_orders(symbol):
+        if (o.get("symbol", "").upper() == symbol.upper()) and (o.get("order_class") == "oco"):
+            _cancel_order(o["id"])
+            count += 1
+    return count
 
+
+def _latest_mid(symbol: str, fallback: float) -> float:
+    try:
+        q = dc.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))[symbol]
+        bid = getattr(q, "bid_price", None)
+        ask = getattr(q, "ask_price", None)
+        if bid and ask:
+            return (float(bid) + float(ask)) / 2.0
+    except Exception:
+        pass
+    return float(fallback)
+
+
+def _submit_oco_exit(symbol: str, side: str, qty: float, tp: float, sl_stop: float) -> Dict[str, Any]:
+    """
+    OCO payload podľa Alpaca docs: type=limit, order_class=oco, take_profit + stop_loss. :contentReference[oaicite:1]{index=1}
+    """
     payload = {
         "symbol": symbol,
-        "qty": str(qty),
-        "side": exit_side,          # "sell" for long exits, "buy" for short exits
-        "type": "limit",            # TP is limit
+        "side": side,                  # "sell" (exit long) alebo "buy" (exit short)
+        "type": "limit",               # OCO vyžaduje limit ako TP leg
         "time_in_force": "day",
+        "qty": str(_safe_float(qty)),
         "order_class": "oco",
-        "limit_price": str(tp),     # TP price
-        "stop_loss": {
-            "stop_price": str(sl)   # SL price
+        "client_order_id": f"{CLIENT_ID_PREFIX}-{symbol}-{int(time.time())}",
+        "take_profit": {
+            "limit_price": f"{_round2(tp):.2f}",
         },
-        # DO NOT set extended_hours here (stop-loss doesn't support it)
+        "stop_loss": {
+            "stop_price": f"{_round2(sl_stop):.2f}",
+        }
     }
-
-    r = S.post(f"{ALPACA_BASE_URL}/v2/orders", json=payload, timeout=15)
+    r = S.post(f"{ALPACA_BASE_URL}/v2/orders", json=payload, timeout=20)
     if r.status_code >= 400:
         raise RuntimeError(r.text)
     return r.json()
 
-def _compute_tp_sl(anchor: float, is_long: bool) -> tuple[float, float]:
-    # percent-based ATR proxy
-    atr = max(0.01, anchor * ATR_PCT)
+
+def _has_valid_oco(orders: List[Dict[str, Any]], abs_qty: float) -> bool:
+    """
+    Validný stav = existuje OCO parent a má aspoň 1 leg (stop_loss).
+    Qty berieme z parenta (TP leg). Ak qty >= abs_qty => považujeme za OK.
+    """
+    tp_qty = 0.0
+    sl_qty = 0.0
+    for o in orders:
+        if o.get("order_class") != "oco":
+            continue
+        tp_qty += _safe_float(o.get("qty", 0))
+        legs = o.get("legs") or []
+        for l in legs:
+            # stop_loss leg
+            if (l.get("type") == "stop") or (l.get("type") == "stop_limit"):
+                sl_qty += _safe_float(l.get("qty", 0))
+    return (tp_qty + EPS >= abs_qty) and (sl_qty + EPS >= abs_qty)
+
+
+def ensure_exits_for_position(pos: Dict[str, Any]) -> None:
+    symbol = pos.get("symbol", "").upper()
+    qty = _safe_float(pos.get("qty"))
+    if not symbol or abs(qty) < EPS:
+        return
+    if SYMBOLS and symbol not in SYMBOLS:
+        return
+
+    is_long = qty > 0
+    abs_qty = abs(qty)
+
+    # ak exits už existujú (OCO), nič nerob
+    open_orders = _get_open_orders(symbol)
+    if _has_valid_oco(open_orders, abs_qty):
+        log.info("%s: exits already present (valid OCO)", symbol)
+        return
+
+    # ak je tam “rozbitý” stav (napr. TP-only), a force je zapnutý, zruš OCO/exit a pošli nové
+    if FORCE_FIX_EXITS:
+        canceled = _cancel_exit_orders_for_symbol(symbol)
+        if canceled:
+            log.warning("%s: canceled %d old OCO exit(s) to repair state", symbol, canceled)
+
+    # anchor = mid (alebo avg_entry_price z pozície)
+    avg_entry = _safe_float(pos.get("avg_entry_price"), 0.0)
+    mid = _latest_mid(symbol, fallback=avg_entry if avg_entry > 0 else 1.0)
+
+    # tp/sl z ATR_PCT
     if is_long:
-        tp = anchor + TP_ATR_MULT * atr
-        sl = max(0.01, anchor - SL_ATR_MULT * atr)
-        if tp <= sl:
-            tp = sl + 0.02
+        tp = _round2(mid * (1.0 + ATR_PCT * TP_ATR_MULT))
+        sl = _round2(mid * (1.0 - ATR_PCT * SL_ATR_MULT))
+        side = "sell"
+        # ochrana: stop musí byť aspoň o 0.01 nižšie než TP base price
+        if sl >= tp:
+            sl = _round2(tp - 0.01)
     else:
-        tp = max(0.01, anchor - TP_ATR_MULT * atr)
-        sl = anchor + SL_ATR_MULT * atr
-        if tp >= sl:
-            sl = tp + 0.02
-    return _qt(tp, 2), _qt(sl, 2)
+        tp = _round2(mid * (1.0 - ATR_PCT * TP_ATR_MULT))
+        sl = _round2(mid * (1.0 + ATR_PCT * SL_ATR_MULT))
+        side = "buy"
+        if sl <= tp:
+            sl = _round2(tp + 0.01)
+
+    log.info("%s: submit OCO exit side=%s qty=%.4f tp=%.2f sl=%.2f (mid=%.4f)", symbol, side, abs_qty, tp, sl, mid)
+    res = _submit_oco_exit(symbol, side=side, qty=abs_qty, tp=tp, sl_stop=sl)
+    log.info("%s: OCO submitted id=%s status=%s", symbol, res.get("id"), res.get("status"))
 
 
-# ---------------- loop ----------------
-def run_once(tr: TradingClient, dc: StockHistoricalDataClient):
-    global _last_action_ts
-    now = time.time()
-    if now - _last_action_ts < COOLDOWN_SECONDS:
-        return
+def main() -> None:
+    if not EXIT_MONITOR_ENABLED:
+        log.warning("EXIT_MONITOR_ENABLED=0 -> monitor disabled")
+        while True:
+            time.sleep(60)
 
-    try:
-        positions = tr.get_all_positions()
-    except Exception:
-        positions = []
-
-    if not positions:
-        log.info("no positions")
-        return
-
-    for p in positions:
-        sym = str(getattr(p, "symbol", "")).upper()
-        if SYMBOLS and sym not in SYMBOLS:
-            continue
-
-        qty = float(getattr(p, "qty", 0.0) or 0.0)
-        if abs(qty) < MIN_QTY:
-            continue
-
-        is_long = qty > 0
-        abs_qty = abs(qty)
-        exit_side = "sell" if is_long else "buy"
-
-        # open orders for this symbol
-        try:
-            oo = _get_open_orders_nested(sym)
-        except Exception as e:
-            log.warning("%s: failed to fetch open orders: %s", sym, e)
-            continue
-
-        # detect existing OCO exit (same side)
-        exit_orders = [o for o in oo if (o.get("symbol") == sym and (o.get("side") == exit_side))]
-        has_oco = any(o.get("order_class") == "oco" for o in exit_orders)
-
-        if has_oco and not FORCE_FIX_EXITS:
-            log.info("%s: exits already present (OCO)", sym)
-            continue
-
-        if FORCE_FIX_EXITS and exit_orders:
-            # cancel any old exit orders so we can recreate clean OCO
-            for o in exit_orders:
-                try:
-                    _cancel_order(o["id"])
-                except Exception as e:
-                    log.warning("%s: cancel failed for %s: %s", sym, o.get("id"), e)
-
-        # recompute free qty (in case partial exits exist)
-        held = 0.0
-        for o in exit_orders:
-            try:
-                held += float(o.get("qty") or 0.0)
-            except Exception:
-                pass
-        free = _qq(max(0.0, abs_qty - held))
-        if free < MIN_QTY:
-            log.info("%s: no free qty to protect", sym)
-            continue
-
-        anchor = _latest_mid(dc, sym) or float(getattr(p, "avg_entry_price", 0.0) or 0.0)
-        if anchor <= 0:
-            log.info("%s: no anchor price; skip", sym)
-            continue
-
-        tp, sl = _compute_tp_sl(anchor, is_long=is_long)
-        # For SHORT: tp is below, sl is above (still correct)
-
-        try:
-            res = _submit_oco_exit(sym, exit_side, free, tp, sl)
-            log.info("%s: OCO exit submitted side=%s qty=%.3f tp=%.2f sl=%.2f id=%s",
-                     sym, exit_side, free, tp, sl, res.get("id"))
-            _last_action_ts = time.time()
-        except Exception as e:
-            log.warning("%s: OCO submit failed: %s", sym, e)
-
-
-def main():
-    tr = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
-    dc = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+    log.info("oco_exit_monitor start | SYMBOLS=%s | POLL=%ss | ATR_PCT=%.4f | FORCE_FIX_EXITS=%s",
+             SYMBOLS, POLL_SECONDS, ATR_PCT, FORCE_FIX_EXITS)
 
     while True:
         try:
-            run_once(tr, dc)
+            positions = _get_positions()
+            if not positions:
+                log.info("no positions")
+            else:
+                for p in positions:
+                    ensure_exits_for_position(p)
         except Exception as e:
-            log.exception("oco_exit_monitor fatal: %s", e)
+            log.exception("loop error: %s", e)
         time.sleep(POLL_SECONDS)
 
 
