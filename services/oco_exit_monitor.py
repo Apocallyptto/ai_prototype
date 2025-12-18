@@ -1,72 +1,152 @@
+# services/oco_exit_monitor.py
+import os
 import time
-from alpaca.trading.requests import (
-    GetOrdersRequest,
-    LimitOrderRequest,
-    TakeProfitRequest,
-    StopLossRequest,
+import logging
+
+from services.alpaca_exit_guard import (
+    get_trading_client,
+    has_exit_orders,
+    cancel_exit_orders,
+    place_exit_oco,
 )
-from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce, OrderClass
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+log = logging.getLogger("oco_exit_monitor")
 
 
-FINAL = {"CANCELED", "FILLED", "REJECTED", "EXPIRED"}
+def _symbols_filter() -> set[str] | None:
+    raw = os.getenv("SYMBOLS", "").strip()
+    if not raw:
+        return None
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
-def norm_status(st) -> str:
-    s = str(st).upper()
-    return s.split(".")[-1]  # OrderStatus.CANCELED -> CANCELED
 
-def get_orders(tc, symbols, limit=300, nested=True):
+def _price_decimals() -> int:
     try:
-        return tc.get_orders(
-            GetOrdersRequest(status=QueryOrderStatus.ALL, symbols=symbols, limit=limit, nested=nested)
-        )
-    except TypeError:
-        return tc.get_orders(
-            GetOrdersRequest(status=QueryOrderStatus.ALL, symbols=symbols, limit=limit)
-        )
+        return int(os.getenv("PRICE_DECIMALS", "2"))
+    except Exception:
+        return 2
 
-def place_exit_oco(tc, symbol: str, qty: int, tp_price: float, sl_price: float, prefix: str):
+
+def _round_price(x: float) -> float:
+    return round(float(x), _price_decimals())
+
+
+def _ref_price(position) -> float | None:
     """
-    Vytvorí OCO: TP limit + SL stop.
-    - zruší existujúce aktívne EXIT-OCO parenty s rovnakým prefixom
-    - po submit-e overí legs (SL stop by mal byť HELD)
+    Referenčná cena:
+    - "entry" (avg_entry_price) alebo "current" (current_price)
     """
-    # 1) cancel existing active EXIT-OCO parents
-    orders = get_orders(tc, [symbol], limit=300, nested=True)
-    for o in orders:
-        st = norm_status(getattr(o, "status", ""))
-        cid = (getattr(o, "client_order_id", "") or "")
-        if cid.startswith(prefix) and st not in FINAL:
-            tc.cancel_order_by_id(o.id)
+    mode = os.getenv("OCO_REF_PRICE", "entry").strip().lower()
 
-    time.sleep(1.5)
+    def f(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
 
-    # 2) submit new OCO (kritické: take_profit.limit_price)
-    client_id = f"{prefix}{int(time.time())}"
+    avg_entry = f(getattr(position, "avg_entry_price", None))
+    current = f(getattr(position, "current_price", None))
 
-    req = LimitOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.GTC,
+    if mode == "current":
+        return current or avg_entry
+    return avg_entry or current
 
-        # Alpaca často reprezentuje OCO tak, že parent je TP limit
-        limit_price=tp_price,
-        order_class=OrderClass.OCO,
 
-        take_profit=TakeProfitRequest(limit_price=tp_price),
-        stop_loss=StopLossRequest(stop_price=sl_price),
+def _signed_qty_from_position(p) -> float | None:
+    """
+    Alpaca často vracia qty kladné a smer je v p.side.
+    Takže si spravíme signed qty:
+      LONG  -> +qty
+      SHORT -> -qty
+    """
+    try:
+        qty = abs(float(getattr(p, "qty", 0)))
+    except Exception:
+        return None
 
-        client_order_id=client_id,
-    )
+    side = getattr(p, "side", None)
+    side_name = getattr(side, "name", str(side)).upper()
 
-    created = tc.submit_order(req)
+    if "SHORT" in side_name:
+        return -qty
+    return qty
 
-    # 3) verify legs (ak legs chýbajú, hneď zruš parent – nech nezostane “len TP” bez SL)
-    full = tc.get_order_by_id(created.id)
-    legs = getattr(full, "legs", None)
 
-    if not legs:
-        tc.cancel_order_by_id(full.id)
-        raise RuntimeError(f"OCO legs missing for {symbol} (canceled parent {full.id})")
+def _tp_sl_from_pct(ref: float, signed_qty: float) -> tuple[float, float]:
+    tp_pct = float(os.getenv("OCO_TP_PCT", "0.015"))  # 1.5%
+    sl_pct = float(os.getenv("OCO_SL_PCT", "0.010"))  # 1.0%
 
-    return full  # parent order (s legs)
+    if signed_qty > 0:  # LONG
+        tp = ref * (1.0 + tp_pct)
+        sl = ref * (1.0 - sl_pct)
+    else:               # SHORT
+        tp = ref * (1.0 - tp_pct)
+        sl = ref * (1.0 + sl_pct)
+
+    return _round_price(tp), _round_price(sl)
+
+
+def main():
+    tc = get_trading_client()
+    poll = float(os.getenv("POLL_SECONDS", "5"))
+    symbols_filter = _symbols_filter()
+
+    log.info("Started | poll=%ss | symbols_filter=%s", poll, sorted(symbols_filter) if symbols_filter else "ALL")
+
+    while True:
+        try:
+            positions = tc.get_all_positions()
+            pos_map = {str(p.symbol).upper(): p for p in positions}
+
+            symbols_to_process = set(pos_map.keys())
+            if symbols_filter:
+                symbols_to_process = symbols_filter
+
+            for symbol in sorted(symbols_to_process):
+                p = pos_map.get(symbol)
+
+                # 1) Ak nemáme pozíciu, zruš orphan EXIT-OCO
+                if p is None:
+                    if has_exit_orders(tc, symbol):
+                        n = cancel_exit_orders(tc, symbol)
+                        log.info("Canceled orphan EXIT-OCO | %s | canceled=%d", symbol, n)
+                    continue
+
+                signed_qty = _signed_qty_from_position(p)
+                if not signed_qty:
+                    continue
+
+                # 2) Idempotencia: už máme EXIT-OCO -> nerob nič
+                if has_exit_orders(tc, symbol):
+                    continue
+
+                ref = _ref_price(p)
+                if not ref or ref <= 0:
+                    log.warning("Skip %s: missing ref price (avg_entry/current).", symbol)
+                    continue
+
+                tp, sl = _tp_sl_from_pct(ref, signed_qty)
+
+                # 3) sanity
+                if signed_qty > 0 and not (sl < ref < tp):
+                    log.warning("Skip %s: invalid LONG tp/sl ref=%s tp=%s sl=%s", symbol, ref, tp, sl)
+                    continue
+                if signed_qty < 0 and not (tp < ref < sl):
+                    log.warning("Skip %s: invalid SHORT tp/sl ref=%s tp=%s sl=%s", symbol, ref, tp, sl)
+                    continue
+
+                oid = place_exit_oco(tc, symbol, signed_qty, tp, sl)
+                log.info("Placed EXIT OCO | %s qty=%s ref=%s tp=%s sl=%s | order_id=%s", symbol, signed_qty, ref, tp, sl, oid)
+
+        except Exception as e:
+            log.exception("Monitor loop error: %s", e)
+
+        time.sleep(poll)
+
+
+if __name__ == "__main__":
+    main()
