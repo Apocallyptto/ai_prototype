@@ -1,8 +1,8 @@
-# services/alpaca_exit_guard.py
 import os
 import time
+import json
 import logging
-from typing import List, Optional
+from typing import Optional, List, Iterable
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -12,122 +12,183 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
 )
 from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce, OrderClass
+from alpaca.common.exceptions import APIError
 
 log = logging.getLogger("alpaca_exit_guard")
-
-EXIT_ORDER_PREFIX = os.getenv("EXIT_ORDER_PREFIX", "EXIT-OCO-").strip()
-
-
-def _paper() -> bool:
-    return os.getenv("TRADING_MODE", "paper").strip().lower() == "paper"
 
 
 def get_trading_client() -> TradingClient:
     key = os.getenv("ALPACA_API_KEY")
     secret = os.getenv("ALPACA_API_SECRET")
-    if not key or not secret:
-        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
-    return TradingClient(key, secret, paper=_paper())
+    paper = os.getenv("TRADING_MODE", "paper") == "paper"
+    return TradingClient(api_key=key, secret_key=secret, paper=paper)
 
 
-def _tif() -> TimeInForce:
-    # default GTC, aby exit ostal aj cez noc (ako u teba v legs: expires 2026-03-18)
-    raw = os.getenv("EXIT_TIF", "GTC").strip().upper()
-    return TimeInForce(raw)
+def _prefix() -> str:
+    # used in client_order_id:  f"{PREFIX}-{SYMBOL}-{epoch}"
+    return os.getenv("EXIT_OCO_PREFIX", "EXIT-OCO").strip() or "EXIT-OCO"
 
 
-def get_position_qty(tc: TradingClient, symbol: str) -> int:
-    symbol = symbol.upper().strip()
-    try:
-        p = tc.get_open_position(symbol)
-        # qty je string, pri short môže byť záporné
-        q = float(p.qty)
-        return int(round(q))
-    except Exception:
-        return 0
-
-
-def _list_open_orders(tc: TradingClient, symbol: str):
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], limit=500)
-    orders = tc.get_orders(req)
-    return list(orders) if orders is not None else []
-
-
-def _is_exit_order(order, symbol: Optional[str] = None) -> bool:
+def _is_our_exit_order(order, symbol: str) -> bool:
     cid = getattr(order, "client_order_id", None) or ""
-    if not cid.startswith(EXIT_ORDER_PREFIX):
-        return False
-    if symbol is None:
-        return True
-    return cid.startswith(f"{EXIT_ORDER_PREFIX}{symbol.upper()}-")
+    return cid.startswith(f"{_prefix()}-{symbol.upper()}-")
 
 
-def list_open_exit_orders(tc: TradingClient, symbol: str) -> List:
-    symbol = symbol.upper().strip()
-    return [o for o in _list_open_orders(tc, symbol) if _is_exit_order(o, symbol)]
+def list_open_orders(tc: TradingClient, symbol: str) -> List:
+    r = GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,
+        symbols=[symbol.upper()],
+        limit=500,
+    )
+    return list(tc.get_orders(r))
 
 
-def cancel_exit_orders(tc: TradingClient, symbol: str) -> int:
+def get_position_qty(tc: TradingClient, symbol: str) -> float:
     """
-    Cancel OPEN EXIT-OCO orders for given symbol.
-    Returns count of cancel requests.
+    Returns:
+      >0  long qty
+      <0  short qty
+       0  no position
     """
-    symbol = symbol.upper().strip()
-    orders = list_open_exit_orders(tc, symbol)
-    n = 0
+    symbol = symbol.upper()
+    try:
+        positions = tc.get_all_positions()
+    except Exception:
+        return 0.0
+
+    for p in positions:
+        if str(p.symbol).upper() != symbol:
+            continue
+        try:
+            return float(p.qty)
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def cancel_exit_orders(tc: TradingClient, symbol: str, side_to_cancel: Optional[OrderSide] = None) -> int:
+    """
+    Cancel ONLY orders that have client_order_id prefix: {EXIT_OCO_PREFIX}-{symbol}-...
+    If side_to_cancel is None, cancels both sides.
+    Returns count requested to cancel (not necessarily already canceled).
+    """
+    orders = list_open_orders(tc, symbol)
+    to_cancel = []
     for o in orders:
+        if not _is_our_exit_order(o, symbol):
+            continue
+        if side_to_cancel is not None and o.side != side_to_cancel:
+            continue
+        to_cancel.append(o)
+
+    for o in to_cancel:
         try:
             tc.cancel_order_by_id(str(o.id))
-            n += 1
         except Exception as e:
-            log.warning("cancel_exit_orders: failed to cancel %s %s: %s", symbol, getattr(o, "id", None), e)
+            log.warning("Failed to cancel order %s for %s: %s", o.id, symbol, e)
+
+    return len(to_cancel)
+
+
+def has_exit_orders(tc: TradingClient, symbol: str) -> bool:
+    orders = list_open_orders(tc, symbol)
+    return any(_is_our_exit_order(o, symbol) for o in orders)
+
+
+def wait_exit_orders_cleared(
+    tc: TradingClient,
+    symbol: str,
+    timeout_s: float = 10.0,
+    poll_s: float = 0.25,
+) -> bool:
+    """
+    Wait until no EXIT-OCO orders exist for symbol. Returns True if cleared, False on timeout.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if not has_exit_orders(tc, symbol):
+                return True
+        except Exception:
+            pass
+        time.sleep(poll_s)
+    return False
+
+
+def _extract_related_order_ids_from_apierror(e: Exception) -> List[str]:
+    """
+    Alpaca-py APIError often stringifies to JSON like:
+      {"code":40310000, "message":"...", "related_orders":[...]}
+    Try to parse and extract related_orders.
+    """
+    if not isinstance(e, APIError):
+        return []
+
+    msg = str(e).strip()
+    if not (msg.startswith("{") and msg.endswith("}")):
+        return []
+
+    try:
+        data = json.loads(msg)
+    except Exception:
+        return []
+
+    ids = data.get("related_orders") or []
+    out = []
+    for x in ids:
+        if x is None:
+            continue
+        out.append(str(x))
+    return out
+
+
+def cancel_orders_by_ids(tc: TradingClient, order_ids: Iterable[str]) -> int:
+    n = 0
+    for oid in order_ids:
+        try:
+            tc.cancel_order_by_id(str(oid))
+            n += 1
+        except Exception as ex:
+            log.warning("Failed to cancel related order %s: %s", oid, ex)
     return n
 
 
-def wait_exit_orders_cleared(tc: TradingClient, symbol: str, timeout: float = 6.0, poll: float = 0.25) -> bool:
-    """
-    After cancel request, Alpaca may still show the order as OPEN for a moment.
-    Wait until there are no OPEN exit orders, or timeout.
-    """
-    symbol = symbol.upper().strip()
-    deadline = time.time() + timeout
+def cancel_related_orders_from_exception(tc: TradingClient, e: Exception) -> int:
+    ids = _extract_related_order_ids_from_apierror(e)
+    if not ids:
+        return 0
+    return cancel_orders_by_ids(tc, ids)
 
-    while time.time() < deadline:
-        remaining = list_open_exit_orders(tc, symbol)
-        if not remaining:
-            return True
-        time.sleep(poll)
 
-    # still there
-    remaining = list_open_exit_orders(tc, symbol)
-    log.warning("wait_exit_orders_cleared: still OPEN after %.1fs for %s: %s",
-                timeout, symbol, [str(o.id) for o in remaining])
-    return False
+def _tif() -> TimeInForce:
+    tif = os.getenv("OCO_TIF", "gtc").strip().lower()
+    return TimeInForce.GTC if tif == "gtc" else TimeInForce.DAY
 
 
 def place_exit_oco(
     tc: TradingClient,
     symbol: str,
-    qty: int,
+    position_qty: float,
     tp_price: float,
     sl_stop_price: float,
-    client_order_id: Optional[str] = None,
 ) -> str:
     """
-    Create OCO exit:
-      - take profit limit
-      - stop loss stop (market on trigger)
+    Create OCO exit for an existing position.
+    LONG qty>0 -> SELL OCO
+    SHORT qty<0 -> BUY OCO (buy-to-close)
     """
-    symbol = symbol.upper().strip()
+    symbol = symbol.upper()
+    qty = abs(int(round(position_qty)))
     if qty <= 0:
-        raise ValueError("qty must be > 0 for SELL_TO_CLOSE OCO")
+        raise ValueError("position_qty must be non-zero")
 
-    cid = client_order_id or f"{EXIT_ORDER_PREFIX}{symbol}-{int(time.time())}"
+    side = OrderSide.SELL if position_qty > 0 else OrderSide.BUY
+    cid = f"{_prefix()}-{symbol}-{int(time.time())}"
 
     req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
-        side=OrderSide.SELL,
+        side=side,
         time_in_force=_tif(),
         limit_price=float(tp_price),
         order_class=OrderClass.OCO,
@@ -135,5 +196,6 @@ def place_exit_oco(
         stop_loss=StopLossRequest(stop_price=float(sl_stop_price)),
         client_order_id=cid,
     )
+
     o = tc.submit_order(req)
     return str(o.id)
