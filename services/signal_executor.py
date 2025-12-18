@@ -1,4 +1,4 @@
-import os
+﻿import os
 import time
 import logging
 
@@ -68,7 +68,7 @@ engine = get_engine()
 
 
 # ---------------------------------------------------------
-# DB – SIGNALS
+# DB â€“ SIGNALS
 # ---------------------------------------------------------
 def fetch_new_signals():
     sql = text(
@@ -125,12 +125,9 @@ def select_signals(signals):
         len(selected),
         len(seen_symbol_side),
     )
-
-    global PROCESSED_SIGNAL_IDS
     if len(PROCESSED_SIGNAL_IDS) > 10000:
-        logger.info("select_signals | resetting PROCESSED_SIGNAL_IDS (size>10000)")
-        PROCESSED_SIGNAL_IDS = set()
-
+        logger.info("select_signals | clearing PROCESSED_SIGNAL_IDS (size>10000)")
+        PROCESSED_SIGNAL_IDS.clear()
     return selected
 
 
@@ -139,7 +136,7 @@ def mark_signal_processed(sig: dict):
 
 
 # ---------------------------------------------------------
-# HELPERS – ACCOUNT & ORDERS
+# HELPERS â€“ ACCOUNT & ORDERS
 # ---------------------------------------------------------
 def _is_exit_oco_order(order) -> bool:
     cid = getattr(order, "client_order_id", None) or ""
@@ -340,7 +337,7 @@ def submit_close_order(symbol: str, order_side: OrderSide, qty: int, last_price:
 
 
 # ---------------------------------------------------------
-# MAIN EXECUTION – PER SIGNAL
+# MAIN EXECUTION â€“ PER SIGNAL
 # ---------------------------------------------------------
 def create_order_from_signal(symbol: str, side: str, strength: float, source: str, signal_id: int):
     side = side.lower()
@@ -435,7 +432,7 @@ def main():
     while True:
         try:
             if not check_daily_risk_guard():
-                logger.info("Daily risk guard active – skipping signal execution this loop")
+                logger.info("Daily risk guard active â€“ skipping signal execution this loop")
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -470,3 +467,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
