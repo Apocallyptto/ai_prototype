@@ -2,150 +2,134 @@
 import os
 import time
 import logging
+from typing import Optional
+
+from alpaca.trading.client import TradingClient
 
 from services.alpaca_exit_guard import (
-    get_trading_client,
     has_exit_orders,
     cancel_exit_orders,
     place_exit_oco,
+    round_to_step,
 )
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("oco_exit_monitor")
 
 
-def _symbols_filter() -> set[str] | None:
-    raw = os.getenv("SYMBOLS", "").strip()
-    if not raw:
-        return None
-    return {s.strip().upper() for s in raw.split(",") if s.strip()}
-
-
-def _price_decimals() -> int:
+def _get_env_float(name: str, default: float) -> float:
     try:
-        return int(os.getenv("PRICE_DECIMALS", "2"))
+        return float(os.getenv(name, str(default)))
     except Exception:
-        return 2
+        return float(default)
 
 
-def _round_price(x: float) -> float:
-    return round(float(x), _price_decimals())
-
-
-def _ref_price(position) -> float | None:
-    """
-    Referenčná cena:
-    - "entry" (avg_entry_price) alebo "current" (current_price)
-    """
-    mode = os.getenv("OCO_REF_PRICE", "entry").strip().lower()
-
-    def f(v):
-        try:
-            return float(v)
-        except Exception:
-            return None
-
-    avg_entry = f(getattr(position, "avg_entry_price", None))
-    current = f(getattr(position, "current_price", None))
-
-    if mode == "current":
-        return current or avg_entry
-    return avg_entry or current
-
-
-def _signed_qty_from_position(p) -> float | None:
-    """
-    Alpaca často vracia qty kladné a smer je v p.side.
-    Takže si spravíme signed qty:
-      LONG  -> +qty
-      SHORT -> -qty
-    """
+def _get_env_int(name: str, default: int) -> int:
     try:
-        qty = abs(float(getattr(p, "qty", 0)))
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if raw in ("1", "true", "yes", "y", "on"):
+        return True
+    if raw in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _symbols():
+    raw = (os.getenv("SYMBOLS") or "AAPL,MSFT,SPY").strip()
+    return [x.strip().upper() for x in raw.split(",") if x.strip()]
+
+
+def _safe_get_position(tc: TradingClient, symbol: str):
+    try:
+        return tc.get_open_position(symbol)
     except Exception:
         return None
-
-    side = getattr(p, "side", None)
-    side_name = getattr(side, "name", str(side)).upper()
-
-    if "SHORT" in side_name:
-        return -qty
-    return qty
-
-
-def _tp_sl_from_pct(ref: float, signed_qty: float) -> tuple[float, float]:
-    tp_pct = float(os.getenv("OCO_TP_PCT", "0.015"))  # 1.5%
-    sl_pct = float(os.getenv("OCO_SL_PCT", "0.010"))  # 1.0%
-
-    if signed_qty > 0:  # LONG
-        tp = ref * (1.0 + tp_pct)
-        sl = ref * (1.0 - sl_pct)
-    else:               # SHORT
-        tp = ref * (1.0 - tp_pct)
-        sl = ref * (1.0 + sl_pct)
-
-    return _round_price(tp), _round_price(sl)
 
 
 def main():
-    tc = get_trading_client()
-    poll = float(os.getenv("POLL_SECONDS", "5"))
-    symbols_filter = _symbols_filter()
+    tc = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
 
-    log.info("Started | poll=%ss | symbols_filter=%s", poll, sorted(symbols_filter) if symbols_filter else "ALL")
+    SYMBOLS = _symbols()
+    POLL_SEC = _get_env_int("OCO_POLL_SEC", 20)
+
+    ATR_PCT = _get_env_float("ATR_PCT", 0.01)      # napr. 0.01 = 1%
+    TP_MULT = _get_env_float("TP_MULT", 1.75)
+    SL_MULT = _get_env_float("SL_MULT", 1.75)
+
+    PRICE_STEP = _get_env_float("PRICE_STEP", 0.01)
+
+    ORPHAN_MIN_AGE_SEC = _get_env_int("ORPHAN_MIN_AGE_SEC", 120)
+    CANCEL_ORPHAN = _get_env_bool("CANCEL_ORPHAN", True)
+
+    DRY_RUN = _get_env_bool("DRY_RUN", False)
+
+    log.info(
+        "oco_exit_monitor starting | SYMBOLS=%s | POLL=%ss | ATR_PCT=%.4f | TP_MULT=%.2f | SL_MULT=%.2f | "
+        "PRICE_STEP=%.2f | ORPHAN_MIN_AGE_SEC=%s | CANCEL_ORPHAN=%s | DRY_RUN=%s",
+        SYMBOLS, POLL_SEC, ATR_PCT, TP_MULT, SL_MULT, PRICE_STEP, ORPHAN_MIN_AGE_SEC, CANCEL_ORPHAN, DRY_RUN
+    )
 
     while True:
         try:
-            positions = tc.get_all_positions()
-            pos_map = {str(p.symbol).upper(): p for p in positions}
+            for symbol in SYMBOLS:
+                pos = _safe_get_position(tc, symbol)
 
-            symbols_to_process = set(pos_map.keys())
-            if symbols_filter:
-                symbols_to_process = symbols_filter
-
-            for symbol in sorted(symbols_to_process):
-                p = pos_map.get(symbol)
-
-                # 1) Ak nemáme pozíciu, zruš orphan EXIT-OCO
-                if p is None:
-                    if has_exit_orders(tc, symbol):
-                        n = cancel_exit_orders(tc, symbol)
-                        log.info("Canceled orphan EXIT-OCO | %s | canceled=%d", symbol, n)
+                # ===== no position -> orphan cleanup (voliteľne) =====
+                if not pos:
+                    if CANCEL_ORPHAN and has_exit_orders(tc, symbol):
+                        # jednoduché: necháme to ako bezpečnostný “kill-switch”
+                        log.warning("Orphan EXIT detected | %s | canceling (DRY_RUN=%s)", symbol, DRY_RUN)
+                        cancel_exit_orders(tc, symbol, dry_run=DRY_RUN)
                     continue
 
-                signed_qty = _signed_qty_from_position(p)
-                if not signed_qty:
+                # ===== position exists -> ensure exactly one EXIT =====
+                qty_raw = float(pos.qty)  # pre SHORT môže byť záporné
+                avg = float(getattr(pos, "avg_entry_price", 0.0) or 0.0)
+
+                if avg <= 0 or qty_raw == 0:
+                    log.warning("Invalid position data | %s | qty=%s avg=%s", symbol, qty_raw, avg)
                     continue
 
-                # 2) Idempotencia: už máme EXIT-OCO -> nerob nič
+                # ak už existuje OCO (parent), nerob duplicitné
                 if has_exit_orders(tc, symbol):
+                    log.info("EXIT already exists | %s | skip", symbol)
                     continue
 
-                ref = _ref_price(p)
-                if not ref or ref <= 0:
-                    log.warning("Skip %s: missing ref price (avg_entry/current).", symbol)
-                    continue
+                # ===== compute TP/SL =====
+                # ATR-based delta as percent of avg
+                delta = avg * ATR_PCT
 
-                tp, sl = _tp_sl_from_pct(ref, signed_qty)
+                # LONG: TP above, SL below
+                # SHORT: TP below, SL above
+                direction = 1.0 if qty_raw > 0 else -1.0
 
-                # 3) sanity
-                if signed_qty > 0 and not (sl < ref < tp):
-                    log.warning("Skip %s: invalid LONG tp/sl ref=%s tp=%s sl=%s", symbol, ref, tp, sl)
-                    continue
-                if signed_qty < 0 and not (tp < ref < sl):
-                    log.warning("Skip %s: invalid SHORT tp/sl ref=%s tp=%s sl=%s", symbol, ref, tp, sl)
-                    continue
+                tp = avg + direction * delta * TP_MULT
+                sl = avg - direction * delta * SL_MULT
 
-                oid = place_exit_oco(tc, symbol, signed_qty, tp, sl)
-                log.info("Placed EXIT OCO | %s qty=%s ref=%s tp=%s sl=%s | order_id=%s", symbol, signed_qty, ref, tp, sl, oid)
+                tp = round_to_step(tp, PRICE_STEP)
+                sl = round_to_step(sl, PRICE_STEP)
 
-        except Exception as e:
-            log.exception("Monitor loop error: %s", e)
+                log.info(
+                    "Placing EXIT-OCO | %s | qty=%s avg=%.4f -> TP=%.4f SL=%.4f | DRY_RUN=%s",
+                    symbol, qty_raw, avg, tp, sl, DRY_RUN
+                )
 
-        time.sleep(poll)
+                if not DRY_RUN:
+                    oid = place_exit_oco(tc, symbol, qty_raw, tp_price=tp, sl_stop_price=sl)
+                    log.info("EXIT-OCO submitted | %s | order_id=%s", symbol, oid)
+
+            time.sleep(POLL_SEC)
+
+        except Exception:
+            # toto je dôležité, aby container “neumrel” pri jednej API chybe
+            log.exception("Cycle error (will continue)")
+            time.sleep(POLL_SEC)
 
 
 if __name__ == "__main__":
