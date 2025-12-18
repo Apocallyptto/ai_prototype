@@ -1,130 +1,100 @@
-# services/oco_exit_monitor.py
 import os
 import time
 import logging
 
-from services.alpaca_exit_guard import (
-    get_trading_client,
-    has_exit_orders,
-    cancel_exit_orders,
-    place_exit_oco,
-)
+from alpaca.trading.client import TradingClient
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-)
+from services.alpaca_exit_guard import has_exit_orders, place_exit_oco
+from utils import compute_atr
+
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("oco_exit_monitor")
 
+POLL_SECONDS = float(os.getenv("OCO_POLL_SECONDS", "5"))
+SYMBOLS_FILTER = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
 
-def _symbols_filter() -> set[str] | None:
-    raw = os.getenv("SYMBOLS", "").strip()
-    if not raw:
-        return None
-    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", "1.0"))
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
+ATR_FALLBACK_PCT = float(os.getenv("ATR_PCT", "0.01"))
 
+EXIT_OCO_PREFIX = os.getenv("EXIT_OCO_PREFIX", "EXIT-OCO").strip() or "EXIT-OCO"
 
-def _price_decimals() -> int:
-    try:
-        return int(os.getenv("PRICE_DECIMALS", "2"))
-    except Exception:
-        return 2
-
-
-def _round_price(x: float) -> float:
-    d = _price_decimals()
-    return round(float(x), d)
+tc = TradingClient(
+    api_key=os.getenv("ALPACA_API_KEY"),
+    secret_key=os.getenv("ALPACA_API_SECRET"),
+    paper=(os.getenv("TRADING_MODE", "paper") == "paper"),
+)
 
 
-def _ref_price(position) -> float | None:
-    """
-    Vyber referenčnú cenu:
-    - entry (avg_entry_price) alebo current (current_price)
-    """
-    mode = os.getenv("OCO_REF_PRICE", "entry").strip().lower()
-
-    avg_entry = getattr(position, "avg_entry_price", None)
-    current = getattr(position, "current_price", None)
-
-    def f(v):
-        try:
-            return float(v)
-        except Exception:
-            return None
-
-    avg_entry_f = f(avg_entry)
-    current_f = f(current)
-
-    if mode == "current":
-        return current_f or avg_entry_f
-    return avg_entry_f or current_f
+def _is_exit_oco(order) -> bool:
+    cid = getattr(order, "client_order_id", None) or ""
+    sym = getattr(order, "symbol", None)
+    if not sym:
+        return False
+    return cid.startswith(f"{EXIT_OCO_PREFIX}-{str(sym).upper()}-")
 
 
-def _tp_sl_from_pct(ref: float, qty: float) -> tuple[float, float]:
-    tp_pct = float(os.getenv("OCO_TP_PCT", "0.015"))  # 1.5%
-    sl_pct = float(os.getenv("OCO_SL_PCT", "0.010"))  # 1.0%
+def _has_open_non_exit_orders(symbol: str) -> bool:
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
 
-    if qty > 0:  # LONG
-        tp = ref * (1.0 + tp_pct)
-        sl = ref * (1.0 - sl_pct)
-    else:        # SHORT
-        tp = ref * (1.0 - tp_pct)
-        sl = ref * (1.0 + sl_pct)
+    r = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol.upper()], limit=500)
+    orders = list(tc.get_orders(r))
+    return any(not _is_exit_oco(o) for o in orders)
 
-    return _round_price(tp), _round_price(sl)
+
+def _compute_tp_sl(symbol: str, position_qty: float, avg_entry: float):
+    atr_val, _last = compute_atr(symbol)
+    atr = float(atr_val or 0.0)
+    if atr <= 0:
+        atr = avg_entry * ATR_FALLBACK_PCT
+
+    if position_qty > 0:
+        tp = avg_entry + atr * TP_ATR_MULT
+        sl = avg_entry - atr * SL_ATR_MULT
+    else:
+        tp = avg_entry - atr * TP_ATR_MULT
+        sl = avg_entry + atr * SL_ATR_MULT
+
+    return round(tp, 2), round(sl, 2)
 
 
 def main():
-    tc = get_trading_client()
-    poll = float(os.getenv("POLL_SECONDS", "5"))
-    symbols_filter = _symbols_filter()
-
-    log.info("Started | poll=%ss | symbols_filter=%s", poll, sorted(symbols_filter) if symbols_filter else "ALL")
+    log.info("Started | poll=%.1fs | symbols_filter=%s", POLL_SECONDS, "ALL" if not SYMBOLS_FILTER else SYMBOLS_FILTER)
 
     while True:
         try:
             positions = tc.get_all_positions()
 
             for p in positions:
-                symbol = str(p.symbol).upper()
-
-                if symbols_filter and symbol not in symbols_filter:
+                sym = str(p.symbol).upper()
+                if SYMBOLS_FILTER and sym not in SYMBOLS_FILTER:
                     continue
 
                 try:
                     qty = float(p.qty)
+                    avg_entry = float(p.avg_entry_price)
                 except Exception:
                     continue
 
                 if qty == 0:
                     continue
 
-                # 1) Idempotencia: ak už máme EXIT-OCO pre symbol, nerob nič
-                if has_exit_orders(tc, symbol):
+                if _has_open_non_exit_orders(sym):
                     continue
 
-                ref = _ref_price(p)
-                if not ref or ref <= 0:
-                    log.warning("Skip %s: missing ref price (avg_entry/current).", symbol)
+                if has_exit_orders(tc, sym):
                     continue
 
-                tp, sl = _tp_sl_from_pct(ref, qty)
-
-                # sanity: nech TP/SL dáva zmysel
-                if qty > 0 and not (sl < ref < tp):
-                    log.warning("Skip %s: invalid LONG tp/sl ref=%s tp=%s sl=%s", symbol, ref, tp, sl)
-                    continue
-                if qty < 0 and not (tp < ref < sl):
-                    log.warning("Skip %s: invalid SHORT tp/sl ref=%s tp=%s sl=%s", symbol, ref, tp, sl)
-                    continue
-
-                oid = place_exit_oco(tc, symbol, qty, tp, sl)
-                log.info("Placed EXIT OCO | %s qty=%s ref=%s tp=%s sl=%s | order_id=%s", symbol, qty, ref, tp, sl, oid)
+                tp, sl = _compute_tp_sl(sym, qty, avg_entry)
+                oid = place_exit_oco(tc, sym, qty, tp, sl)
+                log.info("Placed EXIT-OCO | %s qty=%s avg=%.2f -> TP=%.2f SL=%.2f | order_id=%s",
+                         sym, int(abs(round(qty))), avg_entry, tp, sl, oid)
 
         except Exception as e:
-            log.exception("Monitor loop error: %s", e)
+            log.exception("monitor error: %s", e)
 
-        time.sleep(poll)
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
