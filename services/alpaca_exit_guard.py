@@ -2,7 +2,8 @@
 import os
 import time
 import logging
-from typing import Optional
+import datetime as dt
+from typing import List, Optional, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -11,78 +12,169 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
     StopLossRequest,
 )
-from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce, OrderClass
+from alpaca.trading.enums import (
+    QueryOrderStatus,
+    OrderSide,
+    TimeInForce,
+    OrderClass,
+)
 
 log = logging.getLogger("alpaca_exit_guard")
 
-
-def get_trading_client() -> TradingClient:
-    key = os.getenv("ALPACA_API_KEY")
-    secret = os.getenv("ALPACA_API_SECRET")
-    if not key or not secret:
-        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET env vars")
-
-    paper = os.getenv("TRADING_MODE", "paper").strip().lower() == "paper"
-    return TradingClient(key, secret, paper=paper)
+FINAL_STATUSES = {"CANCELED", "FILLED", "REJECTED", "EXPIRED"}
 
 
-def _prefix() -> str:
-    # prefix WITHOUT symbol, e.g. "EXIT-OCO-"
-    return os.getenv("EXIT_ORDER_PREFIX", "EXIT-OCO-")
+def _norm_status(st) -> str:
+    s = str(st).upper()
+    return s.split(".")[-1]  # OrderStatus.CANCELED -> CANCELED
 
 
-def _is_our_exit_order(order, symbol: str) -> bool:
-    cid = (getattr(order, "client_order_id", None) or "")
-    return cid.startswith(f"{_prefix()}{symbol}-")
+def _csv_env(name: str, default: str) -> List[str]:
+    raw = (os.getenv(name) or default).strip()
+    return [x.strip().upper() for x in raw.split(",") if x.strip()]
 
 
-def list_open_orders(tc: TradingClient, symbol: Optional[str] = None, limit: int = 500):
-    if symbol:
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], limit=limit)
-    else:
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=limit)
-    return tc.get_orders(req)
-
-
-def get_position_qty(tc: TradingClient, symbol: str) -> float:
+def _get_orders_all(tc: TradingClient, symbols: List[str], limit: int = 200, nested: bool = True):
+    """
+    nested=True niekedy pomôže, ale nie všetky verzie alpaca-py ho majú.
+    """
     try:
-        p = tc.get_open_position(symbol)
-        return float(p.qty)
-    except Exception:
-        return 0.0
+        return tc.get_orders(
+            GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                symbols=symbols,
+                limit=limit,
+                nested=nested,
+            )
+        )
+    except TypeError:
+        return tc.get_orders(
+            GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                symbols=symbols,
+                limit=limit,
+            )
+        )
 
 
-def cancel_exit_orders(tc: TradingClient, symbol: str, side_to_cancel: Optional[OrderSide] = None) -> int:
-    """
-    Zruší iba orders s client_order_id prefixom: EXIT-OCO-{symbol}-*
-    Pozn.: OPEN list typicky vráti parent OCO. Zrušenie parenta zruší aj HELD stop leg.
-    """
-    orders = list_open_orders(tc, symbol)
-    to_cancel = []
-    for o in orders:
-        if not _is_our_exit_order(o, symbol):
-            continue
-        if side_to_cancel is not None and getattr(o, "side", None) != side_to_cancel:
-            continue
-        to_cancel.append(o)
-
-    for o in to_cancel:
-        try:
-            tc.cancel_order_by_id(str(o.id))
-        except Exception as e:
-            log.warning("Failed to cancel order %s for %s: %s", getattr(o, "id", None), symbol, e)
-
-    return len(to_cancel)
-
-
-def has_exit_orders(tc: TradingClient, symbol: str) -> bool:
-    orders = list_open_orders(tc, symbol)
-    return any(_is_our_exit_order(o, symbol) for o in orders)
+def _get_orders_open(tc: TradingClient, symbols: List[str], limit: int = 200):
+    return tc.get_orders(
+        GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            symbols=symbols,
+            limit=limit,
+        )
+    )
 
 
 def _tif() -> TimeInForce:
-    tif = os.getenv("OCO_TIF", "gtc").strip().lower()
-    return TimeInForce.GTC if tif == "gtc" else TimeInForce.DAY
+    tif = (os.getenv("OCO_TIF") or "gtc").strip().lower()
+    if tif == "day":
+        return TimeInForce.DAY
+    return TimeInForce.GTC
+
+
+def _exit_prefix() -> str:
+    return (os.getenv("EXIT_PREFIX") or "EXIT-OCO-").strip()
+
+
+def _price_step() -> float:
+    try:
+        return float(os.getenv("PRICE_STEP") or "0.01")
+    except Exception:
+        return 0.01
+
+
+def round_to_step(price: float, step: float) -> float:
+    if step <= 0:
+        return float(price)
+    return round(round(float(price) / step) * step, 8)
+
+
+def list_active_exit_orders(
+    tc: TradingClient,
+    symbol: str,
+    limit: int = 300,
+) -> List[object]:
+    """
+    Nájde všetky ACTIVE (non-final) orders, ktoré vyzerajú ako EXIT:
+    - order_class == OCO  (parent aj niektoré legy)
+    - alebo client_order_id začína na EXIT prefix + SYMBOL-
+    """
+    prefix = _exit_prefix()
+    sym_u = symbol.upper()
+
+    orders = _get_orders_all(tc, [sym_u], limit=limit, nested=True)
+
+    active = []
+    for o in orders:
+        st = _norm_status(getattr(o, "status", ""))
+        if st in FINAL_STATUSES:
+            continue
+
+        cid = (getattr(o, "client_order_id", "") or "")
+        oc = getattr(o, "order_class", None)
+
+        is_oco = str(oc).upper().endswith("OCO")
+        is_ours = cid.startswith(f"{prefix}{sym_u}-")
+
+        if is_oco or is_ours:
+            active.append(o)
+
+    return active
+
+
+def has_exit_orders(tc: TradingClient, symbol: str) -> bool:
+    """
+    Rýchly check: OPEN parent OCO sa zvyčajne objaví v OPEN.
+    Pre istotu doplníme aj ALL(active) filter.
+    """
+    sym_u = symbol.upper()
+
+    # 1) OPEN parenty (najlacnejšie)
+    oo = _get_orders_open(tc, [sym_u], limit=100)
+    for o in oo:
+        oc = getattr(o, "order_class", None)
+        cid = (getattr(o, "client_order_id", "") or "")
+        if str(oc).upper().endswith("OCO") or cid.startswith(f"{_exit_prefix()}{sym_u}-"):
+            return True
+
+    # 2) fallback: ALL(active)
+    return len(list_active_exit_orders(tc, sym_u, limit=200)) > 0
+
+
+def cancel_exit_orders(tc: TradingClient, symbol: str, dry_run: bool = False) -> int:
+    """
+    Zruší active EXITy pre symbol.
+    Preferujeme zrušiť parent OCO (tým sa zrušia aj legs).
+    """
+    sym_u = symbol.upper()
+    active = list_active_exit_orders(tc, sym_u, limit=400)
+
+    # parenty prvé
+    parents = []
+    others = []
+    for o in active:
+        oc = getattr(o, "order_class", None)
+        if str(oc).upper().endswith("OCO"):
+            parents.append(o)
+        else:
+            others.append(o)
+
+    canceled = 0
+    for bucket in (parents, others):
+        for o in bucket:
+            oid = str(getattr(o, "id", ""))
+            try:
+                if dry_run:
+                    log.info("DRY_RUN cancel_exit_orders | would_cancel=%s", oid)
+                else:
+                    tc.cancel_order_by_id(oid)
+                canceled += 1
+            except Exception as e:
+                log.warning("cancel_exit_orders failed | id=%s | err=%s", oid, e)
+
+    return canceled
 
 
 def place_exit_oco(
@@ -102,12 +194,20 @@ def place_exit_oco(
     if position_qty_signed == 0:
         raise ValueError("position_qty_signed is 0 (nothing to protect)")
 
-    side = OrderSide.SELL if position_qty_signed > 0 else OrderSide.BUY
+    sym_u = symbol.upper()
     qty = abs(float(position_qty_signed))
-    cid = f"{_prefix()}{symbol}-{int(time.time())}"
+
+    side = OrderSide.SELL if position_qty_signed > 0 else OrderSide.BUY
+
+    step = _price_step()
+    tp_price = round_to_step(tp_price, step)
+    sl_stop_price = round_to_step(sl_stop_price, step)
+
+    prefix = _exit_prefix()
+    cid = f"{prefix}{sym_u}-{int(time.time())}"
 
     req = LimitOrderRequest(
-        symbol=symbol,
+        symbol=sym_u,
         qty=qty,
         side=side,
         time_in_force=_tif(),
@@ -116,6 +216,7 @@ def place_exit_oco(
         limit_price=float(tp_price),
         order_class=OrderClass.OCO,
 
+        # !!! toto je povinné pre OCO:
         take_profit=TakeProfitRequest(limit_price=float(tp_price)),
         stop_loss=StopLossRequest(stop_price=float(sl_stop_price)),
 
@@ -123,4 +224,16 @@ def place_exit_oco(
     )
 
     o = tc.submit_order(req)
+
+    # bonus robustnosť: over legs (niekedy sa objavia po chvíľke)
+    try:
+        time.sleep(0.5)
+        full = tc.get_order_by_id(str(o.id))
+        legs = getattr(full, "legs", None)
+        if not legs:
+            # malá šanca race condition -> nechaj, ale zaloguj
+            log.warning("OCO submitted but legs missing (yet) | parent_id=%s | client=%s", o.id, cid)
+    except Exception:
+        pass
+
     return str(o.id)
