@@ -182,3 +182,18 @@ def place_exit_oco(
 
     created = tc.submit_order(req)
     return str(created.id)
+
+
+def wait_exit_orders_cleared(tc, symbol: str, timeout_sec: int = 15, poll_sec: float = 0.5, cancel_first: bool = True, **_):
+    """Cancel our EXIT orders for symbol and wait until they are cleared from OPEN orders.
+    Returns True if cleared, False on timeout.
+    """
+    if cancel_first:
+        cancel_exit_orders(tc, symbol)
+
+    deadline = time.time() + float(timeout_sec)
+    while time.time() < deadline:
+        if not has_exit_orders(tc, symbol):
+            return True
+        time.sleep(float(poll_sec))
+    return False
