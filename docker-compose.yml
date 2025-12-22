@@ -1,52 +1,48 @@
-version: "3.9"
-
 services:
-
   postgres:
     image: postgres:16
     container_name: trader_postgres
-    restart: always
+    restart: unless-stopped
     environment:
+      POSTGRES_DB: trader
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: trader
     ports:
       - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
   signal_maker:
     build:
       context: .
     image: ai_prototype-signal_maker
     container_name: trader_signal_maker
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: .env
     environment:
-      # --- DB (lokálny postgres kontajner) ---
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+      DB_URL: "${DB_URL}"
+      SYMBOLS: "${SYMBOLS}"
+      PORTFOLIO_ID: "${PORTFOLIO_ID}"
 
-      ALLOW_SHORT: "${ALLOW_SHORT:-0}"
+      # maker má vlastný threshold (aby generoval dosť signálov)
+      MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.20}"
+      CRON_SLEEP_SECONDS: "${CRON_SLEEP_SECONDS:-180}"
 
-      # --- ML / signály ---
-      SYMBOLS: "AAPL,MSFT,SPY"
-      MIN_STRENGTH: "0.20"
-      CRON_SLEEP_SECONDS: "180"
-
-      # --- Alpaca ---
       ALPACA_API_KEY: "${ALPACA_API_KEY}"
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
-      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
-      ALPACA_DATA_URL: "https://data.alpaca.markets"
+      ALPACA_BASE_URL: "${ALPACA_BASE_URL}"
+      ALPACA_DATA_URL: "${ALPACA_DATA_URL}"
+      TRADING_MODE: "${TRADING_MODE:-paper}"
 
-      TRADING_MODE: "paper"
-      PYTHONPATH: "/app"
+      PYTHONPATH: /app
     volumes:
       - .:/app
     command: >
@@ -55,165 +51,149 @@ services:
         while true; do
           echo '--- running jobs.make_signals_ml ---';
           python -m jobs.make_signals_ml || echo 'make_signals_ml failed';
-          echo 'sleeping for '${CRON_SLEEP_SECONDS:-180}' seconds...';
+          echo 'sleeping for ${CRON_SLEEP_SECONDS:-180} seconds...';
           sleep ${CRON_SLEEP_SECONDS:-180};
         done
       "
-    restart: always
 
   signal_executor:
     build:
       context: .
     image: ai_prototype-signal_executor
     container_name: trader_signal_executor
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: .env
     environment:
-      # --- DB (rovnaká ako signal_maker) ---
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+      DB_URL: "${DB_URL}"
+      SYMBOLS: "${SYMBOLS}"
+      PORTFOLIO_ID: "${PORTFOLIO_ID}"
 
-      # --- Alpaca ---
+      # executor má vlastný threshold (reálne obchodovanie)
+      MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
+      CRON_SLEEP_SECONDS: "${POLL_SECONDS:-20}"
+
+      # ✅ TU je fix: shorty musia ísť aj do signal_executor
+      ALLOW_SHORT: "${ALLOW_SHORT:-0}"
+      LONG_ONLY: "${LONG_ONLY:-0}"
+      FRACTIONAL: "${FRACTIONAL:-1}"
+      MIN_QTY: "${MIN_QTY:-0.01}"
+      ALLOW_FRACTIONAL_SHORTS: "${ALLOW_FRACTIONAL_SHORTS:-0}"
+      ALLOW_AFTER_HOURS: "${ALLOW_AFTER_HOURS:-0}"
+      CLOSE_WITH_MARKET: "${CLOSE_WITH_MARKET:-1}"
+
+      # risk
+      ATR_PCT: "${ATR_PCT:-0.01}"
+      TP_ATR_MULT: "${TP_ATR_MULT:-1.0}"
+      SL_ATR_MULT: "${SL_ATR_MULT:-1.0}"
+      MAX_RISK_PER_TRADE_USD: "${MAX_RISK_PER_TRADE_USD:-30}"
+      MAX_NOTIONAL_PER_TRADE_USD: "${MAX_NOTIONAL_PER_TRADE_USD:-1200}"
+      MAX_QTY_PER_TRADE: "${MAX_QTY_PER_TRADE:-5}"
+      MAX_BP_PCT_PER_TRADE: "${MAX_BP_PCT_PER_TRADE:-0.25}"
+      INSUFFICIENT_COOLDOWN_SECONDS: "${INSUFFICIENT_COOLDOWN_SECONDS:-900}"
+
+      ENABLE_DAILY_RISK_GUARD: "${ENABLE_DAILY_RISK_GUARD:-0}"
+      MAX_DAILY_LOSS_USD: "${MAX_DAILY_LOSS_USD:-200}"
+      MAX_DRAWDOWN_PCT: "${MAX_DRAWDOWN_PCT:-2.0}"
+
       ALPACA_API_KEY: "${ALPACA_API_KEY}"
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
-      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
-      ALPACA_DATA_URL: "https://data.alpaca.markets"
-      TRADING_MODE: "paper"
+      ALPACA_BASE_URL: "${ALPACA_BASE_URL}"
+      ALPACA_DATA_URL: "${ALPACA_DATA_URL}"
+      TRADING_MODE: "${TRADING_MODE:-paper}"
 
-      # --- Executor config ---
-      MIN_STRENGTH: "0.60"
-      SYMBOLS: "AAPL,MSFT,SPY"
-      CRON_SLEEP_SECONDS: "20"
-      PORTFOLIO_ID: "1"
-      DEFAULT_ENTRY_PRICE: "200.0"
-
-      # --- ATR / TP / SL ---
-      ATR_PCT: "0.01"
-      TP_ATR_MULT: "1.0"
-      SL_ATR_MULT: "1.0"
-
-      # --- Risk / sizing guardrails ---
-      MAX_RISK_PER_TRADE_USD: "30"      # max strata na trade ~30 USD
-      MAX_QTY_PER_TRADE: "5"            # max 5 kusov na obchod
-      MAX_NOTIONAL_PER_TRADE_USD: "1200" # max 600 USD v jednom trade
-      MAX_BP_PCT_PER_TRADE: "0.25"      # max 25% buying power na jeden obchod
-      INSUFFICIENT_COOLDOWN_SECONDS: "900"
-
-      # --- Daily risk guard ---
-      ENABLE_DAILY_RISK_GUARD: "0"
-      MAX_DAILY_LOSS_USD: "200"   # max denná strata v USD
-      MAX_DRAWDOWN_PCT: "2.0"     # max drawdown v % za deň
-
-      PYTHONPATH: "/app"
+      PYTHONPATH: /app
     volumes:
       - .:/app
     command: >
-      sh -lc "python -m services.signal_executor"
-    restart: always
+      sh -lc "
+        echo 'signal_executor starting...';
+        python -m services.signal_executor
+      "
 
   sync_orders:
     build:
       context: .
     image: ai_prototype-sync_orders
     container_name: trader_sync_orders
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: .env
     environment:
-      # --- DB ---
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-      # --- Alpaca ---
-      ALPACA_API_KEY: "${ALPACA_API_KEY}"
-      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
-      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
-      ALPACA_DATA_URL: "https://data.alpaca.markets"
-
-      TRADING_MODE: "paper"
-      PYTHONPATH: "/app"
+      DB_URL: "${DB_URL}"
+      PYTHONPATH: /app
+      SYNC_ORDERS_SLEEP_SECONDS: "${SYNC_ORDERS_SLEEP_SECONDS:-15}"
     volumes:
       - .:/app
     command: >
-      sh -lc "python -u tools/sync_orders.py"
-    restart: always
-
-  oco_exit_monitor:
-    build:
-      context: .
-    image: ai_prototype-oco_exit_monitor
-    container_name: trader_oco_exit_monitor
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      # --- DB ---
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-      # --- Alpaca ---
-      ALPACA_API_KEY: "${ALPACA_API_KEY}"
-      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
-      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
-      ALPACA_DATA_URL: "https://data.alpaca.markets"
-
-      TRADING_MODE: "paper"
-      PYTHONPATH: "/app"
-    volumes:
-      - .:/app
-    command: >
-      sh -lc "python -u services/oco_exit_monitor.py"
-    restart: always
+      sh -lc "
+        echo 'sync_orders starting...';
+        while true; do
+          python -u tools/sync_orders.py || echo 'sync_orders failed';
+          sleep ${SYNC_ORDERS_SLEEP_SECONDS:-15};
+        done
+      "
 
   pnl_recorder:
     build:
       context: .
     image: ai_prototype-pnl_recorder
     container_name: trader_pnl_recorder
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: .env
     environment:
-      # --- DB ---
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-
-      # --- Alpaca ---
-      ALPACA_API_KEY: "${ALPACA_API_KEY}"
-      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
-      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
-      ALPACA_DATA_URL: "https://data.alpaca.markets"
-      TRADING_MODE: "paper"
-
-      # --- PnL config ---
-      PORTFOLIO_ID: "1"
-      PNL_POLL_SECONDS: "300"   # každých 5 min počas testu
-
-      PYTHONPATH: "/app"
+      DB_URL: "${DB_URL}"
+      PYTHONPATH: /app
+      PNL_SLEEP_SECONDS: "${PNL_SLEEP_SECONDS:-30}"
     volumes:
       - .:/app
     command: >
-      sh -lc "python -m services.record_pnl"
-    restart: always
+      sh -lc "
+        echo 'pnl_recorder starting...';
+        while true; do
+          python -u tools/pnl_recorder.py || echo 'pnl_recorder failed';
+          sleep ${PNL_SLEEP_SECONDS:-30};
+        done
+      "
 
-  eod_closer:
+  oco_exit_monitor:
     build:
       context: .
-    image: ai_prototype-eod_closer
-    container_name: trader_eod_closer
+    image: ai_prototype-oco_exit_monitor
+    container_name: trader_oco_exit_monitor
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    env_file: .env
     environment:
-      # --- Alpaca ---
+      DB_URL: "${DB_URL}"
+      SYMBOLS: "${SYMBOLS}"
+      PORTFOLIO_ID: "${PORTFOLIO_ID}"
+
+      EXIT_MONITOR_POLL_SECONDS: "${EXIT_MONITOR_POLL_SECONDS:-5}"
+
       ALPACA_API_KEY: "${ALPACA_API_KEY}"
       ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
-      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
-      ALPACA_DATA_URL: "https://data.alpaca.markets"
+      ALPACA_BASE_URL: "${ALPACA_BASE_URL}"
+      ALPACA_DATA_URL: "${ALPACA_DATA_URL}"
+      TRADING_MODE: "${TRADING_MODE:-paper}"
 
-      # --- EOD config ---
-      EOD_FLATTEN_ENABLE: "1"
-      EOD_FLATTEN_MIN_BEFORE_CLOSE: "5"
+      PYTHONPATH: /app
+    volumes:
+      - .:/app
+    command: >
+      sh -lc "
+        echo 'oco_exit_monitor starting...';
+        python -u services/oco_exit_monitor.py
+      "
 
-      # nie je nutné, ale nevadí keď zdielame DB_URL
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-
-    command: sh -lc "python -m jobs.close_positions_eod"
-    restart: always
 volumes:
   pgdata:
