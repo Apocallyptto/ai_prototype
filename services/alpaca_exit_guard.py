@@ -197,3 +197,139 @@ def wait_exit_orders_cleared(tc, symbol: str, timeout_sec: int = 15, poll_sec: f
             return True
         time.sleep(float(poll_sec))
     return False
+
+
+
+
+### COMPAT_SIGNAL_EXECUTOR_V2 ###
+
+# ---------------------------------------------------------------------
+# Compat layer for services/signal_executor.py (SAFE implementation)
+# ---------------------------------------------------------------------
+import os, time
+from typing import Optional
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus, OrderSide
+
+def _side_norm(x) -> str:
+    s = str(x).upper()
+    return s.split(".")[-1]
+
+def _exit_prefix(symbol: str) -> str:
+    return f"EXIT-OCO-{symbol.upper()}-"
+
+def get_position_qty(tc: TradingClient, symbol: str) -> float:
+    sym = symbol.upper()
+    try:
+        p = tc.get_open_position(sym)
+        qty = float(getattr(p, "qty", 0) or 0)
+        side = _side_norm(getattr(p, "side", ""))
+        return -qty if ("SHORT" in side and qty > 0) else qty
+    except Exception:
+        try:
+            for p in tc.get_all_positions():
+                if str(getattr(p, "symbol", "")).upper() == sym:
+                    qty = float(getattr(p, "qty", 0) or 0)
+                    side = _side_norm(getattr(p, "side", ""))
+                    return -qty if ("SHORT" in side and qty > 0) else qty
+        except Exception:
+            pass
+    return 0.0
+
+def _list_open_orders(tc: TradingClient, symbol: str):
+    sym = symbol.upper()
+    try:
+        # niektor? verzie maj? nested=...
+        return tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[sym], nested=True, limit=500))
+    except TypeError:
+        return tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[sym], limit=500))
+
+def has_exit_orders(tc: TradingClient, symbol: str) -> bool:
+    pref = _exit_prefix(symbol)
+    for o in _list_open_orders(tc, symbol):
+        cid = (getattr(o, "client_order_id", "") or "")
+        if cid.startswith(pref):
+            return True
+    return False
+
+def cancel_exit_orders(tc: TradingClient, symbol: str, side_to_cancel: Optional[OrderSide] = None, min_age_sec: int = 0) -> int:
+    pref = _exit_prefix(symbol)
+    now = time.time()
+    canceled = 0
+
+    for o in _list_open_orders(tc, symbol):
+        cid = (getattr(o, "client_order_id", "") or "")
+        if not cid.startswith(pref):
+            continue
+
+        if side_to_cancel is not None:
+            if _side_norm(getattr(o, "side", "")) != _side_norm(side_to_cancel):
+                continue
+
+        if min_age_sec:
+            created_at = getattr(o, "created_at", None)
+            if created_at is not None:
+                try:
+                    if (now - created_at.timestamp()) < float(min_age_sec):
+                        continue
+                except Exception:
+                    pass
+
+        try:
+            tc.cancel_order_by_id(o.id)
+            canceled += 1
+        except Exception:
+            pass
+
+    return canceled
+
+def wait_exit_orders_cleared(
+    tc,
+    symbol: str,
+    timeout_sec: int = 15,
+    poll_sec: float = 0.5,
+    cancel_first: bool = True,
+    timeout_s: float | None = None,
+    poll_s: float | None = None,
+    **_
+) -> bool:
+    if timeout_s is not None:
+        timeout_sec = timeout_s
+    if poll_s is not None:
+        poll_sec = poll_s
+
+    if cancel_first:
+        cancel_exit_orders(tc, symbol)
+
+    deadline = time.time() + float(timeout_sec)
+    while time.time() < deadline:
+        if not has_exit_orders(tc, symbol):
+            return True
+        time.sleep(float(poll_sec))
+    return False
+
+def cancel_related_orders_from_exception(tc: TradingClient, exc: Exception, symbol: str | None = None) -> int:
+    msg_u = str(exc).upper()
+    # vyber symbol: explicit -> z message -> env SYMBOLS
+    if symbol:
+        symbols = [symbol.upper()]
+    else:
+        env_syms = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
+        hit = [s for s in env_syms if s in msg_u]
+        symbols = [hit[0]] if hit else env_syms
+
+    canceled = 0
+    for sym in symbols:
+        try:
+            for o in _list_open_orders(tc, sym):
+                try:
+                    tc.cancel_order_by_id(o.id)
+                    canceled += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return canceled
