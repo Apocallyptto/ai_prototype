@@ -84,7 +84,7 @@ def fetch_new_signals():
         FROM signals
         WHERE created_at > now() - interval '30 minutes'
           AND strength >= :min_strength
-          AND portfolio_id = :pid
+          AND portfolio_id = (:pid)::int
           AND symbol = ANY(:symbols)
         ORDER BY created_at ASC
         """
