@@ -32,7 +32,7 @@ services:
       # --- DB (lokálny postgres kontajner) ---
       DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
 
-      ALLOW_SHORT: "1"
+      ALLOW_SHORT: "${ALLOW_SHORT:-0}"
 
       # --- ML / signály ---
       SYMBOLS: "AAPL,MSFT,SPY"
