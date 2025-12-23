@@ -3,18 +3,18 @@ services:
     image: postgres:16
     container_name: trader_postgres
     environment:
-      POSTGRES_DB: trader
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${POSTGRES_DB:-trader}"
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
-      timeout: 3s
-      retries: 30
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
   signal_maker:
@@ -28,8 +28,10 @@ services:
     env_file:
       - .env
     environment:
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-      PYTHONPATH: "/app"
+      DB_URL: "${DB_URL}"
+      # signal maker chce mať vlastné hodnoty:
+      MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.20}"
+      CRON_SLEEP_SECONDS: "${MAKER_SLEEP_SECONDS:-180}"
     volumes:
       - .:/app
     command: >
@@ -37,9 +39,9 @@ services:
         echo 'signal_maker starting...';
         while true; do
           echo '--- running jobs.make_signals_ml ---';
-          MIN_STRENGTH=${MAKER_MIN_STRENGTH:-0.20} SYMBOLS=${SYMBOLS} PORTFOLIO_ID=${PORTFOLIO_ID:-1} python -m jobs.make_signals_ml || echo 'make_signals_ml failed';
-          echo 'sleeping for ${MAKER_CRON_SLEEP_SECONDS:-180} seconds...';
-          sleep ${MAKER_CRON_SLEEP_SECONDS:-180};
+          python -m jobs.make_signals_ml || echo 'make_signals_ml failed';
+          echo 'sleeping for ${MAKER_SLEEP_SECONDS:-180} seconds...';
+          sleep ${MAKER_SLEEP_SECONDS:-180};
         done
       "
     restart: unless-stopped
@@ -55,14 +57,22 @@ services:
     env_file:
       - .env
     environment:
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-      PYTHONPATH: "/app"
+      DB_URL: "${DB_URL}"
+      # executor chce mať vlastné hodnoty:
+      MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
+      CRON_SLEEP_SECONDS: "${EXEC_POLL_SECONDS:-20}"
+
+      # ✅ SHORTY SA NASTAVUJÚ TU (v signal_executor):
+      ALLOW_SHORT: "${ALLOW_SHORT:-0}"
+      LONG_ONLY: "${LONG_ONLY:-0}"
+
+      # (nech vidíš aj tieto v env, keď debugguješ)
+      EXEC_MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
+      EXEC_POLL_SECONDS: "${EXEC_POLL_SECONDS:-20}"
     volumes:
       - .:/app
     command: >
-      sh -lc "
-        MIN_STRENGTH=${EXEC_MIN_STRENGTH:-0.60} CRON_SLEEP_SECONDS=${EXEC_POLL_SECONDS:-20} python -m services.signal_executor
-      "
+      sh -lc "python -m services.signal_executor"
     restart: unless-stopped
 
   sync_orders:
@@ -76,11 +86,11 @@ services:
     env_file:
       - .env
     environment:
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-      PYTHONPATH: "/app"
+      DB_URL: "${DB_URL}"
     volumes:
       - .:/app
-    command: sh -lc "python -u tools.sync_orders"
+    command: >
+      sh -lc "python -u tools.sync_orders"
     restart: unless-stopped
 
   pnl_recorder:
@@ -94,11 +104,11 @@ services:
     env_file:
       - .env
     environment:
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-      PYTHONPATH: "/app"
+      DB_URL: "${DB_URL}"
     volumes:
       - .:/app
-    command: sh -lc "python -m services.pnl_recorder"
+    command: >
+      sh -lc "python -m services.pnl_recorder"
     restart: unless-stopped
 
   oco_exit_monitor:
@@ -112,12 +122,12 @@ services:
     env_file:
       - .env
     environment:
-      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
-      PYTHONPATH: "/app"
+      DB_URL: "${DB_URL}"
     volumes:
       - .:/app
-    command: sh -lc "python -u services.oco_exit_monitor"
+    command: >
+      sh -lc "python -u tools.oco_exit_monitor"
     restart: unless-stopped
 
 volumes:
-  pgdata:
+  postgres_data:
