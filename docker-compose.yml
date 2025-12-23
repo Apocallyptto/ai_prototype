@@ -1,21 +1,36 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:16
     container_name: trader_postgres
     environment:
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
-      POSTGRES_DB: "${POSTGRES_DB:-trader}"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trader
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
       interval: 5s
       timeout: 5s
-      retries: 20
-    restart: unless-stopped
+      retries: 25
+
+  # Runs init SQL on every compose up (idempotent).
+  db_init:
+    image: postgres:16
+    container_name: trader_db_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./db/init.sql:/schema/init.sql:ro
+    command: bash -lc "psql -h postgres -U postgres -d trader -v ON_ERROR_STOP=1 -f /schema/init.sql"
+    restart: "no"
 
   signal_maker:
     build:
@@ -25,26 +40,32 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    env_file:
-      - .env
+      db_init:
+        condition: service_completed_successfully
     environment:
-      DB_URL: "${DB_URL}"
-      # signal maker chce mať vlastné hodnoty:
+      # --- Alpaca ---
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+
+      # --- DB ---
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+
+      # --- Maker config ---
+      SYMBOLS: "${SYMBOLS:-AAPL,MSFT,SPY}"
+      PORTFOLIO_ID: "${PORTFOLIO_ID:-1}"
       MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.20}"
-      CRON_SLEEP_SECONDS: "${MAKER_SLEEP_SECONDS:-180}"
-    volumes:
-      - .:/app
+      MAKER_MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.20}"
+      CRON_SLEEP_SECONDS: "${CRON_SLEEP_SECONDS:-180}"
+
     command: >
-      sh -lc "
-        echo 'signal_maker starting...';
-        while true; do
-          echo '--- running jobs.make_signals_ml ---';
-          python -m jobs.make_signals_ml || echo 'make_signals_ml failed';
-          echo 'sleeping for ${MAKER_SLEEP_SECONDS:-180} seconds...';
-          sleep ${MAKER_SLEEP_SECONDS:-180};
-        done
-      "
-    restart: unless-stopped
+      sh -lc "while true; do
+        echo '[signal_maker] tick';
+        python -m jobs.make_signals_ml;
+        sleep ${CRON_SLEEP_SECONDS:-180};
+      done"
+    restart: always
 
   signal_executor:
     build:
@@ -54,26 +75,47 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    env_file:
-      - .env
+      db_init:
+        condition: service_completed_successfully
     environment:
-      DB_URL: "${DB_URL}"
-      # executor chce mať vlastné hodnoty:
+      # --- Alpaca ---
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+
+      # --- DB ---
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+
+      # --- Executor config ---
+      SYMBOLS: "${SYMBOLS:-AAPL,MSFT,SPY}"
+      PORTFOLIO_ID: "${PORTFOLIO_ID:-1}"
       MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
+      EXEC_MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
       CRON_SLEEP_SECONDS: "${EXEC_POLL_SECONDS:-20}"
 
-      # ✅ SHORTY SA NASTAVUJÚ TU (v signal_executor):
+      # --- Trading switches ---
       ALLOW_SHORT: "${ALLOW_SHORT:-0}"
-      LONG_ONLY: "${LONG_ONLY:-0}"
+      LONG_ONLY: "${LONG_ONLY:-1}"
+      CLOSE_WITH_MARKET: "${CLOSE_WITH_MARKET:-1}"
 
-      # (nech vidíš aj tieto v env, keď debugguješ)
-      EXEC_MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
-      EXEC_POLL_SECONDS: "${EXEC_POLL_SECONDS:-20}"
-    volumes:
-      - .:/app
-    command: >
-      sh -lc "python -m services.signal_executor"
-    restart: unless-stopped
+      # --- Sizing / risk ---
+      ATR_PCT: "${ATR_PCT:-0.01}"
+      SL_ATR_MULT: "${SL_ATR_MULT:-1.0}"
+      TP_ATR_MULT: "${TP_ATR_MULT:-1.0}"
+      MAX_RISK_PER_TRADE_USD: "${MAX_RISK_PER_TRADE_USD:-30}"
+      MAX_BP_PCT_PER_TRADE: "${MAX_BP_PCT_PER_TRADE:-0.05}"
+      MAX_NOTIONAL_PER_TRADE_USD: "${MAX_NOTIONAL_PER_TRADE_USD:-1200}"
+      MAX_QTY_PER_TRADE: "${MAX_QTY_PER_TRADE:-5}"
+      INSUFFICIENT_COOLDOWN_SECONDS: "${INSUFFICIENT_COOLDOWN_SECONDS:-900}"
+
+      # --- Daily guard ---
+      ENABLE_DAILY_RISK_GUARD: "${ENABLE_DAILY_RISK_GUARD:-0}"
+      MAX_DAILY_LOSS_USD: "${MAX_DAILY_LOSS_USD:-200}"
+      MAX_DRAWDOWN_PCT: "${MAX_DRAWDOWN_PCT:-2.0}"
+
+    command: sh -lc "python -m services.signal_executor"
+    restart: always
 
   sync_orders:
     build:
@@ -83,33 +125,16 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    env_file:
-      - .env
+      db_init:
+        condition: service_completed_successfully
     environment:
-      DB_URL: "${DB_URL}"
-    volumes:
-      - .:/app
-    command: >
-      sh -lc "python -u tools.sync_orders"
-    restart: unless-stopped
-
-  pnl_recorder:
-    build:
-      context: .
-    image: ai_prototype-pnl_recorder
-    container_name: trader_pnl_recorder
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      DB_URL: "${DB_URL}"
-    volumes:
-      - .:/app
-    command: >
-      sh -lc "python -m services.pnl_recorder"
-    restart: unless-stopped
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+    command: sh -lc "python -u tools/sync_orders.py"
+    restart: always
 
   oco_exit_monitor:
     build:
@@ -119,15 +144,56 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    env_file:
-      - .env
+      db_init:
+        condition: service_completed_successfully
     environment:
-      DB_URL: "${DB_URL}"
-    volumes:
-      - .:/app
-    command: >
-      sh -lc "python -u tools.oco_exit_monitor"
-    restart: unless-stopped
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+    command: sh -lc "python -m services.oco_exit_monitor"
+    restart: always
+
+  pnl_recorder:
+    build:
+      context: .
+    image: ai_prototype-pnl_recorder
+    container_name: trader_pnl_recorder
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db_init:
+        condition: service_completed_successfully
+    environment:
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+    command: sh -lc "python -m services.record_pnl"
+    restart: always
+
+  eod_closer:
+    build:
+      context: .
+    image: ai_prototype-eod_closer
+    container_name: trader_eod_closer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db_init:
+        condition: service_completed_successfully
+    environment:
+      ALPACA_API_KEY: "${ALPACA_API_KEY}"
+      ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_URL: "https://data.alpaca.markets"
+      EOD_FLATTEN_ENABLE: "1"
+      EOD_FLATTEN_MIN_BEFORE_CLOSE: "5"
+      DB_URL: "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+    command: sh -lc "python -m jobs.close_positions_eod"
+    restart: always
 
 volumes:
-  postgres_data:
+  pgdata:
