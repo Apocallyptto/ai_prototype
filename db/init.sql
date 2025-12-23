@@ -1,7 +1,4 @@
--- db/init.sql
--- Minimal schema needed for ai_prototype (at least signals table).
--- Safe to run repeatedly.
-
+﻿-- db/init.sql
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS signals (
