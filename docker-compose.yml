@@ -44,21 +44,15 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.20}"
-      CRON_SLEEP_SECONDS: "${MAKER_SLEEP_SECONDS:-180}"
-    volumes:
-      - .:/app
     command: >
-      sh -lc "
-        echo 'signal_maker starting...';
-        while true; do
-          echo '--- running jobs.make_signals_ml ---';
-          python -m jobs.make_signals_ml || echo 'make_signals_ml failed';
-          echo 'sleeping for '${CRON_SLEEP_SECONDS:-180}' seconds...';
-          sleep ${CRON_SLEEP_SECONDS:-180};
-        done
-      "
+      sh -lc "echo 'signal_maker starting...';
+      while true; do
+        python -m jobs.make_signals_ml || echo 'make_signals_ml failed';
+        sleep ${MAKER_SLEEP_SECONDS:-180};
+      done"
     restart: always
 
   signal_executor:
@@ -73,12 +67,10 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
-      POLL_SECONDS: "${EXEC_POLL_SECONDS:-20}"
-      CLOSE_WITH_MARKET: "${CLOSE_WITH_MARKET:-1}"
-    volumes:
-      - .:/app
+      CRON_SLEEP_SECONDS: "${EXEC_POLL_SECONDS:-20}"
     command: sh -lc "python -m services.signal_executor"
     restart: always
 
@@ -94,9 +86,8 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
-    volumes:
-      - .:/app
     command: sh -lc "python -u tools/sync_orders.py"
     restart: always
 
@@ -112,10 +103,9 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
-    volumes:
-      - .:/app
-    command: sh -lc "python -u services/oco_exit_monitor.py"
+    command: sh -lc "python -m services.oco_exit_monitor"
     restart: always
 
   pnl_recorder:
@@ -130,31 +120,9 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
+      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
-      PNL_POLL_SECONDS: "300"
-    volumes:
-      - .:/app
     command: sh -lc "python -m services.record_pnl"
-    restart: always
-
-  eod_closer:
-    build:
-      context: .
-    image: ai_prototype-eod_closer
-    container_name: trader_eod_closer
-    depends_on:
-      postgres:
-        condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
-    env_file: .env
-    environment:
-      PYTHONPATH: "/app"
-      EOD_FLATTEN_ENABLE: "1"
-      EOD_FLATTEN_MIN_BEFORE_CLOSE: "5"
-    volumes:
-      - .:/app
-    command: sh -lc "python -m jobs.close_positions_eod"
     restart: always
 
 volumes:
