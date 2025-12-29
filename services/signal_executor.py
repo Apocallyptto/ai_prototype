@@ -1,470 +1,436 @@
 ﻿import os
 import time
+import json
+import math
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from sqlalchemy import create_engine, text
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from alpaca.common.exceptions import APIError
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
 
-from sqlalchemy import text
 
-from utils import get_engine, compute_atr
-from services.alpaca_exit_guard import (
-    cancel_exit_orders,
-    wait_exit_orders_cleared,
-    get_position_qty,
-    cancel_related_orders_from_exception,
-)
-
+# ---------------- Logging ----------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("signal_executor")
-logging.basicConfig(level=logging.INFO)
 
 
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.6"))
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-PORTFOLIO_ID = int(os.getenv("PORTFOLIO_ID", "1"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
-
-ATR_PCT = float(os.getenv("ATR_PCT", "0.01"))  # 1%
-DEFAULT_ENTRY_PRICE = float(os.getenv("DEFAULT_ENTRY_PRICE", "100.00"))
-
-RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.01"))  # 1% of equity
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.10"))      # 10% of equity per symbol
-
-ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").strip().lower() in ("1", "true", "yes", "y")
-CLOSE_WITH_MARKET = os.getenv("CLOSE_WITH_MARKET", "true").strip().lower() in ("1", "true", "yes", "y")
-EXIT_CLEAR_RETRIES = int(os.getenv("EXIT_CLEAR_RETRIES", "8"))
-EXIT_CLEAR_SLEEP_S = float(os.getenv("EXIT_CLEAR_SLEEP_S", "0.4"))
-EXIT_CLEAR_WAIT_S = float(os.getenv("EXIT_CLEAR_WAIT_S", "2.0"))
-
-EXIT_OCO_PREFIX = os.getenv("EXIT_OCO_PREFIX", "EXIT-OCO").strip() or "EXIT-OCO"
-
-ENABLE_DAILY_RISK_GUARD = os.getenv("ENABLE_DAILY_RISK_GUARD", "false").strip().lower() in ("1", "true", "yes", "y")
-MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "200"))
-MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "2.0"))  # e.g. 2%
+# ---------------- Helpers ----------------
+def env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return v if v is not None and v != "" else default
 
 
-# ---------------------------------------------------------
-# STATE
-# ---------------------------------------------------------
-PROCESSED_SIGNAL_IDS = set()
-INSUFFICIENT_COOLDOWN = {}  # (symbol, side)-> epoch seconds
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(env_str(name, str(default)))
+    except Exception:
+        return default
 
 
-# ---------------------------------------------------------
-# ALPACA + DB
-# ---------------------------------------------------------
-trading_client = TradingClient(
-    api_key=os.getenv("ALPACA_API_KEY"),
-    secret_key=os.getenv("ALPACA_API_SECRET"),
-    paper=(os.getenv("TRADING_MODE", "paper") == "paper"),
-)
-
-engine = get_engine()
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(env_str(name, str(default)))
+    except Exception:
+        return default
 
 
-# ---------------------------------------------------------
-# DB â€“ SIGNALS
-# ---------------------------------------------------------
-def fetch_new_signals():
-    sql = text(
-        """
-        SELECT
-            id,
-            created_at,
-            symbol,
-            side,
-            strength,
-            source,
-            portfolio_id
+def env_bool(name: str, default: bool = False) -> bool:
+    v = env_str(name, "")
+    if v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_symbols(s: str) -> List[str]:
+    return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
+
+
+@dataclass
+class PositionInfo:
+    side: str   # "LONG" / "SHORT"
+    qty: float  # absolute qty (positive)
+
+
+@dataclass
+class SignalRow:
+    id: int
+    created_at: str
+    symbol: str
+    side: str    # "BUY"/"SELL"
+    strength: float
+    source: str
+    portfolio_id: int
+
+
+# ---------------- Alpaca market data (simple REST) ----------------
+def alpaca_headers(api_key: str, api_secret: str) -> Dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": api_key,
+        "APCA-API-SECRET-KEY": api_secret,
+    }
+
+
+def get_latest_price(data_url: str, api_key: str, api_secret: str, symbol: str, timeout: float = 8.0) -> Optional[float]:
+    # Try latest trade
+    trade_url = f"{data_url.rstrip('/')}/v2/stocks/{symbol}/trades/latest"
+    try:
+        r = requests.get(trade_url, headers=alpaca_headers(api_key, api_secret), timeout=timeout)
+        if r.status_code == 200:
+            j = r.json()
+            trade = j.get("trade") or {}
+            p = trade.get("p") or trade.get("price")
+            if p is not None:
+                return float(p)
+    except Exception:
+        pass
+
+    # Fallback: latest quote (mid)
+    quote_url = f"{data_url.rstrip('/')}/v2/stocks/{symbol}/quotes/latest"
+    try:
+        r = requests.get(quote_url, headers=alpaca_headers(api_key, api_secret), timeout=timeout)
+        if r.status_code == 200:
+            j = r.json()
+            q = j.get("quote") or {}
+            ap = q.get("ap") or q.get("ask_price")
+            bp = q.get("bp") or q.get("bid_price")
+            if ap is not None and bp is not None:
+                return (float(ap) + float(bp)) / 2.0
+            if ap is not None:
+                return float(ap)
+            if bp is not None:
+                return float(bp)
+    except Exception:
+        pass
+
+    return None
+
+
+# ---------------- DB helpers ----------------
+def db_engine(db_url: str):
+    return create_engine(db_url, pool_pre_ping=True, future=True)
+
+
+def fetch_unprocessed_signals(engine, symbols: List[str], portfolio_id: int, min_strength: float, lookback_minutes: int = 30) -> List[SignalRow]:
+    sql = text("""
+        SELECT id, created_at, symbol, side, strength, source, portfolio_id
         FROM signals
-        WHERE created_at > now() - interval '30 minutes'
+        WHERE processed_at IS NULL
+          AND created_at > now() - (:lookback_minutes || ' minutes')::interval
           AND strength >= :min_strength
           AND portfolio_id = (:pid)::int
           AND symbol = ANY(:symbols)
         ORDER BY created_at ASC
-        """
-    )
+    """)
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {
+            "symbols": symbols,
+            "pid": int(portfolio_id),
+            "min_strength": float(min_strength),
+            "lookback_minutes": int(lookback_minutes),
+        }).mappings().all()
 
-    with engine.begin() as c:
-        rows = c.execute(
-            sql,
-            {"min_strength": MIN_STRENGTH, "pid": PORTFOLIO_ID, "symbols": SYMBOLS},
-        ).mappings().all()
+    out: List[SignalRow] = []
+    for r in rows:
+        out.append(SignalRow(
+            id=int(r["id"]),
+            created_at=str(r["created_at"]),
+            symbol=str(r["symbol"]).upper(),
+            side=str(r["side"]).upper(),
+            strength=float(r["strength"]),
+            source=str(r.get("source") or "unknown"),
+            portfolio_id=int(r.get("portfolio_id") or portfolio_id),
+        ))
+    return out
 
-    logger.info("fetch_new_signals | fetched %d rows", len(rows))
-    return [dict(r) for r in rows]
+
+def mark_signal(engine, signal_id: int, status: str, note: str = "", alpaca_order_id: Optional[str] = None) -> None:
+    sql = text("""
+        UPDATE signals
+        SET processed_at = now(),
+            processed_status = :status,
+            processed_note = :note,
+            alpaca_order_id = COALESCE(:alpaca_order_id, alpaca_order_id)
+        WHERE id = :id
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql, {
+            "id": int(signal_id),
+            "status": status,
+            "note": note[:4000],
+            "alpaca_order_id": alpaca_order_id,
+        })
 
 
-def select_signals(signals):
-    selected = []
-    seen_symbol_side = set()
-
-    for sig in signals:
-        sid = sig["id"]
-        if sid in PROCESSED_SIGNAL_IDS:
+# ---------------- Trading guards ----------------
+def get_positions_map(tc: TradingClient) -> Dict[str, PositionInfo]:
+    pos_map: Dict[str, PositionInfo] = {}
+    for p in tc.get_all_positions():
+        sym = str(getattr(p, "symbol", "")).upper()
+        side = str(getattr(p, "side", "")).upper()  # PositionSide.LONG/SHORT -> string contains LONG/SHORT
+        qty_raw = float(getattr(p, "qty", 0) or 0)
+        if qty_raw == 0 or sym == "":
             continue
-
-        sym = str(sig["symbol"]).upper()
-        side = str(sig["side"]).lower()
-
-        key = (sym, side)
-        if key in seen_symbol_side:
-            continue
-
-        seen_symbol_side.add(key)
-        selected.append(sig)
-
-    logger.info(
-        "select_signals | fetched=%d | new=%d | unique_symbol_side=%d",
-        len(signals),
-        len(selected),
-        len(seen_symbol_side),
-    )
-    if len(PROCESSED_SIGNAL_IDS) > 10000:
-        logger.info("select_signals | clearing PROCESSED_SIGNAL_IDS (size>10000)")
-        PROCESSED_SIGNAL_IDS.clear()
-    return selected
-
-
-def mark_signal_processed(sig: dict):
-    PROCESSED_SIGNAL_IDS.add(sig["id"])
-
-
-# ---------------------------------------------------------
-# HELPERS â€“ ACCOUNT & ORDERS
-# ---------------------------------------------------------
-def _is_exit_oco_order(order) -> bool:
-    cid = getattr(order, "client_order_id", None) or ""
-    sym = getattr(order, "symbol", None)
-    if not sym:
-        return False
-    return cid.startswith(f"{EXIT_OCO_PREFIX}-{str(sym).upper()}-")
-
-
-def get_buying_power() -> float:
-    a = trading_client.get_account()
-    return float(a.buying_power)
-
-
-def get_equity() -> float:
-    a = trading_client.get_account()
-    return float(a.equity)
-
-
-def get_open_orders_for_symbol(symbol: str, include_exit_oco: bool = True):
-    from alpaca.trading.requests import GetOrdersRequest
-
-    r = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol.upper()], limit=500)
-    orders = list(trading_client.get_orders(r))
-    if include_exit_oco:
-        return orders
-    return [o for o in orders if not _is_exit_oco_order(o)]
-
-
-def cleanup_and_check(symbol: str, desired_side: str) -> bool:
-    desired_side = desired_side.lower()
-    orders = get_open_orders_for_symbol(symbol, include_exit_oco=False)
-
-    same_side = []
-    opp_side = []
-    for o in orders:
-        o_side = str(o.side).lower()
-        if o_side == desired_side:
-            same_side.append(o)
+        if "SHORT" in side:
+            pos_map[sym] = PositionInfo(side="SHORT", qty=abs(qty_raw))
         else:
-            opp_side.append(o)
-
-    if same_side:
-        o = same_side[0]
-        lp = getattr(o, "limit_price", None)
-        logger.info(
-            "Skip %s %s: open %s order %s already exists%s",
-            symbol,
-            desired_side.upper(),
-            desired_side.upper(),
-            str(o.id),
-            f" at {lp}" if lp else "",
-        )
-        return False
-
-    canceled = 0
-    for o in opp_side:
-        try:
-            trading_client.cancel_order_by_id(str(o.id))
-            canceled += 1
-        except Exception as e:
-            logger.warning("Failed cancel opposite order %s: %s", o.id, e)
-
-    if canceled:
-        logger.info("Canceled %d opposite open order(s) for %s before new %s", canceled, symbol, desired_side.upper())
-
-    return True
+            pos_map[sym] = PositionInfo(side="LONG", qty=abs(qty_raw))
+    return pos_map
 
 
-def compute_order_qty(symbol: str, side: str, entry_price: float, atr_val: float) -> int:
-    eq = get_equity()
-    bp = get_buying_power()
-
-    stop_dist = float(atr_val or 0.0)
-    if stop_dist <= 0:
-        stop_dist = entry_price * ATR_PCT
-
-    risk_dollars = eq * RISK_PCT_PER_TRADE
-    qty_risk = int(risk_dollars / stop_dist) if stop_dist > 0 else 0
-
-    max_notional = eq * MAX_POSITION_PCT
-    qty_cap = int(max_notional / entry_price) if entry_price > 0 else 0
-
-    qty = max(0, min(qty_risk, qty_cap))
-
-    if side.lower() == "buy":
-        qty_bp = int(bp / entry_price) if entry_price > 0 else 0
-        qty = min(qty, qty_bp)
-
-    return int(qty)
-
-
-# ---------------------------------------------------------
-# DAILY RISK GUARD (optional)
-# ---------------------------------------------------------
-def check_daily_risk_guard() -> bool:
-    if not ENABLE_DAILY_RISK_GUARD:
-        return True
-
+def get_open_orders_map(tc: TradingClient) -> Dict[str, List[object]]:
     try:
-        with engine.begin() as c:
-            row = c.execute(
-                text(
-                    """
-                    SELECT pnl_usd, drawdown_pct
-                    FROM daily_pnl
-                    WHERE day = CURRENT_DATE
-                    LIMIT 1
-                    """
-                )
-            ).mappings().first()
-    except Exception as e:
-        logger.warning("Daily risk guard: could not query daily_pnl (%s). Guard disabled.", e)
-        return True
+        orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True))
+    except TypeError:
+        orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
 
-    if not row:
-        return True
-
-    pnl = float(row.get("pnl_usd") or 0.0)
-    dd = float(row.get("drawdown_pct") or 0.0)
-
-    if pnl <= -abs(MAX_DAILY_LOSS_USD):
-        logger.warning("Daily risk guard HIT: pnl_usd=%.2f <= -%.2f", pnl, abs(MAX_DAILY_LOSS_USD))
-        return False
-    if dd >= abs(MAX_DRAWDOWN_PCT):
-        logger.warning("Daily risk guard HIT: drawdown_pct=%.2f >= %.2f", dd, abs(MAX_DRAWDOWN_PCT))
-        return False
-
-    return True
+    m: Dict[str, List[object]] = {}
+    for o in orders or []:
+        sym = str(getattr(o, "symbol", "")).upper()
+        if sym == "":
+            continue
+        m.setdefault(sym, []).append(o)
+    return m
 
 
-# ---------------------------------------------------------
-# EXIT CLEARANCE + ORDER SUBMISSION
-# ---------------------------------------------------------
-def _side_to_cancel_for_close(order_side: OrderSide) -> OrderSide:
-    return OrderSide.SELL if order_side == OrderSide.SELL else OrderSide.BUY
+def compute_qty(
+    price: float,
+    buying_power: float,
+    atr_pct: float,
+    sl_atr_mult: float,
+    max_risk_usd: float,
+    max_bp_pct: float,
+    max_notional_usd: float,
+    max_qty: int
+) -> int:
+    if price <= 0:
+        return 0
+
+    # Risk-based qty using ATR_PCT proxy: stop_distance = price * atr_pct * sl_mult
+    stop_distance = max(price * max(atr_pct, 0.0001) * max(sl_atr_mult, 0.1), 0.01)
+    qty_risk = math.floor(max_risk_usd / stop_distance) if max_risk_usd > 0 else 10**9
+
+    qty_bp = math.floor((buying_power * max_bp_pct) / price) if max_bp_pct > 0 else 10**9
+    qty_notional = math.floor(max_notional_usd / price) if max_notional_usd > 0 else 10**9
+    qty_cap = max_qty if max_qty > 0 else 10**9
+
+    qty = int(max(0, min(qty_risk, qty_bp, qty_notional, qty_cap)))
+    return qty
 
 
-def submit_close_order(symbol: str, order_side: OrderSide, qty: int, last_price: float):
-    if qty <= 0:
-        logger.info("submit_close_order: qty<=0 for %s, skipping", symbol)
-        return None
-
-    side_to_cancel = _side_to_cancel_for_close(order_side)
-
-    for attempt in range(1, EXIT_CLEAR_RETRIES + 1):
-        try:
-            canceled = cancel_exit_orders(trading_client, symbol, side_to_cancel=side_to_cancel)
-            if canceled:
-                logger.info("Canceled %d EXIT-OCO order(s) for %s before CLOSE %s (attempt %d/%d)",
-                            canceled, symbol, order_side.name, attempt, EXIT_CLEAR_RETRIES)
-
-            wait_exit_orders_cleared(trading_client, symbol, timeout_s=EXIT_CLEAR_WAIT_S, poll_s=0.25)
-
-            if CLOSE_WITH_MARKET:
-                req = MarketOrderRequest(
-                    symbol=symbol.upper(),
-                    qty=qty,
-                    side=order_side,
-                    time_in_force=TimeInForce.DAY,
-                )
-            else:
-                if order_side == OrderSide.SELL:
-                    limit_price = round(last_price * (1 - ATR_PCT), 2)
-                else:
-                    limit_price = round(last_price * (1 + ATR_PCT), 2)
-
-                req = LimitOrderRequest(
-                    symbol=symbol.upper(),
-                    qty=qty,
-                    side=order_side,
-                    limit_price=limit_price,
-                    time_in_force=TimeInForce.DAY,
-                )
-
-            o = trading_client.submit_order(req)
-            logger.info("CLOSE submitted: %s %s qty=%s | id=%s status=%s",
-                        symbol, order_side.name, qty, str(o.id), str(o.status))
-            return o
-
-        except APIError as e:
-            msg = str(e)
-            if ("held_for_orders" in msg) or ("insufficient qty" in msg) or ("40310000" in msg):
-                rel = cancel_related_orders_from_exception(trading_client, e)
-                if rel:
-                    logger.info("Canceled %d related order(s) from error for %s", rel, symbol)
-                logger.warning("Close submit blocked by held qty (attempt %d/%d) for %s: %s",
-                               attempt, EXIT_CLEAR_RETRIES, symbol, msg)
-                time.sleep(EXIT_CLEAR_SLEEP_S)
-                continue
-            raise
-        except Exception as e:
-            logger.warning("Close submit attempt %d/%d failed for %s: %s", attempt, EXIT_CLEAR_RETRIES, symbol, e)
-            time.sleep(EXIT_CLEAR_SLEEP_S)
-
-    logger.error("Failed to submit CLOSE order for %s after %d attempts", symbol, EXIT_CLEAR_RETRIES)
-    return None
+def is_insufficient_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return ("40310000" in s) or ("insufficient" in s) or ("buying power" in s) or ("insufficient qty" in s)
 
 
-# ---------------------------------------------------------
-# MAIN EXECUTION â€“ PER SIGNAL
-# ---------------------------------------------------------
-def create_order_from_signal(symbol: str, side: str, strength: float, source: str, signal_id: int):
-    side = side.lower()
-    symbol = symbol.upper()
-
-    key = (symbol, side)
-    now_ts = time.time()
-    until = INSUFFICIENT_COOLDOWN.get(key)
-    if until is not None and now_ts < until:
-        logger.info("Skip %s %s: still in insufficient cooldown until %s",
-                    symbol, side.upper(), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)))
-        return
-
-    pos_qty = get_position_qty(trading_client, symbol)
-
-    atr_val, last_price = compute_atr(symbol)
-    if last_price is None:
-        last_price = DEFAULT_ENTRY_PRICE
-
-    if not ALLOW_SHORT:
-        if side == "sell":
-            if pos_qty > 0:
-                close_qty = int(abs(round(pos_qty)))
-                logger.info("CLOSE intent: %s SELL to close long qty=%s (shorting disabled)", symbol, close_qty)
-                submit_close_order(symbol, OrderSide.SELL, close_qty, float(last_price))
-            else:
-                logger.info("Skip %s SELL: no long position and shorting disabled", symbol)
-            return
-
-        if side == "buy" and pos_qty < 0:
-            close_qty = int(abs(round(pos_qty)))
-            logger.info("CLOSE intent: %s BUY to close short qty=%s (shorting disabled)", symbol, close_qty)
-            submit_close_order(symbol, OrderSide.BUY, close_qty, float(last_price))
-            return
-
-    if not cleanup_and_check(symbol, side):
-        return
-
-    if side == "buy":
-        entry_price = float(last_price) * (1 + ATR_PCT)
-    else:
-        entry_price = float(last_price) * (1 - ATR_PCT)
-    entry_price = round(entry_price, 2)
-
-    qty = compute_order_qty(symbol, side, entry_price, float(atr_val or 0.0))
-    if qty < 1:
-        logger.info("Skip %s %s: computed qty < 1, no trade", symbol, side.upper())
-        return
-
-    req = LimitOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide(side),
-        limit_price=entry_price,
-        time_in_force=TimeInForce.DAY,
-    )
-
-    try:
-        o = trading_client.submit_order(req)
-        logger.info("ENTRY submitted: %s %s qty=%s @%.2f | id=%s status=%s | signal_id=%s",
-                    symbol, side.upper(), qty, entry_price, str(o.id), str(o.status), signal_id)
-
-    except APIError as e:
-        msg = str(e)
-        if ("insufficient buying power" in msg.lower()) or ("insufficient qty" in msg.lower()) or ("40310000" in msg):
-            INSUFFICIENT_COOLDOWN[key] = time.time() + 120
-            logger.warning("Insufficient funds/qty for %s %s, cooldown set: %s", symbol, side.upper(), msg)
-            return
-        raise
-
-
-# ---------------------------------------------------------
-# MAIN LOOP
-# ---------------------------------------------------------
+# ---------------- Main loop ----------------
 def main():
+    # Env
+    db_url = env_str("DB_URL", "postgresql+psycopg2://postgres:postgres@postgres:5432/trader")
+
+    symbols = parse_symbols(env_str("SYMBOLS", "AAPL,MSFT,SPY"))
+    portfolio_id = env_int("PORTFOLIO_ID", 1)
+
+    # Accept both names (old/new)
+    min_strength = env_float("MIN_STRENGTH", env_float("EXEC_MIN_STRENGTH", 0.60))
+    poll_seconds = env_int("POLL_SECONDS", env_int("EXEC_POLL_SECONDS", 20))
+
+    allow_short = env_bool("ALLOW_SHORT", False)
+    long_only = env_bool("LONG_ONLY", False)
+
+    atr_pct = env_float("ATR_PCT", 0.01)
+    sl_atr_mult = env_float("SL_ATR_MULT", 1.0)
+    tp_atr_mult = env_float("TP_ATR_MULT", 1.0)  # not used here directly, but logged
+
+    max_risk = env_float("MAX_RISK_PER_TRADE_USD", 30.0)
+    max_bp_pct = env_float("MAX_BP_PCT_PER_TRADE", 0.05)
+    max_notional = env_float("MAX_NOTIONAL_PER_TRADE_USD", 1200.0)
+    max_qty = env_int("MAX_QTY_PER_TRADE", 5)
+
+    cooldown_seconds = env_int("INSUFFICIENT_COOLDOWN_SECONDS", 900)
+    lookback_minutes = env_int("SIGNALS_LOOKBACK_MINUTES", 30)
+    max_signals_per_loop = env_int("MAX_SIGNALS_PER_LOOP", 5)
+
+    trading_mode = env_str("TRADING_MODE", "paper").lower()
+    paper = (trading_mode != "live")
+
+    api_key = env_str("ALPACA_API_KEY")
+    api_secret = env_str("ALPACA_API_SECRET")
+    data_url = env_str("ALPACA_DATA_URL", "https://data.alpaca.markets")
+
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET in env")
+
+    engine = db_engine(db_url)
+    tc = TradingClient(api_key, api_secret, paper=paper)
+
+    insuff_cooldown_until: Dict[str, datetime] = {}
+
     logger.info(
-        "signal_executor starting | MIN_STRENGTH=%s | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
-        "ATR_PCT=%.4f | ALLOW_SHORT=%s | CLOSE_WITH_MARKET=%s | "
-        "ENABLE_DAILY_RISK_GUARD=%s | MAX_DAILY_LOSS_USD=%.2f | MAX_DRAWDOWN_PCT=%.2f",
-        MIN_STRENGTH,
-        SYMBOLS,
-        PORTFOLIO_ID,
-        POLL_SECONDS,
-        ATR_PCT,
-        ALLOW_SHORT,
-        CLOSE_WITH_MARKET,
-        ENABLE_DAILY_RISK_GUARD,
-        MAX_DAILY_LOSS_USD,
-        MAX_DRAWDOWN_PCT,
+        "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | ATR_PCT=%.4f | "
+        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_RISK=%.2f | MAX_BP_PCT=%.4f | MAX_NOTIONAL=%.2f | MAX_QTY=%s | TP_ATR_MULT=%.2f | SL_ATR_MULT=%.2f",
+        min_strength, symbols, portfolio_id, poll_seconds, atr_pct,
+        allow_short, long_only, max_risk, max_bp_pct, max_notional, max_qty, tp_atr_mult, sl_atr_mult
     )
 
     while True:
         try:
-            if not check_daily_risk_guard():
-                logger.info("Daily risk guard active â€“ skipping signal execution this loop")
-                time.sleep(POLL_SECONDS)
+            # Refresh account/positions/open orders each loop (simple + stable)
+            account = tc.get_account()
+            buying_power = float(getattr(account, "buying_power", 0) or 0)
+
+            pos_map = get_positions_map(tc)
+            open_orders_map = get_open_orders_map(tc)
+
+            # Fetch signals
+            rows = fetch_unprocessed_signals(engine, symbols, portfolio_id, min_strength, lookback_minutes=lookback_minutes)
+            logger.info("fetch_new_signals | fetched %s rows", len(rows))
+
+            if not rows:
+                time.sleep(poll_seconds)
                 continue
 
-            signals = fetch_new_signals()
-            selected = select_signals(signals)
+            # Deduplicate: keep only earliest per (symbol, side)
+            seen = set()
+            selected: List[SignalRow] = []
+            for r in rows:
+                key = (r.symbol, r.side)
+                if key in seen:
+                    continue
+                seen.add(key)
+                selected.append(r)
+                if len(selected) >= max_signals_per_loop:
+                    break
 
-            if not selected:
-                logger.info("no new signals to execute")
-            else:
-                logger.info("Executing %d selected signal(s)", len(selected))
+            logger.info("select_signals | fetched=%s | selected=%s | unique_symbol_side=%s",
+                        len(rows), len(selected), len(seen))
 
-            for sig in selected:
-                sym = str(sig["symbol"]).upper()
-                side = str(sig["side"]).lower()
-                strength = float(sig["strength"])
-                source = str(sig.get("source") or "")
-                sid = int(sig["id"])
+            for s in selected:
+                sym = s.symbol.upper()
+                side = s.side.upper()
 
-                logger.info("EXEC: %s %s | strength=%.4f | source=%s | signal_id=%s",
-                            sym, side.upper(), strength, source, sid)
+                # Cooldown guard
+                cd_until = insuff_cooldown_until.get(sym)
+                if cd_until and now_utc() < cd_until:
+                    mark_signal(engine, s.id, "skipped", f"cooldown_until={cd_until.isoformat()}")
+                    continue
+
+                # Strategy guards
+                if long_only and side == "SELL":
+                    mark_signal(engine, s.id, "skipped", "LONG_ONLY=1")
+                    continue
+                if side == "SELL" and not allow_short:
+                    mark_signal(engine, s.id, "skipped", "ALLOW_SHORT=0")
+                    continue
+
+                # Open-order guard
+                if open_orders_map.get(sym):
+                    mark_signal(engine, s.id, "skipped", f"open_orders_present={len(open_orders_map[sym])}")
+                    continue
+
+                # Position guard (no pyramiding)
+                p = pos_map.get(sym)
+                if p:
+                    if p.side == "LONG" and side == "BUY":
+                        mark_signal(engine, s.id, "skipped", "already_long_no_pyramiding")
+                        continue
+                    if p.side == "SHORT" and side == "SELL":
+                        mark_signal(engine, s.id, "skipped", "already_short_no_pyramiding")
+                        continue
+
+                    # Flip: close first, do not open opposite entry in same loop
+                    if p.side == "LONG" and side == "SELL":
+                        close_req = MarketOrderRequest(symbol=sym, qty=p.qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+                        try:
+                            o = tc.submit_order(close_req)
+                            mark_signal(engine, s.id, "skipped", f"flip_close_submitted LONG->SELL qty={p.qty}", str(getattr(o, "id", "")))
+                            logger.info("FLIP_CLOSE submitted: %s SELL qty=%s | id=%s", sym, p.qty, getattr(o, "id", None))
+                        except Exception as e:
+                            mark_signal(engine, s.id, "error", f"flip_close_failed {e}")
+                            logger.exception("flip_close_failed: %s", e)
+                        continue
+
+                    if p.side == "SHORT" and side == "BUY":
+                        close_req = MarketOrderRequest(symbol=sym, qty=p.qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+                        try:
+                            o = tc.submit_order(close_req)
+                            mark_signal(engine, s.id, "skipped", f"flip_close_submitted SHORT->BUY qty={p.qty}", str(getattr(o, "id", "")))
+                            logger.info("FLIP_CLOSE submitted: %s BUY qty=%s | id=%s", sym, p.qty, getattr(o, "id", None))
+                        except Exception as e:
+                            mark_signal(engine, s.id, "error", f"flip_close_failed {e}")
+                            logger.exception("flip_close_failed: %s", e)
+                        continue
+
+                # Compute price + qty
+                price = get_latest_price(data_url, api_key, api_secret, sym)
+                if not price or price <= 0:
+                    mark_signal(engine, s.id, "error", "no_price_from_alpaca_data")
+                    continue
+
+                qty = compute_qty(
+                    price=price,
+                    buying_power=buying_power,
+                    atr_pct=atr_pct,
+                    sl_atr_mult=sl_atr_mult,
+                    max_risk_usd=max_risk,
+                    max_bp_pct=max_bp_pct,
+                    max_notional_usd=max_notional,
+                    max_qty=max_qty,
+                )
+
+                if qty < 1:
+                    mark_signal(engine, s.id, "skipped", "computed_qty<1")
+                    continue
+
+                # Submit limit at near-last price (small bias)
+                if side == "BUY":
+                    order_side = OrderSide.BUY
+                    limit_price = round(price * 1.0005, 2)
+                else:
+                    order_side = OrderSide.SELL
+                    limit_price = round(price * 0.9995, 2)
+
+                req = LimitOrderRequest(
+                    symbol=sym,
+                    qty=qty,
+                    side=order_side,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price
+                )
 
                 try:
-                    create_order_from_signal(sym, side, strength, source, sid)
-                finally:
-                    mark_signal_processed(sig)
+                    o = tc.submit_order(req)
+                    oid = str(getattr(o, "id", "")) if o else ""
+                    mark_signal(engine, s.id, "submitted", f"entry_submitted qty={qty} limit={limit_price}", oid)
+                    logger.info("ENTRY submitted: %s %s qty=%s @%.2f | id=%s | signal_id=%s",
+                                sym, side, qty, limit_price, oid, s.id)
+                except Exception as e:
+                    if is_insufficient_error(e):
+                        until = now_utc() + timedelta(seconds=cooldown_seconds)
+                        insuff_cooldown_until[sym] = until
+                        mark_signal(engine, s.id, "skipped", f"insufficient_set_cooldown_until={until.isoformat()} | {e}")
+                        logger.warning("Insufficient for %s %s: cooldown set until %s | err=%s", sym, side, until, e)
+                    else:
+                        mark_signal(engine, s.id, "error", f"submit_failed {e}")
+                        logger.exception("submit_failed: %s", e)
+
+                # tiny spacing to be nice to APIs
+                time.sleep(0.15)
 
         except Exception as e:
             logger.exception("signal_executor loop error: %s", e)
 
-        time.sleep(POLL_SECONDS)
+        time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":
     main()
-
