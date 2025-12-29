@@ -44,15 +44,10 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
-      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.20}"
-    command: >
-      sh -lc "echo 'signal_maker starting...';
-      while true; do
-        python -m jobs.make_signals_ml || echo 'make_signals_ml failed';
-        sleep ${MAKER_SLEEP_SECONDS:-180};
-      done"
+      CRON_SLEEP_SECONDS: "${MAKER_SLEEP_SECONDS:-180}"
+    command: sh -lc "python -m jobs.make_signals_ml"
     restart: always
 
   signal_executor:
@@ -67,28 +62,10 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
-      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
-      CRON_SLEEP_SECONDS: "${EXEC_POLL_SECONDS:-20}"
+      POLL_SECONDS: "${EXEC_POLL_SECONDS:-20}"
     command: sh -lc "python -m services.signal_executor"
-    restart: always
-
-  sync_orders:
-    build:
-      context: .
-    image: ai_prototype-sync_orders
-    container_name: trader_sync_orders
-    depends_on:
-      postgres:
-        condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
-    env_file: .env
-    environment:
-      PYTHONUNBUFFERED: "1"
-      PYTHONPATH: "/app"
-    command: sh -lc "python -u tools/sync_orders.py"
     restart: always
 
   oco_exit_monitor:
@@ -103,9 +80,24 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
-      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
     command: sh -lc "python -m services.oco_exit_monitor"
+    restart: always
+
+  sync_orders:
+    build:
+      context: .
+    image: ai_prototype-sync_orders
+    container_name: trader_sync_orders
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db_init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      PYTHONPATH: "/app"
+    command: sh -lc "python -u tools/sync_orders.py"
     restart: always
 
   pnl_recorder:
@@ -120,7 +112,6 @@ services:
         condition: service_completed_successfully
     env_file: .env
     environment:
-      PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
     command: sh -lc "python -m services.record_pnl"
     restart: always
