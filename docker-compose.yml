@@ -45,7 +45,7 @@ services:
     env_file: .env
     environment:
       PYTHONPATH: "/app"
-      MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.20}"
+      MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.60}"
       CRON_SLEEP_SECONDS: "${MAKER_SLEEP_SECONDS:-180}"
     command: sh -lc "python -m jobs.make_signals_ml"
     restart: always
