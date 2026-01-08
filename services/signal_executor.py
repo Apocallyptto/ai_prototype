@@ -14,6 +14,9 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, MarketOrderRequest
 from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
 
+# ✅ MARKET GATE (A+B už máš, takto to len voláme)
+from services.market_gate import should_trade_now
+
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -260,6 +263,9 @@ def main():
     lookback_minutes = env_int("SIGNALS_LOOKBACK_MINUTES", 30)
     max_signals_per_loop = env_int("MAX_SIGNALS_PER_LOOP", 5)
 
+    # ✅ market gate config
+    stop_new_entries_min_before_close = env_int("STOP_NEW_ENTRIES_MIN_BEFORE_CLOSE", 10)
+
     trading_mode = env_str("TRADING_MODE", "paper").lower()
     paper = (trading_mode != "live")
 
@@ -277,13 +283,29 @@ def main():
 
     logger.info(
         "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | ATR_PCT=%.4f | "
-        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_RISK=%.2f | MAX_BP_PCT=%.4f | MAX_NOTIONAL=%.2f | MAX_QTY=%s | TP_ATR_MULT=%.2f | SL_ATR_MULT=%.2f",
+        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_RISK=%.2f | MAX_BP_PCT=%.4f | MAX_NOTIONAL=%.2f | MAX_QTY=%s | "
+        "TP_ATR_MULT=%.2f | SL_ATR_MULT=%.2f | STOP_NEW_ENTRIES_MIN_BEFORE_CLOSE=%s",
         min_strength, symbols, portfolio_id, poll_seconds, atr_pct,
-        allow_short, long_only, max_risk, max_bp_pct, max_notional, max_qty, tp_atr_mult, sl_atr_mult
+        allow_short, long_only, max_risk, max_bp_pct, max_notional, max_qty,
+        tp_atr_mult, sl_atr_mult, stop_new_entries_min_before_close
     )
 
     while True:
         try:
+            # ✅ MARKET GATE (hneď na začiatku loopu)
+            ok, reason, clock = should_trade_now(stop_new_entries_min_before_close)
+            if not ok:
+                logger.info(
+                    "market_gate | skip trading | reason=%s | is_open=%s | ts=%s | next_open=%s | next_close=%s",
+                    reason,
+                    clock.get("is_open"),
+                    clock.get("timestamp"),
+                    clock.get("next_open"),
+                    clock.get("next_close"),
+                )
+                time.sleep(poll_seconds)
+                continue
+
             # Refresh account/positions/open orders each loop (simple + stable)
             account = tc.get_account()
             buying_power = float(getattr(account, "buying_power", 0) or 0)
