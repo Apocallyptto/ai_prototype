@@ -139,17 +139,20 @@ def fetch_unprocessed_signals(engine, portfolio_id: int, symbols: List[str], min
     return rows
 
 
-def mark_signal(engine, signal_id: int, status: str, note: str = "", alpaca_order_id: Optional[str] = None):
-    sql = text(
-        """
+def mark_signal(engine, signal_id: int, status: str, note: str, alpaca_order_id=None) -> None:
+    # Alpaca SDK may return UUID objects; DB column is TEXT in our schema.
+    if alpaca_order_id is not None:
+        alpaca_order_id = str(alpaca_order_id)
+
+    # Support both styles: some older code used param name 'oid' in SQL params
+    sql = text("""
         UPDATE signals
         SET processed_status = :status,
             processed_note = :note,
             processed_at = NOW(),
-            alpaca_order_id = COALESCE(:oid, alpaca_order_id)
+            alpaca_order_id = COALESCE(CAST(:oid AS text), alpaca_order_id)
         WHERE id = :id
-        """
-    )
+    """)
     with engine.begin() as conn:
         conn.execute(sql, {"status": status, "note": note, "oid": alpaca_order_id, "id": signal_id})
 
