@@ -371,6 +371,27 @@ def risk_guard_allows_new_entries(
 
     return True, "ok"
 
+def in_symbol_cooldown(engine, portfolio_id: int, symbol: str, cooldown_seconds: int) -> bool:
+    if cooldown_seconds <= 0:
+        return False
+    sql = text("""
+        SELECT 1
+        FROM signals
+        WHERE portfolio_id = :pid
+          AND symbol = :sym
+          AND processed_at IS NOT NULL
+          AND processed_at >= NOW() - (:cd || ' seconds')::interval
+          AND processed_status IN ('submitted','filled')
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(sql, {"pid": portfolio_id, "sym": symbol, "cd": int(cooldown_seconds)}).fetchone()
+    return row is not None
+
+
+def cooldown_reason(cooldown_seconds: int) -> str:
+    return f"symbol_cooldown_{int(cooldown_seconds)}s"
+
 
 # -----------------------------
 # main loop
