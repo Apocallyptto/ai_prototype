@@ -1,83 +1,81 @@
 ﻿import os
 import time
+import math
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Sequence, Tuple
-from uuid import UUID
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-import requests
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
-try:
-    from services.market_gate import should_trade_now  # type: ignore
-except Exception:  # pragma: no cover
-    def should_trade_now(*_args, **_kwargs) -> bool:  # type: ignore
-        return True
-
-logger = logging.getLogger("signal_executor")
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
 
 
-def _s(name: str, default: str = "") -> str:
+LOG = logging.getLogger("signal_executor")
+
+
+def _env_str(name: str, default: str) -> str:
     v = os.getenv(name)
-    return default if v is None or v == "" else v
+    return default if v is None or str(v).strip() == "" else str(v).strip()
 
 
-def _i(name: str, default: int) -> int:
+def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if not v:
+    if v is None or str(v).strip() == "":
         return default
     try:
-        return int(v)
-    except ValueError:
+        return int(float(v))
+    except Exception:
         return default
 
 
-def _f(name: str, default: float) -> float:
+def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    if not v:
+    if v is None or str(v).strip() == "":
         return default
     try:
         return float(v)
-    except ValueError:
+    except Exception:
         return default
 
 
-def _b(name: str, default: bool = False) -> bool:
+def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
-    if not v:
+    if v is None:
         return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
-def utcnow() -> datetime:
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def parse_symbols(raw: str) -> List[str]:
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
-
-
-def parse_side(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    if s in ("buy", "long"):
-        return "buy"
-    if s in ("sell", "short"):
-        return "sell"
-    return s
+def _parse_symbols(raw: str) -> List[str]:
+    syms = [s.strip().upper() for s in raw.replace(";", ",").split(",") if s.strip()]
+    out: List[str] = []
+    seen: Set[str] = set()
+    for s in syms:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
 
 
 @dataclass(frozen=True)
-class Config:
-    database_url: str
+class Cfg:
     symbols: List[str]
-    min_strength: float
     portfolio_id: int
+    min_strength: float
     poll_seconds: int
 
     allow_short: bool
@@ -98,463 +96,413 @@ class Config:
     symbol_cooldown_seconds: int
     pick_ttl_seconds: int
 
-    data_base_url: str
-    data_feed: str
-
-    @staticmethod
-    def from_env() -> "Config":
-        return Config(
-            database_url=_s("DATABASE_URL", "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"),
-            symbols=parse_symbols(_s("SYMBOLS", "AAPL,MSFT,SPY,NVDA,AMD")),
-            min_strength=_f("MIN_STRENGTH", 0.60),
-            portfolio_id=_i("PORTFOLIO_ID", 1),
-            poll_seconds=_i("SIGNAL_EXECUTOR_POLL_SECONDS", 20),
-
-            allow_short=_b("ALLOW_SHORT", True),
-            long_only=_b("LONG_ONLY", False),
-            max_notional=_f("MAX_NOTIONAL", 1200.0),
-            max_qty=_i("MAX_QTY", 5),
-
-            alpaca_dedupe_minutes=_i("ALPACA_DEDUPE_MINUTES", 10),
-            cancel_opposite_open_orders=_b("CANCEL_OPPOSITE_OPEN_ORDERS", True),
-
-            max_open_positions=_i("MAX_OPEN_POSITIONS", 2),
-            max_open_orders=_i("MAX_OPEN_ORDERS", 3),
-
-            enable_daily_risk_guard=_b("ENABLE_DAILY_RISK_GUARD", False),
-            daily_loss_stop_pct=_f("DAILY_LOSS_STOP_PCT", 1.0),
-            max_daily_loss_usd=_f("MAX_DAILY_LOSS_USD", 200.0),
-
-            symbol_cooldown_seconds=_i("SYMBOL_COOLDOWN_SECONDS", 0),
-            pick_ttl_seconds=_i("PICK_TTL_SECONDS", 0),
-
-            data_base_url=_s("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
-            data_feed=_s("ALPACA_DATA_FEED", "iex"),
-        )
+    trading_paused: bool
+    dry_run: bool
 
 
-def make_engine(cfg: Config) -> Engine:
-    return create_engine(cfg.database_url, pool_pre_ping=True)
-
-
-def fetch_unprocessed_signals(engine: Engine, cfg: Config, limit: int = 250) -> List[dict]:
-    q = text(
-        "select id, created_at, symbol, side, strength "
-        "from signals "
-        "where processed_at is null and portfolio_id=:pid and symbol=any(:symbols) and strength>=:min_strength "
-        "order by created_at asc "
-        "limit :limit"
+def load_cfg() -> Cfg:
+    return Cfg(
+        symbols=_parse_symbols(_env_str("SYMBOLS", "AAPL,MSFT,SPY,NVDA,AMD")),
+        portfolio_id=_env_int("PORTFOLIO_ID", 1),
+        min_strength=_env_float("MIN_STRENGTH", 0.75),
+        poll_seconds=_env_int("POLL_SECONDS", _env_int("SIGNAL_POLL_SECONDS", 20)),
+        allow_short=_env_bool("ALLOW_SHORT", False),
+        long_only=_env_bool("LONG_ONLY", False),
+        max_notional=_env_float("MAX_NOTIONAL", 200.0),
+        max_qty=_env_int("MAX_QTY", 1),
+        alpaca_dedupe_minutes=_env_int("ALPACA_DEDUPE_MINUTES", 2),
+        cancel_opposite_open_orders=_env_bool("CANCEL_OPPOSITE_OPEN_ORDERS", True),
+        max_open_positions=_env_int("MAX_OPEN_POSITIONS", 1),
+        max_open_orders=_env_int("MAX_OPEN_ORDERS", 1),
+        enable_daily_risk_guard=_env_bool("ENABLE_DAILY_RISK_GUARD", True),
+        daily_loss_stop_pct=_env_float("DAILY_LOSS_STOP_PCT", 1.0),
+        max_daily_loss_usd=_env_float("MAX_DAILY_LOSS_USD", 200.0),
+        symbol_cooldown_seconds=_env_int("SYMBOL_COOLDOWN_SECONDS", 60),
+        pick_ttl_seconds=_env_int("PICK_TTL_SECONDS", 120),
+        trading_paused=_env_bool("TRADING_PAUSED", False),  # kill switch
+        dry_run=_env_bool("DRY_RUN", False),
     )
-    with engine.begin() as con:
-        rows = con.execute(
+
+
+def _setup_logging() -> None:
+    level = _env_str("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
+
+
+def make_engine():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        host = _env_str("POSTGRES_HOST", _env_str("PGHOST", "postgres"))
+        port = _env_int("POSTGRES_PORT", _env_int("PGPORT", 5432))
+        user = _env_str("POSTGRES_USER", _env_str("PGUSER", "postgres"))
+        pwd = _env_str("POSTGRES_PASSWORD", _env_str("PGPASSWORD", "postgres"))
+        db = _env_str("POSTGRES_DB", _env_str("PGDATABASE", "trader"))
+        db_url = f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}"
+    return create_engine(db_url, pool_pre_ping=True)
+
+
+def make_trading_client() -> TradingClient:
+    key = os.getenv("ALPACA_API_KEY")
+    sec = os.getenv("ALPACA_API_SECRET")
+    if not key or not sec:
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
+    return TradingClient(key, sec, paper=_env_bool("ALPACA_PAPER", True))
+
+
+def make_data_client() -> StockHistoricalDataClient:
+    key = os.getenv("ALPACA_API_KEY")
+    sec = os.getenv("ALPACA_API_SECRET")
+    if not key or not sec:
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
+    return StockHistoricalDataClient(key, sec)
+
+
+def fetch_new_signals(engine, cfg: Cfg, limit: int = 300) -> List[dict]:
+    q = text(
+        """
+        SELECT id, created_at, symbol, side, strength
+        FROM signals
+        WHERE processed_at IS NULL
+          AND portfolio_id = :pid
+          AND symbol = ANY(:symbols)
+          AND strength >= :min_strength
+        ORDER BY created_at ASC
+        LIMIT :limit
+        """
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(
             q,
             {"pid": cfg.portfolio_id, "symbols": cfg.symbols, "min_strength": cfg.min_strength, "limit": limit},
         ).mappings().all()
     return [dict(r) for r in rows]
 
 
-def select_signals(rows: List[dict]) -> List[dict]:
-    best: Dict[Tuple[str, str], dict] = {}
-    for r in rows:
-        k = (r["symbol"], r["side"])
-        if k not in best or float(r["strength"]) > float(best[k]["strength"]):
-            best[k] = r
-    out = list(best.values())
-    out.sort(key=lambda x: float(x["strength"]), reverse=True)
-    return out
-
-
-def mark_signal(engine: Engine, sid: int, status: str, note: str, alpaca_order_id: Optional[str] = None) -> None:
-    q = text(
-        "update signals set processed_at=now(), processed_status=:status, processed_note=:note, "
-        "alpaca_order_id=coalesce(:alpaca_order_id, alpaca_order_id) where id=:id"
-    )
-    with engine.begin() as con:
-        con.execute(q, {"id": sid, "status": status, "note": note, "alpaca_order_id": alpaca_order_id})
-
-
-def mark_signals_picked(engine: Engine, ids: Sequence[int]) -> None:
+def mark(engine, ids: Sequence[int], status: str, note: str) -> None:
     if not ids:
         return
     q = text(
-        "update signals set processed_at=now(), processed_status='picked', processed_note='picked' "
-        "where id=any(:ids) and processed_at is null"
+        """
+        UPDATE signals
+        SET processed_at = now(),
+            processed_status = :status,
+            processed_note = :note
+        WHERE id = ANY(:ids)
+        """
     )
-    with engine.begin() as con:
-        con.execute(q, {"ids": list(ids)})
+    with engine.begin() as conn:
+        conn.execute(q, {"ids": list(ids), "status": status, "note": note})
 
 
-def unpick_signals(engine: Engine, ids: Sequence[int], note: str) -> int:
+def mark_one(engine, sid: int, status: str, note: str) -> None:
+    mark(engine, [sid], status, note)
+
+
+def pick(engine, ids: Sequence[int]) -> None:
     if not ids:
-        return 0
+        return
     q = text(
-        "update signals set processed_at=null, processed_status=null, processed_note=:note "
-        "where id=any(:ids) and processed_status='picked'"
+        """
+        UPDATE signals
+        SET processed_at = now(),
+            processed_status = 'picked',
+            processed_note = 'picked'
+        WHERE id = ANY(:ids)
+          AND processed_at IS NULL
+        """
     )
-    with engine.begin() as con:
-        res = con.execute(q, {"ids": list(ids), "note": note})
+    with engine.begin() as conn:
+        conn.execute(q, {"ids": list(ids)})
+
+
+def unpick_stale_picks(engine, cfg: Cfg) -> int:
+    q = text(
+        """
+        UPDATE signals
+        SET processed_at = NULL,
+            processed_status = NULL,
+            processed_note = 'auto_unpick_pick_ttl'
+        WHERE processed_status = 'picked'
+          AND processed_at < (now() - (:ttl || ' seconds')::interval)
+        """
+    )
+    with engine.begin() as conn:
+        res = conn.execute(q, {"ttl": cfg.pick_ttl_seconds})
         return int(res.rowcount or 0)
 
 
-def release_stale_picks(engine: Engine, cfg: Config) -> int:
-    if cfg.pick_ttl_seconds <= 0:
-        return 0
+def get_symbol_last_trade_ts(engine, symbols: Sequence[str]) -> Dict[str, datetime]:
     q = text(
-        "update signals set processed_at=null, processed_status=null, processed_note='pick_expired' "
-        "where portfolio_id=:pid and processed_status='picked' and processed_at is not null "
-        "and processed_at < (now() - make_interval(secs => :ttl))"
+        """
+        SELECT symbol, max(processed_at) AS last_ts
+        FROM signals
+        WHERE symbol = ANY(:symbols)
+          AND processed_at IS NOT NULL
+          AND processed_status IN ('submitted','filled')
+        GROUP BY symbol
+        """
     )
-    with engine.begin() as con:
-        res = con.execute(q, {"pid": cfg.portfolio_id, "ttl": cfg.pick_ttl_seconds})
-        return int(res.rowcount or 0)
-
-
-def last_trade_ts(engine: Engine, cfg: Config, symbol: str) -> Optional[datetime]:
-    # cooldown ONLY on submitted/filled (NOT on skipped), aby sa cooldown “nepredlžoval” skipmi
-    q = text(
-        "select max(processed_at) as last_ts from signals "
-        "where portfolio_id=:pid and symbol=:symbol and processed_at is not null "
-        "and processed_status in ('submitted','filled')"
-    )
-    with engine.begin() as con:
-        row = con.execute(q, {"pid": cfg.portfolio_id, "symbol": symbol}).mappings().first()
-    if not row or row["last_ts"] is None:
-        return None
-    return row["last_ts"]
-
-
-def in_symbol_cooldown(engine: Engine, cfg: Config, symbol: str) -> bool:
-    if cfg.symbol_cooldown_seconds <= 0:
-        return False
-    lt = last_trade_ts(engine, cfg, symbol)
-    if lt is None:
-        return False
-    return (utcnow() - lt).total_seconds() < cfg.symbol_cooldown_seconds
-
-
-def get_latest_price(cfg: Config, symbol: str) -> float:
-    url = f"{cfg.data_base_url.rstrip('/')}/v2/stocks/{symbol}/trades/latest"
-    headers = {"APCA-API-KEY-ID": _s("ALPACA_API_KEY"), "APCA-API-SECRET-KEY": _s("ALPACA_API_SECRET")}
-    r = requests.get(url, headers=headers, params={"feed": cfg.data_feed}, timeout=10)
-    r.raise_for_status()
-    j = r.json()
-    trade = j.get("trade") or {}
-    if "p" in trade:
-        return float(trade["p"])
-    if "price" in trade:
-        return float(trade["price"])
-    raise RuntimeError(f"unexpected payload: {j}")
-
-
-def open_orders(tc: TradingClient):
-    return tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
-
-
-def count_open_orders(tc: TradingClient) -> Tuple[int, List[str]]:
-    os_ = open_orders(tc)
-    return len(os_), [f"{o.symbol}:{o.side.name}:{o.qty}:{o.type.name}:{o.status.name}" for o in os_]
-
-
-def count_open_positions(tc: TradingClient) -> Tuple[int, List[str]]:
-    ps = tc.get_all_positions()
-    n = 0
-    out: List[str] = []
-    for p in ps:
-        try:
-            qty = float(p.qty)
-        except Exception:
-            qty = 0.0
-        if abs(qty) > 0:
-            n += 1
-            out.append(f"{p.symbol}:{p.qty}")
-    return n, out
-
-
-def daily_loss_exceeded(tc: TradingClient, cfg: Config) -> Tuple[bool, str]:
-    if not cfg.enable_daily_risk_guard:
-        return (False, "")
-    a = tc.get_account()
-    if not hasattr(a, "equity") or not hasattr(a, "last_equity"):
-        return (False, "daily_guard_unavailable_missing_last_equity")
-    try:
-        equity = float(a.equity)
-        last_equity = float(a.last_equity)
-    except Exception:
-        return (False, "daily_guard_unavailable_parse_error")
-    if last_equity <= 0:
-        return (False, "daily_guard_unavailable_last_equity<=0")
-    pl_usd = equity - last_equity
-    pl_pct = (equity / last_equity - 1.0) * 100.0
-    if cfg.max_daily_loss_usd > 0 and pl_usd <= -abs(cfg.max_daily_loss_usd):
-        return (True, f"max_daily_loss_usd_exceeded pl_usd={pl_usd:.2f} <= -{abs(cfg.max_daily_loss_usd):.2f}")
-    if cfg.daily_loss_stop_pct > 0 and pl_pct <= -abs(cfg.daily_loss_stop_pct):
-        return (True, f"daily_loss_stop_pct_exceeded pl_pct={pl_pct:.2f}% <= -{abs(cfg.daily_loss_stop_pct):.2f}%")
-    return (False, f"daily_pl_usd={pl_usd:.2f} daily_pl_pct={pl_pct:.2f}%")
-
-
-def risk_guard_blocked(tc: TradingClient, cfg: Config) -> Tuple[bool, str]:
-    blocked, reason = daily_loss_exceeded(tc, cfg)
-    if blocked:
-        return (True, reason)
-
-    n_pos, pos_sum = count_open_positions(tc)
-    if cfg.max_open_positions > 0 and n_pos >= cfg.max_open_positions:
-        return (True, f"max_open_positions_reached:{n_pos}/{cfg.max_open_positions} pos={pos_sum}")
-
-    n_ord, ord_sum = count_open_orders(tc)
-    if cfg.max_open_orders > 0 and n_ord >= cfg.max_open_orders:
-        return (True, f"max_open_orders_reached:{n_ord}/{cfg.max_open_orders} ord={ord_sum}")
-
-    return (False, "")
-
-
-def recent_orders(tc: TradingClient, minutes: int) -> List[object]:
-    cutoff = utcnow() - timedelta(minutes=minutes)
-    orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=500))
-    out = []
-    for o in orders:
-        sa = getattr(o, "submitted_at", None)
-        if sa and sa >= cutoff:
-            out.append(o)
+    out: Dict[str, datetime] = {}
+    with engine.connect() as conn:
+        for r in conn.execute(q, {"symbols": list(symbols)}).mappings().all():
+            if r["last_ts"] is not None:
+                out[str(r["symbol"]).upper()] = r["last_ts"]
     return out
 
 
-def has_recent_order(tc: TradingClient, symbol: str, side: OrderSide, minutes: int) -> bool:
-    if minutes <= 0:
+def select_signals(engine, cfg: Cfg, signals: List[dict]) -> Tuple[List[dict], int]:
+    now = _now_utc()
+    selected: List[dict] = []
+    seen: Set[Tuple[str, str]] = set()
+    stale_ids: List[int] = []
+
+    for s in signals:
+        sid = int(s["id"])
+        sym = str(s["symbol"]).upper()
+        side = str(s["side"]).lower()
+        created_at = s["created_at"]
+
+        if isinstance(created_at, datetime):
+            ca = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+            if (now - ca).total_seconds() > cfg.pick_ttl_seconds:
+                stale_ids.append(sid)
+                continue
+
+        k = (sym, side)
+        if k in seen:
+            continue
+        seen.add(k)
+        selected.append(s)
+
+    if stale_ids:
+        mark(engine, stale_ids, "skipped", f"stale_signal_ttl_{cfg.pick_ttl_seconds}s")
+
+    return selected, len(stale_ids)
+
+
+def risk_guard(tc: TradingClient, cfg: Cfg) -> Tuple[bool, str]:
+    positions = tc.get_all_positions()
+    open_orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+
+    if len(positions) >= cfg.max_open_positions:
+        return False, f"max_open_positions_reached:{len(positions)}/{cfg.max_open_positions}"
+    if len(open_orders) >= cfg.max_open_orders:
+        return False, f"max_open_orders_reached:{len(open_orders)}/{cfg.max_open_orders}"
+
+    if cfg.enable_daily_risk_guard:
+        try:
+            acct = tc.get_account()
+            equity = float(acct.equity)
+            last_equity = getattr(acct, "last_equity", None)
+            if last_equity is not None:
+                last_equity_f = float(last_equity)
+                if last_equity_f > 0:
+                    dd_pct = max(0.0, (last_equity_f - equity) / last_equity_f * 100.0)
+                    if dd_pct >= cfg.daily_loss_stop_pct:
+                        return False, f"daily_loss_stop_pct_hit:{dd_pct:.2f}%"
+                loss_usd = max(0.0, last_equity_f - equity)
+                if loss_usd >= cfg.max_daily_loss_usd:
+                    return False, f"max_daily_loss_usd_hit:{loss_usd:.2f}"
+        except Exception as e:
+            LOG.warning("risk_guard | daily guard calc failed: %s", e)
+
+    return True, ""
+
+
+def _recent_alpaca_dedupe(tc: TradingClient, symbol: str, side: OrderSide, window_minutes: int) -> bool:
+    if window_minutes <= 0:
         return False
-    try:
-        orders = recent_orders(tc, minutes)
-    except Exception:
-        logger.exception("recent orders fetch failed")
-        return False
+    cutoff = _now_utc() - timedelta(minutes=window_minutes)
+    orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=200))
     for o in orders:
-        if getattr(o, "symbol", None) == symbol and getattr(o, "side", None) == side:
-            st = getattr(o, "status", None)
-            st_name = getattr(st, "name", str(st)).lower()
-            if st_name not in ("canceled", "expired", "rejected"):
-                return True
+        if str(o.symbol).upper() != symbol.upper():
+            continue
+        if o.side != side:
+            continue
+        if o.submitted_at and o.submitted_at >= cutoff:
+            return True
     return False
 
 
-def cancel_opposite_open_orders(tc: TradingClient, symbol: str, new_side: OrderSide) -> int:
-    opposite = OrderSide.SELL if new_side == OrderSide.BUY else OrderSide.BUY
+def _cancel_opposite_open_orders(tc: TradingClient, symbol: str, side: OrderSide) -> int:
+    opposite = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
     canceled = 0
-    for o in open_orders(tc):
-        if o.symbol == symbol and o.side == opposite:
-            try:
-                tc.cancel_order_by_id(o.id)
-                canceled += 1
-            except Exception:
-                logger.exception("cancel opposite order failed | %s %s %s", symbol, o.side, o.id)
+    opens = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+    for o in opens:
+        if str(o.symbol).upper() == symbol.upper() and o.side == opposite:
+            tc.cancel_order_by_id(o.id)
+            canceled += 1
     return canceled
 
 
-def update_submitted_fills(engine: Engine, tc: TradingClient, cfg: Config, lookback_minutes: int = 180) -> int:
-    q = text(
-        "select id, alpaca_order_id from signals "
-        "where portfolio_id=:pid and processed_status='submitted' and alpaca_order_id is not null "
-        "and processed_at > (now() - make_interval(secs => :secs)) "
-        "order by processed_at desc limit 200"
-    )
-    with engine.begin() as con:
-        rows = con.execute(q, {"pid": cfg.portfolio_id, "secs": lookback_minutes * 60}).mappings().all()
-
-    updated = 0
-    for r in rows:
-        sid = int(r["id"])
-        oid_raw = str(r["alpaca_order_id"])
-        try:
-            oid: object = UUID(oid_raw)
-        except Exception:
-            oid = oid_raw
-        try:
-            o = tc.get_order_by_id(oid)
-        except Exception:
-            logger.exception("get_order_by_id failed | sid=%s oid=%s", sid, oid_raw)
-            continue
-        st = getattr(o, "status", None)
-        st_name = getattr(st, "name", str(st)).lower()
-        if st_name == "filled":
-            mark_signal(engine, sid, "filled", "order filled", alpaca_order_id=oid_raw)
-            updated += 1
-        elif st_name in ("canceled", "expired"):
-            mark_signal(engine, sid, "canceled", f"order {st_name}", alpaca_order_id=oid_raw)
-            updated += 1
-        elif st_name == "rejected":
-            mark_signal(engine, sid, "error", "order rejected", alpaca_order_id=oid_raw)
-            updated += 1
-    return updated
+def _latest_trade_price(data: StockHistoricalDataClient, symbol: str) -> Optional[float]:
+    try:
+        req = StockLatestTradeRequest(symbol_or_symbols=[symbol])
+        resp = data.get_stock_latest_trade(req)
+        t = resp.get(symbol)
+        if t and t.price is not None:
+            return float(t.price)
+    except Exception as e:
+        LOG.warning("price | latest trade failed for %s: %s", symbol, e)
+    return None
 
 
-def size_qty(cfg: Config, limit_price: float) -> int:
-    # Allow at least 1 share even if price > MAX_NOTIONAL (bounded by MAX_QTY)
-    if cfg.max_qty <= 0:
+def _calc_qty(limit_price: float, cfg: Cfg) -> int:
+    if limit_price <= 0:
         return 0
-    if cfg.max_notional <= 0:
-        return cfg.max_qty
-    qty_by_notional = max(1, int(cfg.max_notional // max(limit_price, 0.01)))
-    return max(0, min(cfg.max_qty, qty_by_notional))
+    qty_by_notional = int(math.floor(cfg.max_notional / limit_price))
+    return max(0, min(cfg.max_qty, qty_by_notional if qty_by_notional > 0 else 0))
+
+
+def submit_limit(tc: TradingClient, symbol: str, side: OrderSide, qty: int, limit_price: float) -> str:
+    req = LimitOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        time_in_force=TimeInForce.DAY,
+        limit_price=round(float(limit_price), 2),
+    )
+    o = tc.submit_order(req)
+    return str(o.id)
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    _setup_logging()
+    cfg = load_cfg()
+    engine = make_engine()
+    tc = make_trading_client()
+    data = make_data_client()
 
-    cfg = Config.from_env()
-    engine = make_engine(cfg)
-
-    tc = TradingClient(_s("ALPACA_API_KEY"), _s("ALPACA_API_SECRET"), paper=_b("ALPACA_PAPER", True))
-
-    logger.info(
+    LOG.info(
         "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
         "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | ALPACA_DEDUPE_MINUTES=%s | "
-        "CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | "
-        "DAILY_LOSS_STOP_PCT=%s | MAX_DAILY_LOSS_USD=%s | ENABLE_DAILY_RISK_GUARD=%s | "
-        "SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s",
+        "CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%.1f | "
+        "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
+        "TRADING_PAUSED=%s | DRY_RUN=%s",
         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
-        cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty,
-        cfg.alpaca_dedupe_minutes, cfg.cancel_opposite_open_orders,
-        cfg.max_open_positions, cfg.max_open_orders,
+        cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.alpaca_dedupe_minutes,
+        cfg.cancel_opposite_open_orders, cfg.max_open_positions, cfg.max_open_orders,
         cfg.daily_loss_stop_pct, cfg.max_daily_loss_usd, cfg.enable_daily_risk_guard,
-        cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds,
+        cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds, cfg.trading_paused, cfg.dry_run
     )
-
-    last_block_reason: Optional[str] = None
-    last_block_log_ts = 0.0
 
     while True:
         try:
-            if not should_trade_now(tc):
+            n = unpick_stale_picks(engine, cfg)
+            if n:
+                LOG.info("auto_unpick | count=%s", n)
+
+            signals = fetch_new_signals(engine, cfg)
+            LOG.info("fetch_new_signals | fetched %s rows", len(signals))
+            if not signals:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            released = release_stale_picks(engine, cfg)
-            if released:
-                logger.warning("released_stale_picks | released=%s (ttl=%ss)", released, cfg.pick_ttl_seconds)
+            selected, stale_cnt = select_signals(engine, cfg, signals)
+            LOG.info(
+                "select_signals | fetched=%s | selected=%s | unique_symbol_side=%s%s",
+                len(signals), len(selected),
+                len({(str(s['symbol']).upper(), str(s['side']).lower()) for s in selected}),
+                f" | stale_skipped={stale_cnt}" if stale_cnt else ""
+            )
 
-            try:
-                upd = update_submitted_fills(engine, tc, cfg, lookback_minutes=180)
-                if upd:
-                    logger.info("updated_submitted_fills | updated=%s", upd)
-            except Exception:
-                logger.exception("update_submitted_fills error")
-
-            rows = fetch_unprocessed_signals(engine, cfg, limit=250)
-            logger.info("fetch_new_signals | fetched %s rows", len(rows))
-            if not rows:
+            if not selected:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            selected = select_signals(rows)
-            logger.info("select_signals | fetched=%s | selected=%s | unique_symbol_side=%s", len(rows), len(selected), len(selected))
+            if cfg.trading_paused or cfg.dry_run:
+                note = "paused" if cfg.trading_paused else "dry_run"
+                mark(engine, [int(s["id"]) for s in selected], "skipped", note)
+                for s in selected:
+                    LOG.info("skip | sid=%s %s %s | %s", s["id"], s["symbol"], s["side"], note)
+                time.sleep(cfg.poll_seconds)
+                continue
 
-            candidates: List[dict] = []
-            for s in selected:
+            last_ts = get_symbol_last_trade_ts(engine, cfg.symbols)
+            now = _now_utc()
+
+            pick(engine, [int(s["id"]) for s in selected])
+
+            for idx, s in enumerate(selected):
                 sid = int(s["id"])
-                symbol = str(s["symbol"]).upper()
-                side = parse_side(str(s["side"]))
+                sym = str(s["symbol"]).upper()
+                side_s = str(s["side"]).lower()
 
-                if side == "sell" and (cfg.long_only or not cfg.allow_short):
-                    mark_signal(engine, sid, "skipped", "short_disabled")
-                    logger.info("skip | sid=%s %s %s | short_disabled", sid, symbol, side)
+                if cfg.long_only and side_s != "buy":
+                    mark_one(engine, sid, "skipped", "long_only")
+                    LOG.info("skip | sid=%s %s %s | long_only", sid, sym, side_s)
                     continue
 
-                if in_symbol_cooldown(engine, cfg, symbol):
-                    mark_signal(engine, sid, "skipped", f"symbol_cooldown_{cfg.symbol_cooldown_seconds}s")
-                    logger.info("skip | sid=%s %s %s | symbol_cooldown_%ss", sid, symbol, side, cfg.symbol_cooldown_seconds)
+                if side_s == "sell" and not cfg.allow_short:
+                    mark_one(engine, sid, "skipped", "short_disabled")
+                    LOG.info("skip | sid=%s %s %s | short_disabled", sid, sym, side_s)
                     continue
 
-                candidates.append(s)
+                ts = last_ts.get(sym)
+                if ts is not None:
+                    t0 = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                    if (now - t0).total_seconds() < cfg.symbol_cooldown_seconds:
+                        mark_one(engine, sid, "skipped", f"symbol_cooldown_{cfg.symbol_cooldown_seconds}s")
+                        LOG.info("skip | sid=%s %s %s | symbol_cooldown_%ss", sid, sym, side_s, cfg.symbol_cooldown_seconds)
+                        continue
 
-            if not candidates:
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            blocked, reason = risk_guard_blocked(tc, cfg)
-            if blocked:
-                now_ts = time.time()
-                if reason != last_block_reason or (now_ts - last_block_log_ts) > 60:
-                    logger.warning("risk_guard | blocked new entries | %s", reason)
-                    last_block_reason = reason
-                    last_block_log_ts = now_ts
-                else:
-                    logger.info("risk_guard | blocked new entries | %s", reason)
-
-                for s in candidates:
-                    mark_signal(engine, int(s["id"]), "skipped", f"risk_guard:{reason.split()[0]}")
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            last_block_reason = None
-
-            ids = [int(s["id"]) for s in candidates]
-            mark_signals_picked(engine, ids)
-
-            for idx, s in enumerate(candidates):
-                sid = int(s["id"])
-                symbol = str(s["symbol"]).upper()
-                side = parse_side(str(s["side"]))
-                strength = float(s["strength"])
-
-                blocked_mid, reason_mid = risk_guard_blocked(tc, cfg)
-                if blocked_mid:
-                    remaining = [int(x["id"]) for x in candidates[idx:]]
-                    unpicked = unpick_signals(engine, remaining, f"unpicked_due_to_risk_guard:{reason_mid.split()[0]}")
-                    logger.warning("risk_guard | blocked mid-batch | %s | unpicked_remaining=%s", reason_mid, unpicked)
+                ok, reason = risk_guard(tc, cfg)
+                if not ok:
+                    remaining = len(selected) - idx
+                    LOG.warning("risk_guard | blocked mid-batch | %s | unpicked_remaining=%s", reason, remaining)
+                    ids = [int(x["id"]) for x in selected[idx:]]
+                    q = text(
+                        """
+                        UPDATE signals
+                        SET processed_at = NULL,
+                            processed_status = NULL,
+                            processed_note = :note
+                        WHERE id = ANY(:ids)
+                        """
+                    )
+                    with engine.begin() as conn:
+                        conn.execute(q, {"ids": ids, "note": f"unpicked_risk_guard:{reason}"})
                     break
 
-                alpaca_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+                side = OrderSide.BUY if side_s == "buy" else OrderSide.SELL
 
-                if has_recent_order(tc, symbol, alpaca_side, cfg.alpaca_dedupe_minutes):
-                    mark_signal(engine, sid, "skipped", f"dedupe_alpaca_{cfg.alpaca_dedupe_minutes}m")
-                    logger.info("skip | sid=%s %s %s | dedupe_alpaca_%sm", sid, symbol, side, cfg.alpaca_dedupe_minutes)
+                if _recent_alpaca_dedupe(tc, sym, side, cfg.alpaca_dedupe_minutes):
+                    mark_one(engine, sid, "skipped", f"dedupe_alpaca_{cfg.alpaca_dedupe_minutes}m")
+                    LOG.info("skip | sid=%s %s %s | dedupe_alpaca_%sm", sid, sym, side_s, cfg.alpaca_dedupe_minutes)
                     continue
 
-                try:
-                    px = get_latest_price(cfg, symbol)
-                except Exception as e:
-                    logger.exception("price fetch failed | sid=%s %s | %s", sid, symbol, e)
-                    mark_signal(engine, sid, "error", f"price_fetch_failed:{type(e).__name__}")
+                limit_price = _latest_trade_price(data, sym)
+                if limit_price is None:
+                    mark_one(engine, sid, "skipped", "no_price")
+                    LOG.warning("skip | sid=%s %s %s | no_price", sid, sym, side_s)
                     continue
 
-                limit_price = round(px, 2)
-                qty = size_qty(cfg, limit_price)
+                qty = _calc_qty(limit_price, cfg)
                 if qty <= 0:
-                    mark_signal(engine, sid, "skipped", "qty_zero")
-                    logger.info("skip | sid=%s %s %s | qty_zero", sid, symbol, side)
+                    mark_one(engine, sid, "skipped", "qty_zero_by_limits")
+                    LOG.info("skip | sid=%s %s %s | qty_zero_by_limits", sid, sym, side_s)
                     continue
 
                 if cfg.cancel_opposite_open_orders:
-                    canceled = cancel_opposite_open_orders(tc, symbol, alpaca_side)
-                    if canceled:
-                        logger.info("canceled_opposite_open_orders | %s | canceled=%s", symbol, canceled)
+                    _cancel_opposite_open_orders(tc, sym, side)
 
                 try:
-                    o = tc.submit_order(
-                        LimitOrderRequest(
-                            symbol=symbol,
-                            qty=qty,
-                            side=alpaca_side,
-                            time_in_force=TimeInForce.DAY,
-                            limit_price=limit_price,
-                        )
+                    alpaca_id = submit_limit(tc, sym, side, qty, limit_price)
+                    mark_one(engine, sid, "submitted", "order submitted")
+                    LOG.info(
+                        "submitted | sid=%s | %s %s qty=%s limit=%.2f | alpaca_id=%s",
+                        sid, sym, side_s, qty, round(limit_price, 2), alpaca_id
                     )
-                    mark_signal(engine, sid, "submitted", "submitted", alpaca_order_id=str(o.id))
-                    logger.info(
-                        "submitted | sid=%s | %s %s qty=%s limit=%.2f strength=%.4f | alpaca_id=%s",
-                        sid, symbol, side, qty, limit_price, strength, o.id
-                    )
+                    last_ts[sym] = _now_utc()
                 except Exception as e:
-                    logger.exception("submit_order failed | sid=%s %s %s | %s", sid, symbol, side, e)
-                    mark_signal(engine, sid, "error", f"submit_failed:{type(e).__name__}")
+                    mark_one(engine, sid, "error", f"submit_error:{type(e).__name__}")
+                    LOG.exception("submit failed | sid=%s %s %s | %s", sid, sym, side_s, e)
 
             time.sleep(cfg.poll_seconds)
 
-        except Exception:
-            logger.exception("signal_executor loop error")
-            time.sleep(cfg.poll_seconds)
+        except Exception as e:
+            LOG.exception("loop error: %s", e)
+            time.sleep(max(5, cfg.poll_seconds))
 
 
 if __name__ == "__main__":
