@@ -2,15 +2,15 @@
 import time
 import math
 import logging
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict, Any, Tuple, Set
 
 import requests
 from sqlalchemy import create_engine, text
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
+from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.trading.models import Order
 
 from services.market_gate import should_trade_now
@@ -39,6 +39,13 @@ def env_float(name: str, default: float = 0.0) -> float:
     if v is None or str(v).strip() == "":
         return default
     return float(str(v).strip())
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip() not in ("0", "false", "False", "no", "NO")
 
 
 def now_utc() -> datetime:
@@ -113,11 +120,12 @@ def get_latest_price(symbol: str) -> Optional[float]:
 
 
 def fetch_unprocessed_signals(engine, portfolio_id: int, symbols: List[str], min_strength: float, limit: int = 50):
+    # ✅ Source of truth = processed_at. (Prevents loops if processed_status is left NULL by older code/manual updates.)
     sql = text(
         """
         SELECT id, created_at, symbol, side, strength
         FROM signals
-        WHERE processed_status IS NULL
+        WHERE processed_at IS NULL
           AND portfolio_id = :pid
           AND symbol = ANY(:symbols)
           AND strength >= :min_strength
@@ -140,11 +148,9 @@ def fetch_unprocessed_signals(engine, portfolio_id: int, symbols: List[str], min
 
 
 def mark_signal(engine, signal_id: int, status: str, note: str, alpaca_order_id=None) -> None:
-    # Alpaca SDK may return UUID objects; DB column is TEXT in our schema.
     if alpaca_order_id is not None:
         alpaca_order_id = str(alpaca_order_id)
 
-    # Support both styles: some older code used param name 'oid' in SQL params
     sql = text("""
         UPDATE signals
         SET processed_status = :status,
@@ -155,6 +161,28 @@ def mark_signal(engine, signal_id: int, status: str, note: str, alpaca_order_id=
     """)
     with engine.begin() as conn:
         conn.execute(sql, {"status": status, "note": note, "oid": alpaca_order_id, "id": signal_id})
+
+
+def mark_signals_picked(engine, ids: List[int]) -> Set[int]:
+    """
+    ✅ Atomically mark selected signals as picked (only if not yet processed).
+    Returns the set of IDs that were successfully picked.
+    """
+    if not ids:
+        return set()
+
+    sql = text("""
+        UPDATE signals
+        SET processed_status = 'picked',
+            processed_note = 'picked',
+            processed_at = NOW()
+        WHERE id = ANY(:ids)
+          AND processed_at IS NULL
+        RETURNING id
+    """)
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {"ids": ids}).fetchall()
+    return {int(r[0]) for r in rows}
 
 
 def select_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -176,6 +204,61 @@ def select_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return selected
 
 
+def alpaca_dedupe_exists(tc: TradingClient, symbol: str, alpaca_side: OrderSide, lookback_minutes: int, limit: int = 200) -> bool:
+    """
+    Checks if Alpaca has a recent order for (symbol, side) within lookback window.
+    This prevents repeated submits even if DB state lags.
+    """
+    try:
+        orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit))
+    except Exception as e:
+        logger.debug("alpaca_dedupe_exists | get_orders failed | %s", e)
+        return False
+
+    cutoff = now_utc() - timedelta(minutes=lookback_minutes)
+    for o in orders:
+        try:
+            if str(o.symbol).upper() != symbol:
+                continue
+            if o.side != alpaca_side:
+                continue
+            if o.submitted_at is None:
+                continue
+            ts = o.submitted_at
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts >= cutoff:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def cancel_opposite_open_orders(tc: TradingClient, symbol: str, alpaca_side: OrderSide, limit: int = 500) -> int:
+    """
+    Cancels OPEN orders on the same symbol but opposite side.
+    Helps avoid accidental self-cross / conflicts.
+    """
+    try:
+        open_orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=limit))
+    except Exception as e:
+        logger.debug("cancel_opposite_open_orders | get_orders failed | %s", e)
+        return 0
+
+    canceled = 0
+    for o in open_orders:
+        try:
+            if str(o.symbol).upper() != symbol:
+                continue
+            if o.side == alpaca_side:
+                continue
+            tc.cancel_order_by_id(o.id)
+            canceled += 1
+        except Exception:
+            continue
+    return canceled
+
+
 def main():
     # ---- config ----
     api_key = env_str("ALPACA_API_KEY")
@@ -195,14 +278,13 @@ def main():
     allow_short = env_str("ALLOW_SHORT", "1") != "0"
     long_only = env_str("LONG_ONLY", "0") != "0"
 
-    tp_atr_mult = env_float("TP_ATR_MULT", 1.0)
-    sl_atr_mult = env_float("SL_ATR_MULT", 1.0)
+    # Safety toggles
+    alpaca_dedupe_minutes = env_int("ALPACA_DEDUPE_MINUTES", 10)
+    cancel_opposite = env_bool("CANCEL_OPPOSITE_OPEN_ORDERS", True)
 
     # DB URL + engine
     db_url = env_str("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
-    # tolerate SQLAlchemy-style URLs in env (postgresql+psycopg2://...) as well as plain psycopg2 DSNs
     db_url = db_url.replace("postgresql+psycopg2://", "postgresql://")
-
     engine = create_engine(db_url, pool_pre_ping=True)
 
     # Alpaca client
@@ -210,7 +292,8 @@ def main():
 
     logger.info(
         "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
-        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | TP_ATR_MULT=%.2f | SL_ATR_MULT=%.2f",
+        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | "
+        "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s",
         min_strength,
         symbols,
         portfolio_id,
@@ -219,14 +302,13 @@ def main():
         long_only,
         max_notional,
         max_qty,
-        tp_atr_mult,
-        sl_atr_mult,
+        alpaca_dedupe_minutes,
+        cancel_opposite,
     )
 
     # ---- loop ----
     while True:
         try:
-            # ✅ MARKET GATE (no trades when closed / too close to close)
             ok, reason, clock = should_trade_now(stop_new_entries_min_before_close)
             if not ok:
                 logger.info(
@@ -249,6 +331,15 @@ def main():
             # 2) dedupe batch
             signals = select_signals(signals)
 
+            # ✅ 2.5) pre-mark as picked (atomic) so they cannot loop
+            ids = [int(s["id"]) for s in signals]
+            picked_ids = mark_signals_picked(engine, ids)
+            signals = [s for s in signals if int(s["id"]) in picked_ids]
+            if not signals:
+                logger.info("picked | none (already processed/picked)")
+                time.sleep(poll_seconds)
+                continue
+
             # 3) execute each
             for s in signals:
                 sid = int(s["id"])
@@ -257,27 +348,41 @@ def main():
 
                 if long_only and side == "sell":
                     mark_signal(engine, sid, "skipped", "long_only")
+                    logger.info("skip | sid=%s %s %s | long_only", sid, symbol, side)
                     continue
                 if (not allow_short) and side == "sell":
                     mark_signal(engine, sid, "skipped", "short_disabled")
+                    logger.info("skip | sid=%s %s %s | short_disabled", sid, symbol, side)
                     continue
 
                 # latest price for limit calc / sanity
                 px = get_latest_price(symbol)
                 if px is None or not math.isfinite(px) or px <= 0:
                     mark_signal(engine, sid, "skipped", "no_limit_price")
+                    logger.info("skip | sid=%s %s %s | no_limit_price", sid, symbol, side)
                     continue
 
                 # sizing (simple fixed caps)
                 qty = max(1, min(max_qty, int(max_notional // px)))
                 if qty <= 0:
                     mark_signal(engine, sid, "skipped", "qty_zero")
+                    logger.info("skip | sid=%s %s %s | qty_zero", sid, symbol, side)
                     continue
 
                 alpaca_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
-
-                # entry order: limit near current (simple; you can later improve with ATR)
                 limit_price = round(px, 2)
+
+                # ✅ Alpaca-side dedupe
+                if alpaca_dedupe_minutes > 0 and alpaca_dedupe_exists(tc, symbol, alpaca_side, alpaca_dedupe_minutes):
+                    mark_signal(engine, sid, "skipped", f"dedupe_alpaca_{alpaca_dedupe_minutes}m")
+                    logger.info("skip | sid=%s %s %s | dedupe_alpaca_%sm", sid, symbol, side, alpaca_dedupe_minutes)
+                    continue
+
+                # ✅ cancel opposite open orders (optional)
+                if cancel_opposite:
+                    canceled = cancel_opposite_open_orders(tc, symbol, alpaca_side)
+                    if canceled:
+                        logger.info("canceled_opposite_open_orders | %s | canceled=%s", symbol, canceled)
 
                 try:
                     req = LimitOrderRequest(
@@ -288,10 +393,11 @@ def main():
                         limit_price=limit_price,
                     )
                     o: Order = tc.submit_order(req)
-                    mark_signal(engine, sid, "submitted", f"limit={limit_price}", alpaca_order_id=o.id)
+                    mark_signal(engine, sid, "submitted", f"limit={limit_price} qty={qty}", alpaca_order_id=o.id)
+                    logger.info("submitted | sid=%s | %s %s qty=%s limit=%s | alpaca_id=%s", sid, symbol, side, qty, limit_price, o.id)
 
                 except Exception as e:
-                    logger.exception("submit_order failed | %s %s qty=%s px=%s", symbol, side, qty, limit_price)
+                    logger.exception("submit_order failed | sid=%s | %s %s qty=%s px=%s | %s", sid, symbol, side, qty, limit_price, e)
                     mark_signal(engine, sid, "error", f"submit_failed:{type(e).__name__}")
 
             time.sleep(poll_seconds)
