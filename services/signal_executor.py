@@ -124,6 +124,9 @@ def get_latest_price(symbol: str) -> Optional[float]:
 
 # -----------------------------
 # DB: signals (source of truth = processed_at)
+# IMPORTANT CHANGE:
+# - we treat "picked" as a transient lock WITHOUT setting processed_at
+# - therefore "unprocessed" means processed_at IS NULL AND processed_status IS NULL
 # -----------------------------
 def fetch_unprocessed_signals(engine, portfolio_id: int, symbols: List[str], min_strength: float, limit: int = 50):
     sql = text(
@@ -131,6 +134,7 @@ def fetch_unprocessed_signals(engine, portfolio_id: int, symbols: List[str], min
         SELECT id, created_at, symbol, side, strength
         FROM signals
         WHERE processed_at IS NULL
+          AND processed_status IS NULL
           AND portfolio_id = :pid
           AND symbol = ANY(:symbols)
           AND strength >= :min_strength
@@ -167,7 +171,8 @@ def mark_signal(engine, signal_id: int, status: str, note: str, alpaca_order_id=
 
 def mark_signals_picked(engine, ids: List[int]) -> Set[int]:
     """
-    Atomically mark selected signals as picked (only if not yet processed).
+    Atomically lock selected signals as 'picked' WITHOUT setting processed_at.
+    This prevents the 'picked forever' bug and keeps processed_at as the true "done" flag.
     Returns IDs that were successfully picked.
     """
     if not ids:
@@ -177,16 +182,59 @@ def mark_signals_picked(engine, ids: List[int]) -> Set[int]:
         """
         UPDATE signals
         SET processed_status = 'picked',
-            processed_note   = 'picked',
-            processed_at     = NOW()
+            processed_note   = 'picked'
         WHERE id = ANY(:ids)
           AND processed_at IS NULL
+          AND processed_status IS NULL
         RETURNING id
         """
     )
     with engine.begin() as conn:
         rows = conn.execute(sql, {"ids": ids}).fetchall()
     return {int(r[0]) for r in rows}
+
+
+def unpick_signals(engine, ids: List[int], note: str = "unpicked") -> int:
+    """
+    Releases 'picked' locks so the signals can be processed later.
+    """
+    if not ids:
+        return 0
+    sql = text(
+        """
+        UPDATE signals
+        SET processed_status = NULL,
+            processed_note   = :note
+        WHERE id = ANY(:ids)
+          AND processed_at IS NULL
+          AND processed_status = 'picked'
+        """
+    )
+    with engine.begin() as conn:
+        res = conn.execute(sql, {"ids": ids, "note": note})
+    return int(res.rowcount or 0)
+
+
+def release_stale_picks(engine, ttl_seconds: int) -> int:
+    """
+    Safety net: if executor crashes, 'picked' can remain locked.
+    We release old picks based on age (now - created_at).
+    """
+    if ttl_seconds <= 0:
+        return 0
+    sql = text(
+        """
+        UPDATE signals
+        SET processed_status = NULL,
+            processed_note   = 'picked_ttl_released'
+        WHERE processed_at IS NULL
+          AND processed_status = 'picked'
+          AND created_at < NOW() - (:ttl || ' seconds')::interval
+        """
+    )
+    with engine.begin() as conn:
+        res = conn.execute(sql, {"ttl": int(ttl_seconds)})
+    return int(res.rowcount or 0)
 
 
 def select_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -371,10 +419,15 @@ def risk_guard_allows_new_entries(
 
     return True, "ok"
 
+
+# -----------------------------
+# Symbol cooldown (DB-based)
+# -----------------------------
 def in_symbol_cooldown(engine, portfolio_id: int, symbol: str, cooldown_seconds: int) -> bool:
     if cooldown_seconds <= 0:
         return False
-    sql = text("""
+    sql = text(
+        """
         SELECT 1
         FROM signals
         WHERE portfolio_id = :pid
@@ -383,7 +436,8 @@ def in_symbol_cooldown(engine, portfolio_id: int, symbol: str, cooldown_seconds:
           AND processed_at >= NOW() - (:cd || ' seconds')::interval
           AND processed_status IN ('submitted','filled')
         LIMIT 1
-    """)
+        """
+    )
     with engine.connect() as conn:
         row = conn.execute(sql, {"pid": portfolio_id, "sym": symbol, "cd": int(cooldown_seconds)}).fetchone()
     return row is not None
@@ -432,6 +486,14 @@ def main():
     max_daily_loss_usd = env_float("MAX_DAILY_LOSS_USD", 0.0)   # optional absolute USD stop
     enable_daily_guard = env_bool("ENABLE_DAILY_RISK_GUARD", True)  # if you keep 0 in env, it disables
 
+    # Symbol cooldown seconds:
+    # - prefer SYMBOL_COOLDOWN_SECONDS if set
+    # - fallback to your existing INSUFFICIENT_COOLDOWN_SECONDS (you already have 900)
+    symbol_cooldown_seconds = env_int("SYMBOL_COOLDOWN_SECONDS", env_int("INSUFFICIENT_COOLDOWN_SECONDS", 0))
+
+    # Pick TTL release safety net (default 120s)
+    pick_ttl_seconds = env_int("PICK_TTL_SECONDS", 120)
+
     # DB URL + engine
     db_url = env_str("DB_URL", "postgresql://postgres:postgres@postgres:5432/trader")
     db_url = db_url.replace("postgresql+psycopg2://", "postgresql://")
@@ -447,7 +509,8 @@ def main():
         "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
         "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | "
         "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | "
-        "MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%s | MAX_DAILY_LOSS_USD=%s | ENABLE_DAILY_RISK_GUARD=%s",
+        "MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%s | MAX_DAILY_LOSS_USD=%s | ENABLE_DAILY_RISK_GUARD=%s | "
+        "SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s",
         min_strength,
         symbols,
         portfolio_id,
@@ -463,6 +526,8 @@ def main():
         daily_loss_stop_pct,
         max_daily_loss_usd,
         enable_daily_guard,
+        symbol_cooldown_seconds,
+        pick_ttl_seconds,
     )
 
     # ---- loop ----
@@ -481,6 +546,11 @@ def main():
                 time.sleep(poll_seconds)
                 continue
 
+            # Release stale "picked" locks (crash safety)
+            released = release_stale_picks(engine, pick_ttl_seconds)
+            if released:
+                logger.warning("picked_ttl | released=%s", released)
+
             # GLOBAL RISK GUARD (do not even fetch signals if capacity/stop hit)
             if enable_daily_guard:
                 allowed, why = risk_guard_allows_new_entries(
@@ -496,7 +566,7 @@ def main():
                     time.sleep(poll_seconds)
                     continue
 
-            # 1) fetch signals
+            # 1) fetch signals (only truly unprocessed & unpicked)
             signals = fetch_unprocessed_signals(engine, portfolio_id, symbols, min_strength, limit=50)
             if not signals:
                 time.sleep(poll_seconds)
@@ -505,7 +575,7 @@ def main():
             # 2) dedupe batch
             signals = select_signals(signals)
 
-            # 2.5) pre-mark as picked (atomic) so they cannot loop
+            # 2.5) lock as picked (atomic)
             ids = [int(s["id"]) for s in signals]
             picked_ids = mark_signals_picked(engine, ids)
             signals = [s for s in signals if int(s["id"]) in picked_ids]
@@ -515,12 +585,12 @@ def main():
                 continue
 
             # 3) execute each
-            for s in signals:
+            for idx, s in enumerate(signals):
                 sid = int(s["id"])
                 symbol = str(s["symbol"]).upper()
                 side = str(s["side"]).lower().strip()
 
-                # Re-check risk guard per-signal (so we stop mid-batch if we hit cap)
+                # Re-check risk guard per-signal (stop mid-batch if we hit cap)
                 if enable_daily_guard:
                     allowed, why = risk_guard_allows_new_entries(
                         engine=engine,
@@ -531,8 +601,10 @@ def main():
                         max_daily_loss_usd=max_daily_loss_usd,
                     )
                     if not allowed:
-                        # do NOT skip/mark signals; keep them unprocessed for later
-                        logger.warning("risk_guard | blocked mid-batch | %s", why)
+                        # IMPORTANT: unpick the remaining signals so they can run later
+                        remaining_ids = [int(x["id"]) for x in signals[idx:]]
+                        released_n = unpick_signals(engine, remaining_ids, note=f"unpicked_due_to_risk_guard:{why}")
+                        logger.warning("risk_guard | blocked mid-batch | %s | unpicked_remaining=%s", why, released_n)
                         break
 
                 if long_only and side == "sell":
@@ -542,6 +614,13 @@ def main():
                 if (not allow_short) and side == "sell":
                     mark_signal(engine, sid, "skipped", "short_disabled")
                     logger.info("skip | sid=%s %s %s | short_disabled", sid, symbol, side)
+                    continue
+
+                # Symbol cooldown (DB-based)
+                if in_symbol_cooldown(engine, portfolio_id, symbol, symbol_cooldown_seconds):
+                    note = cooldown_reason(symbol_cooldown_seconds)
+                    mark_signal(engine, sid, "skipped", note)
+                    logger.info("skip | sid=%s %s %s | %s", sid, symbol, side, note)
                     continue
 
                 # latest price for limit calc / sanity
