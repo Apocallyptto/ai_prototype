@@ -1,8 +1,10 @@
 # services/alpaca_exit_guard.py
+from __future__ import annotations
+
 import os
 import time
 import logging
-from typing import List, Optional
+from typing import List, Optional, Iterable
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -13,201 +15,206 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import (
     QueryOrderStatus,
+    OrderClass,
     OrderSide,
     TimeInForce,
-    OrderClass,
 )
 
-log = logging.getLogger("alpaca_exit_guard")
+log = logging.getLogger(__name__)
 
 
-# ----------------------------
+# -------------------------
 # Helper: Trading client
-# ----------------------------
-def get_trading_client(*, paper: Optional[bool] = None) -> TradingClient:
+# -------------------------
+def get_trading_client() -> TradingClient:
     """
-    Central factory for TradingClient so services can share the same logic.
-    Defaults to PAPER unless explicitly overridden.
-
-    Env fallback:
-      ALPACA_PAPER=true/false (optional)
+    Centralized Alpaca TradingClient creator (paper by default).
+    Env:
+      ALPACA_API_KEY
+      ALPACA_API_SECRET
+      ALPACA_PAPER=true/false (default true)
     """
     key = os.getenv("ALPACA_API_KEY")
-    sec = os.getenv("ALPACA_API_SECRET")
-    if not key or not sec:
-        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET in environment.")
+    secret = os.getenv("ALPACA_API_SECRET")
+    if not key or not secret:
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET in env")
 
-    if paper is None:
-        paper_env = (os.getenv("ALPACA_PAPER") or "true").strip().lower()
-        paper = paper_env in ("1", "true", "yes", "y", "on")
+    paper_raw = (os.getenv("ALPACA_PAPER") or "true").strip().lower()
+    paper = paper_raw not in ("0", "false", "no", "off")
 
-    return TradingClient(key, sec, paper=paper)
+    return TradingClient(key, secret, paper=paper)
 
 
-# ----------------------------
-# Helper: orders fetch (nested compatible)
-# ----------------------------
-def _get_orders(tc: TradingClient, *, status: QueryOrderStatus, limit: int = 500, nested: bool = True):
+# -------------------------
+# Internal helpers
+# -------------------------
+def _get_open_orders(tc: TradingClient) -> list:
     """
-    Some alpaca-py versions support nested=True, some don't.
-    This helper tries nested first, then falls back.
+    Return OPEN orders. Try nested=True if supported by alpaca-py version.
     """
-    if nested:
-        try:
-            return tc.get_orders(GetOrdersRequest(status=status, limit=limit, nested=True)) or []
-        except TypeError:
-            return tc.get_orders(GetOrdersRequest(status=status, limit=limit)) or []
-    return tc.get_orders(GetOrdersRequest(status=status, limit=limit)) or []
+    try:
+        return tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True)) or []
+    except TypeError:
+        return tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)) or []
 
 
-def _exit_side_for_qty(qty: float) -> OrderSide:
-    # qty > 0 => long => exit is SELL
-    # qty < 0 => short => exit is BUY
+def _iter_orders_and_legs(orders: list) -> Iterable:
+    """
+    Yield each order and its legs (if present) as flat stream.
+    """
+    for o in orders or []:
+        yield o
+        for leg in (getattr(o, "legs", None) or []):
+            yield leg
+
+
+def _is_exit_order(o) -> bool:
+    """
+    Our exits are OCO orders (parent or leg). So: order_class == OCO.
+    """
+    oc = getattr(o, "order_class", None)
+    return oc == OrderClass.OCO
+
+
+def _close_side_from_qty(qty: float) -> OrderSide:
+    """
+    Long qty>0 -> close via SELL
+    Short qty<0 -> close via BUY
+    """
     return OrderSide.SELL if qty > 0 else OrderSide.BUY
 
 
-def _is_exit_oco_order(o, exit_side: OrderSide) -> bool:
+# -------------------------
+# Public API used by oco_exit_monitor
+# -------------------------
+def has_exit_orders(tc: TradingClient, symbol: str, qty: Optional[float] = None) -> bool:
     """
-    Treat any OPEN OCO on the correct side as "exit order exists".
-    With nested=True, parent contains legs; with nested=False, we may only see parent.
+    MUST be compatible with calls:
+      has_exit_orders(tc, symbol)
+      has_exit_orders(tc, symbol, qty)
+
+    We detect any OPEN OCO order on that symbol (parent or leg).
+    qty is optional (kept for backwards-compatibility / future logic).
     """
-    if getattr(o, "order_class", None) != OrderClass.OCO:
+    sym = (symbol or "").upper().strip()
+    if not sym:
         return False
-    if getattr(o, "side", None) != exit_side:
-        return False
-    # Parent LIMIT with TP price is typical; stop leg is HELD.
-    return True
 
+    open_orders = _get_open_orders(tc)
 
-# ----------------------------
-# REQUIRED by oco_exit_monitor.py
-# ----------------------------
-def has_exit_orders(tc: TradingClient, symbol: str, qty: float) -> bool:
-    """
-    True if there is already an OPEN OCO exit order for this symbol and position side.
-    Signature matches oco_exit_monitor: (tc, symbol, qty)
-    """
-    sym = (symbol or "").upper()
-    exit_side = _exit_side_for_qty(float(qty))
-
-    open_orders = _get_orders(tc, status=QueryOrderStatus.OPEN, limit=500, nested=True)
-
-    for o in open_orders:
+    for o in _iter_orders_and_legs(open_orders):
         if str(getattr(o, "symbol", "")).upper() != sym:
             continue
-
-        # If nested=True, OCO should appear as parent with legs (or as OCO items depending on API response).
-        if _is_exit_oco_order(o, exit_side):
+        if _is_exit_order(o):
             return True
-
-        # Defensive: sometimes legs can appear; if so, also accept them as "exit exists"
-        for leg in (getattr(o, "legs", None) or []):
-            if str(getattr(leg, "symbol", "")).upper() != sym:
-                continue
-            if _is_exit_oco_order(leg, exit_side):
-                return True
 
     return False
 
 
-def list_non_exit_closing_orders(tc: TradingClient, symbol: str, qty: float) -> List[str]:
+def list_non_exit_closing_orders(tc: TradingClient, symbol: str, qty: Optional[float] = None) -> List:
     """
-    Returns IDs of OPEN orders that are "closing" this position (same exit side)
-    BUT are NOT the OCO exit orders we want to keep.
+    Return OPEN orders that would CLOSE/consume the position qty but are NOT our exit OCO.
 
-    Signature matches oco_exit_monitor: (tc, symbol, qty)
+    MUST be compatible with calls:
+      list_non_exit_closing_orders(tc, symbol, qty)
+      list_non_exit_closing_orders(tc, symbol)
+
+    If qty is None, we conservatively return any non-exit OPEN orders on the symbol.
     """
-    sym = (symbol or "").upper()
-    exit_side = _exit_side_for_qty(float(qty))
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return []
 
-    open_orders = _get_orders(tc, status=QueryOrderStatus.OPEN, limit=500, nested=True)
+    open_orders = _get_open_orders(tc)
 
-    ids: List[str] = []
-    for o in open_orders:
+    # Determine which side would close the position.
+    closing_side: Optional[OrderSide] = None
+    if qty is not None:
+        try:
+            closing_side = _close_side_from_qty(float(qty))
+        except Exception:
+            closing_side = None
+
+    res: List = []
+    for o in _iter_orders_and_legs(open_orders):
         if str(getattr(o, "symbol", "")).upper() != sym:
             continue
 
-        side = getattr(o, "side", None)
-        if side != exit_side:
-            # not a closing order for this position
+        # ignore our exits
+        if _is_exit_order(o):
             continue
 
-        # KEEP any OCO (parent or leg) for this symbol/side
-        if getattr(o, "order_class", None) == OrderClass.OCO:
-            continue
+        # if qty known: only orders that close the position side
+        if closing_side is not None:
+            if getattr(o, "side", None) != closing_side:
+                continue
 
-        # Sometimes legs might appear separately; if they are OCO, keep them too
-        parent_id = getattr(o, "parent_order_id", None)
-        if parent_id and getattr(o, "order_class", None) == OrderClass.OCO:
-            continue
+        res.append(o)
 
-        oid = getattr(o, "id", None)
-        if oid:
-            ids.append(str(oid))
-
-    return ids
+    return res
 
 
-def place_exit_oco(
-    tc: TradingClient,
-    symbol: str,
-    qty: float,
-    tp_price: float,
-    sl_price: float,
-    tif: str = "day",
-):
+def place_exit_oco(tc: TradingClient, symbol: str, qty: float, tp: float, sl: float) -> str:
     """
-    Submit an OCO exit:
-      - Parent LIMIT (take profit)
-      - stop_loss leg
+    Create EXIT OCO for the position:
+      - take_profit.limit_price = tp
+      - stop_loss.stop_price = sl
 
-    IMPORTANT: Alpaca requires take_profit.limit_price for OCO.
-    We provide BOTH limit_price and take_profit.limit_price (works with their API behavior you saw).
+    IMPORTANT:
+    Alpaca requires for OCO:
+      - it must be a LIMIT parent order
+      - take_profit.limit_price must be present
+    We therefore submit LimitOrderRequest with BOTH:
+      limit_price=tp AND take_profit=TakeProfitRequest(limit_price=tp)
+    (redundant but it’s what Alpaca accepts reliably)
+
+    Returns submitted order id (string).
     """
-    sym = (symbol or "").upper()
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise ValueError("symbol empty")
+
     q = float(qty)
+    if q == 0:
+        raise ValueError("qty is 0")
+
     qty_abs = int(abs(q))
     if qty_abs <= 0:
-        raise ValueError(f"place_exit_oco: qty_abs <= 0 for {sym}: qty={qty}")
+        raise ValueError(f"qty_abs invalid: {qty}")
 
-    exit_side = _exit_side_for_qty(q)
+    exit_side = _close_side_from_qty(q)
 
-    tif_enum = TimeInForce.DAY if str(tif).lower() == "day" else TimeInForce.GTC
+    tp = round(float(tp), 2)
+    sl = round(float(sl), 2)
 
     req = LimitOrderRequest(
         symbol=sym,
         qty=qty_abs,
         side=exit_side,
-        time_in_force=tif_enum,
+        time_in_force=TimeInForce.DAY,
         order_class=OrderClass.OCO,
-        limit_price=float(tp_price),
-        take_profit=TakeProfitRequest(limit_price=float(tp_price)),
-        stop_loss=StopLossRequest(stop_price=float(sl_price)),
+        limit_price=tp,  # parent limit (Alpaca wants limit)
+        take_profit=TakeProfitRequest(limit_price=tp),  # REQUIRED by Alpaca for OCO
+        stop_loss=StopLossRequest(stop_price=sl),
     )
-    return tc.submit_order(req)
+
+    o = tc.submit_order(req)
+    oid = str(getattr(o, "id", "") or "")
+    if not oid:
+        raise RuntimeError("submit_order returned empty id")
+    return oid
 
 
-# (Optional helpers – not required by oco_exit_monitor, but handy)
-def cancel_open_orders_for_symbol(tc: TradingClient, symbol: str) -> int:
-    sym = (symbol or "").upper()
-    open_orders = _get_orders(tc, status=QueryOrderStatus.OPEN, limit=500, nested=False)
-    n = 0
-    for o in open_orders:
-        if str(getattr(o, "symbol", "")).upper() != sym:
-            continue
-        oid = getattr(o, "id", None)
-        if oid:
-            tc.cancel_order_by_id(oid)
-            n += 1
-    return n
-
-
-def wait_until_no_open_orders(tc: TradingClient, symbol: str, timeout_sec: float = 15.0, poll_sec: float = 0.5) -> bool:
-    sym = (symbol or "").upper()
-    deadline = time.time() + float(timeout_sec)
+# -------------------------
+# Optional: small utility (not required by monitor, but handy)
+# -------------------------
+def wait_until_no_open_exit_orders(tc: TradingClient, symbol: str, timeout_s: int = 20) -> bool:
+    """
+    Wait a bit until there are no OPEN OCO orders for symbol.
+    """
+    deadline = time.time() + timeout_s
     while time.time() < deadline:
-        open_orders = _get_orders(tc, status=QueryOrderStatus.OPEN, limit=500, nested=False)
-        if not any(str(getattr(o, "symbol", "")).upper() == sym for o in open_orders):
+        if not has_exit_orders(tc, symbol):
             return True
-        time.sleep(float(poll_sec))
+        time.sleep(0.5)
     return False
