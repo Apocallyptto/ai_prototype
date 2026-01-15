@@ -1,0 +1,27 @@
+[35mdb/init_neon.sql[m[36m:[m[32m50[m[36m:[m  ADD COLUMN IF NOT EXISTS [1;31morder_class[m       TEXT,
+[35mdb/migrations/2025_10_22__normalize.sql[m[36m:[m[32m40[m[36m:[m  ADD COLUMN IF NOT EXISTS [1;31morder_class[m       TEXT,
+[35mjobs/healthcheck.py[m[36m:[m[32m39[m[36m:[m        "public.orders":  ["id","client_order_id","symbol","side","[1;31morder_class[m","created_at"],
+[35mjobs/manage_stale_orders.py[m[36m:[m[32m52[m[36m:[m            if (str(getattr(o, "[1;31morder_class[m", "")).lower() != "bracket") or getattr(o, "parent_order_id", None):
+[35mservices/alpaca_exit_guard.py[m[36m:[m[32m68[m[36m:[m    True if order looks like an exit bracket/OCO (has [1;31morder_class[m OCO/BRACKET or legs).
+[35mservices/alpaca_exit_guard.py[m[36m:[m[32m70[m[36m:[m    oc = getattr(order, "[1;31morder_class[m", None)
+[35mservices/alpaca_exit_guard.py[m[36m:[m[32m150[m[36m:[m        [1;31morder_class[m=OrderClass.OCO,
+[35mservices/bracket_helper.py[m[36m:[m[32m146[m[36m:[m        [1;31morder_class[m=OrderClass.BRACKET,
+[35mservices/executor_bracket.py[m[36m:[m[32m145[m[36m:[m        [1;31morder_class[m="bracket",
+[35mservices/order_router.py[m[36m:[m[32m202[m[36m:[m                                    [1;31morder_class[m="bracket", extended_hours=False)
+[35mservices/order_router.py[m[36m:[m[32m206[m[36m:[m                                     [1;31morder_class[m="bracket", extended_hours=False)
+[35mservices/reprice_stale.py[m[36m:[m[32m67[m[36m:[m        if o.[1;31morder_class[m not in (OrderClass.SIMPLE, OrderClass.BRACKET):
+[35mservices/risk_budget.py[m[36m:[m[32m119[m[36m:[m        parent = getattr(o, "[1;31morder_class[m", "") in ("bracket", "oco", "otoco") or getattr(o, "parent_order_id", None) is None
+[35mservices/trailing_stop.py[m[36m:[m[32m41[m[36m:[m        if o.get("symbol") == symbol and o.get("[1;31morder_class[m") == "bracket":
+[35mtools/cancel_all_open_parents.py[m[36m:[m[32m24[m[36m:[m    # only cancel parent orders (have [1;31morder_class[m == 'bracket' and no parent_id)
+[35mtools/cancel_all_open_parents.py[m[36m:[m[32m25[m[36m:[m    parents = [o for o in orders if o.get("[1;31morder_class[m") == "bracket" and not o.get("parent_order_id")]
+[35mtools/cancel_symbol_orders.py[m[36m:[m[32m30[m[36m:[m        log(f"Cancel {symbol} order {oid} ({o.get('type')}/{o.get('[1;31morder_class[m')}, qty={o.get('qty')})")
+[35mtools/diagnose_atr_brackets.py[m[36m:[m[32m40[m[36m:[m    parents = [o for o in orders if o.get("[1;31morder_class[m") == "bracket" and not o.get("parent_order_id")]
+[35mtools/ensure_exits_now.py[m[36m:[m[32m67[m[36m:[m        if getattr(o, "[1;31morder_class[m", None) == OrderClass.OCO:
+[35mtools/ensure_exits_now.py[m[36m:[m[32m191[m[36m:[m            [1;31morder_class[m=OrderClass.OCO,
+[35mtools/ensure_exits_now.py[m[36m:[m[32m198[m[36m:[m    print("OCO submitted:", oco.id, "status:", oco.status, "[1;31morder_class[m:", oco.[1;31morder_class[m)
+[35mtools/init_or_migrate_orders.py[m[36m:[m[32m21[m[36m:[m    [1;31morder_class[m      text,
+[35mtools/init_or_migrate_orders.py[m[36m:[m[32m47[m[36m:[m    "[1;31morder_class[m":      "text",
+[35mtools/init_orders_db.py[m[36m:[m[32m19[m[36m:[m    [1;31morder_class[m     TEXT,                          -- bracket/oto/oco/...
+[35mtools/list_open_orders.py[m[36m:[m[32m26[m[36m:[m    oclass = o.get("[1;31morder_class[m")
+[35mtools/place_tp.py[m[36m:[m[32m98[m[36m:[m        [1;31morder_class[m=OrderClass.SIMPLE # simple fractional limit
+[35mtools/sync_orders.py[m[36m:[m[32m43[m[36m:[m    Alpaca SDK often returns enums for fields like status/[1;31morder_class[m.
