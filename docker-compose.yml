@@ -45,7 +45,7 @@ services:
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.75}"
       CRON_SLEEP_SECONDS: "${MAKER_SLEEP_SECONDS:-180}"
-    command: sh -lc "python -m jobs.make_signals_ml"
+    command: sh -lc "python -u -m jobs.make_signals_ml"
     restart: always
 
   signal_executor:
@@ -63,7 +63,7 @@ services:
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
       POLL_SECONDS: "${EXEC_POLL_SECONDS:-20}"
-    command: sh -lc "python -m services.signal_executor"
+    command: sh -lc "python -u -m services.signal_executor"
     restart: always
 
   oco_exit_monitor:
@@ -79,7 +79,32 @@ services:
     env_file: .env
     environment:
       PYTHONPATH: "/app"
-    command: sh -lc "python -m services.oco_exit_monitor"
+      POLL_SECONDS: "${OCO_POLL_SECONDS:-5}"
+      HEARTBEAT_SECONDS: "${OCO_HEARTBEAT_SECONDS:-60}"
+    command: sh -lc "python -u -m services.oco_exit_monitor"
+    restart: always
+
+  # ✅ NEW: stale limit repricer worker
+  reprice_stale:
+    build:
+      context: .
+    image: ai_prototype-reprice_stale
+    container_name: trader_reprice_stale
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db_init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      PYTHONPATH: "/app"
+      REPRICE_STALE_SECONDS: "${REPRICE_STALE_SECONDS:-45}"
+      REPRICE_CANCEL_AFTER_SECONDS: "${REPRICE_CANCEL_AFTER_SECONDS:-300}"
+      REPRICE_MAX_SPREAD_PCT: "${REPRICE_MAX_SPREAD_PCT:-0.40}"
+      REPRICE_MIN_ABS_MOVE: "${REPRICE_MIN_ABS_MOVE:-0.01}"
+      REPRICE_LOOP_SLEEP_SECS: "${REPRICE_LOOP_SLEEP_SECS:-2}"
+      REPRICE_MAX_REPRICES_PER_ORDER: "${REPRICE_MAX_REPRICES_PER_ORDER:-20}"
+    command: sh -lc "python -u -m services.reprice_stale"
     restart: always
 
   sync_orders:
@@ -111,7 +136,7 @@ services:
     env_file: .env
     environment:
       PYTHONPATH: "/app"
-    command: sh -lc "python -m services.record_pnl"
+    command: sh -lc "python -u -m services.record_pnl"
     restart: always
 
 volumes:
