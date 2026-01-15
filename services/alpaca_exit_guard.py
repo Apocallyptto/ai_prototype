@@ -146,7 +146,7 @@ def place_exit_oco(tc: TradingClient, symbol: str, qty: float, tp: float, sl: fl
         symbol=symbol,
         qty=q,
         side=exit_side,
-        time_in_force=TimeInForce.GTC,  # <-- CHANGE: DAY -> GTC
+        time_in_force=TimeInForce.GTC,   # ✅ DAY -> GTC
         order_class=OrderClass.OCO,
         # Alpaca requires take_profit.limit_price for OCO; keep both to satisfy SDK/API
         limit_price=tp,
