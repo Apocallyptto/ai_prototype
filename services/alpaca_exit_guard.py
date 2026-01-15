@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List, Optional
+from typing import Optional
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -148,6 +148,7 @@ def place_exit_oco(tc: TradingClient, symbol: str, qty: float, tp: float, sl: fl
         side=exit_side,
         time_in_force=TimeInForce.GTC,   # ✅ DAY -> GTC
         order_class=OrderClass.OCO,
+        extended_hours=False,            # STOP legy nedávaj do extended hours
         # Alpaca requires take_profit.limit_price for OCO; keep both to satisfy SDK/API
         limit_price=tp,
         take_profit=TakeProfitRequest(limit_price=tp),
@@ -155,6 +156,8 @@ def place_exit_oco(tc: TradingClient, symbol: str, qty: float, tp: float, sl: fl
     )
 
     o = tc.submit_order(req)
-    log.info("exit_oco_submitted | %s qty=%s side=%s tp=%s sl=%s id=%s",
-             symbol, q, exit_side, tp, sl, getattr(o, "id", None))
+    log.info(
+        "exit_oco_submitted | %s qty=%s side=%s tp=%s sl=%s id=%s",
+        symbol, q, exit_side, tp, sl, getattr(o, "id", None)
+    )
     return o
