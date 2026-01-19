@@ -34,13 +34,16 @@ CANCEL_AFTER_SECONDS = int(os.getenv("REPRICE_CANCEL_AFTER_SECONDS", "300"))
 # Loop sleep when market open / normal mode
 LOOP_SLEEP_SECS = float(os.getenv("REPRICE_LOOP_SLEEP_SECONDS", "2"))
 
+# When there are no open orders, sleep longer to reduce log spam
+IDLE_SLEEP_SECONDS = int(os.getenv("REPRICE_IDLE_SLEEP_SECONDS", "10"))
+
 # Skip repricing if spread too wide (percent of mid, e.g. 0.40 = 0.40%)
 MAX_SPREAD_PCT = float(os.getenv("REPRICE_MAX_SPREAD_PCT", "0.40"))
 
 # Skip repricing if quote timestamp is too old
 QUOTE_MAX_AGE_SECONDS = int(os.getenv("REPRICE_QUOTE_MAX_AGE_SECONDS", "60"))
 
-# Market-open gate (requested)
+# Market-open gate
 REQUIRE_MARKET_OPEN = os.getenv("REPRICE_REQUIRE_MARKET_OPEN", "1") == "1"
 CLOSED_MARKET_SLEEP_SECONDS = int(os.getenv("REPRICE_CLOSED_MARKET_SLEEP_SECONDS", "60"))
 
@@ -80,12 +83,9 @@ def quote_fields(q) -> tuple[float, float, datetime | None]:
     """
     Return (bid, ask, ts_utc_or_None) from various quote object shapes.
     """
-    # Alpaca data quote objects usually have:
-    # bid_price, ask_price, timestamp
     bid = getattr(q, "bid_price", None)
     ask = getattr(q, "ask_price", None)
 
-    # sometimes fields are named b/a or similar
     if bid is None:
         bid = getattr(q, "b", None)
     if ask is None:
@@ -127,10 +127,17 @@ def is_market_open(trading: TradingClient) -> bool:
         return True
 
 
+def _is_limit_type(ot) -> bool:
+    if ot is None:
+        return False
+    s = str(ot).lower()
+    return s == "limit" or s.endswith(".limit") or s.endswith("limit")
+
+
 def is_parent_simple_limit(o) -> bool:
     # only open limit orders
     ot = getattr(o, "type", None) or getattr(o, "order_type", None)
-    if ot is None or str(ot).lower() != str(OrderType.LIMIT).lower():
+    if not _is_limit_type(ot):
         return False
 
     # ignore child/legs if SDK provides parent_order_id
@@ -179,9 +186,9 @@ def compute_new_limit_price(order, bid: float, ask: float) -> float | None:
         return None
 
     # More aggressive: buy at ask, sell at bid
-    if str(side).lower() == str(OrderSide.BUY).lower():
+    if str(side).lower().endswith("buy"):
         return float(ask)
-    if str(side).lower() == str(OrderSide.SELL).lower():
+    if str(side).lower().endswith("sell"):
         return float(bid)
 
     return None
@@ -197,29 +204,13 @@ def run_once(trading: TradingClient, data: StockHistoricalDataClient, dry_run: b
     Executes one scan:
       - cancel old orders (CANCEL_AFTER_SECONDS) even when market closed
       - reprice only when market open (if REQUIRE_MARKET_OPEN=1)
-    Returns an optional sleep override (e.g. CLOSED_MARKET_SLEEP_SECONDS).
+    Returns an optional sleep override.
     """
     orders = get_open_parent_limit_orders(trading)
-
-    # MARKET GATE (skip repricing when market is closed)
-    # - cancel pass can still run (even in closed market)
-    if REQUIRE_MARKET_OPEN:
-        market_open = is_market_open(trading)
-        if not market_open:
-            # If there's nothing to cancel and no orders at all, don't spam logs every 2s
-            if not orders:
-                logger.info("market closed -> idle (no orders) -> sleeping %ss", CLOSED_MARKET_SLEEP_SECONDS)
-            return float(CLOSED_MARKET_SLEEP_SECONDS)
-
-    if not orders:
-        logger.info("no open orders to reprice")
-        return None
-
     canceled_ids: set[str] = set()
-    now = utc_now()
 
     # 1) CANCEL PASS (allowed even when market closed)
-    if CANCEL_AFTER_SECONDS > 0:
+    if orders and CANCEL_AFTER_SECONDS > 0:
         for o in orders:
             oid = str(getattr(o, "id", "") or "")
             if not oid:
@@ -241,13 +232,23 @@ def run_once(trading: TradingClient, data: StockHistoricalDataClient, dry_run: b
     if REQUIRE_MARKET_OPEN:
         market_open = is_market_open(trading)
         if not market_open:
-            if canceled_ids:
-                logger.info("market closed -> skipping reprices (canceled=%d)", len(canceled_ids))
+            if not orders:
+                logger.info("market closed -> idle (no orders) -> sleeping %ss", CLOSED_MARKET_SLEEP_SECONDS)
             else:
-                logger.info("market closed -> skipping reprices (holiday/weekend)")
+                logger.info(
+                    "market closed -> skipping reprices (open_orders=%d canceled=%d) -> sleeping %ss",
+                    len(orders),
+                    len(canceled_ids),
+                    CLOSED_MARKET_SLEEP_SECONDS,
+                )
             return float(CLOSED_MARKET_SLEEP_SECONDS)
 
-    # 3) REPRICE PASS (only when market open or gate disabled)
+    # 3) If nothing to do, sleep longer to reduce spam
+    if not orders:
+        logger.info("no open orders to reprice -> sleeping %ss", IDLE_SLEEP_SECONDS)
+        return float(IDLE_SLEEP_SECONDS)
+
+    # 4) REPRICE PASS (only when market open or gate disabled)
     repriced = 0
 
     for o in orders:
@@ -256,12 +257,8 @@ def run_once(trading: TradingClient, data: StockHistoricalDataClient, dry_run: b
             continue
 
         sym = getattr(o, "symbol", "?")
-
         age = order_age_seconds(o)
-        if age is None:
-            continue
-
-        if age < STALE_SECONDS:
+        if age is None or age < STALE_SECONDS:
             continue
 
         # quote
@@ -301,9 +298,7 @@ def run_once(trading: TradingClient, data: StockHistoricalDataClient, dry_run: b
         try:
             trading.replace_order_by_id(
                 oid,
-                ReplaceOrderRequest(
-                    limit_price=str(round(new_px, 2)),
-                ),
+                ReplaceOrderRequest(limit_price=str(round(new_px, 2))),
             )
             repriced += 1
         except Exception as e:
