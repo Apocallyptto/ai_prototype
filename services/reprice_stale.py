@@ -18,6 +18,8 @@ logger = logging.getLogger("reprice_stale")
 STALE_SECONDS = int(os.getenv("REPRICE_STALE_SECONDS", "45"))
 CANCEL_AFTER_SECONDS = int(os.getenv("REPRICE_CANCEL_AFTER_SECONDS", "300"))  # 0 = disable
 MAX_SPREAD_PCT = float(os.getenv("REPRICE_MAX_SPREAD_PCT", "0.40"))           # percent of mid
+MAX_JUMP_PCT = float(os.getenv("REPRICE_MAX_JUMP_PCT", "3.0"))                    # max % jump allowed vs current limit
+QUOTE_MAX_AGE_SECONDS = int(os.getenv("REPRICE_QUOTE_MAX_AGE_SECONDS", "15"))     # ignore quotes older than this (seconds)
 MIN_ABS_MOVE = float(os.getenv("REPRICE_MIN_ABS_MOVE", "0.01"))              # dollars
 LOOP_SLEEP_SECS = int(os.getenv("REPRICE_LOOP_SLEEP_SECS", "2"))
 MAX_REPRICES_PER_ORDER = int(os.getenv("REPRICE_MAX_REPRICES_PER_ORDER", "20"))
@@ -94,17 +96,37 @@ def get_open_parent_limit_orders(trading: TradingClient):
     return parents
 
 
+def _parse_dt_any(x):
+    """Best-effort parse for Alpaca quote timestamps. Returns UTC-aware datetime or None."""
+    if x is None:
+        return None
+    try:
+        from datetime import datetime, timezone
+        if isinstance(x, datetime):
+            return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
+        if isinstance(x, str):
+            s = x.strip()
+            if s.endswith('Z'):
+                s = s[:-1] + '+00:00'
+            dt = datetime.fromisoformat(s)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return None
+
+
 def get_quote(data_client: StockHistoricalDataClient, symbol: str):
     req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
     out = data_client.get_stock_latest_quote(req)
     q = out.get(symbol)
-    if q is None or q.bid_price is None or q.ask_price is None:
+    if q is None or getattr(q, 'bid_price', None) is None or getattr(q, 'ask_price', None) is None:
         return None
     bid = float(q.bid_price)
     ask = float(q.ask_price)
     if bid <= 0 or ask <= 0:
         return None
-    return bid, ask
+    ts = _parse_dt_any(getattr(q, 'timestamp', None) or getattr(q, 't', None) or getattr(q, 'time', None))
+    return bid, ask, ts
 
 
 def _round_tick(x: Decimal) -> Decimal:
@@ -179,11 +201,32 @@ def run_once(trading: TradingClient, data_client: StockHistoricalDataClient,
         quote = get_quote(data_client, o.symbol)
         if not quote:
             continue
-        bid, ask = quote
+        bid, ask, q_ts = quote
+        if q_ts is not None and QUOTE_MAX_AGE_SECONDS > 0:
+            try:
+                if q_ts.tzinfo is None:
+                    q_ts = q_ts.replace(tzinfo=timezone.utc)
+                q_age = (_now_utc() - q_ts).total_seconds()
+                if q_age > QUOTE_MAX_AGE_SECONDS:
+                    logger.info("%s: skip (quote too old %.0fs)", o.symbol, q_age)
+                    continue
+            except Exception:
+                pass
 
         new_px = compute_new_price(o, bid, ask)
         if new_px is None:
             continue
+
+        # Guard against huge jumps (e.g., bad quote / after-hours)
+        try:
+            old_px = float(o.limit_price)
+            if old_px > 0:
+                jump_pct = abs(new_px - old_px) / old_px * 100.0
+                if jump_pct > MAX_JUMP_PCT:
+                    logger.info("%s: skip (jump %.2f%% > %.2f%%)", o.symbol, jump_pct, MAX_JUMP_PCT)
+                    continue
+        except Exception:
+            pass
 
         count += 1
         reprice_counts[oid] = count
