@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Data/artifacts
+*.log
+*.sqlite
+*.db
+data/
+models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+**/*.tar
