@@ -200,6 +200,17 @@ def run_once(trading: TradingClient, data: StockHistoricalDataClient, dry_run: b
     Returns an optional sleep override (e.g. CLOSED_MARKET_SLEEP_SECONDS).
     """
     orders = get_open_parent_limit_orders(trading)
+
+    # MARKET GATE (skip repricing when market is closed)
+    # - cancel pass can still run (even in closed market)
+    if REQUIRE_MARKET_OPEN:
+        market_open = is_market_open(trading)
+        if not market_open:
+            # If there's nothing to cancel and no orders at all, don't spam logs every 2s
+            if not orders:
+                logger.info("market closed -> idle (no orders) -> sleeping %ss", CLOSED_MARKET_SLEEP_SECONDS)
+            return float(CLOSED_MARKET_SLEEP_SECONDS)
+
     if not orders:
         logger.info("no open orders to reprice")
         return None
