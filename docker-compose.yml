@@ -31,6 +31,8 @@ services:
     restart: "no"
 
   signal_maker:
+    volumes:
+      - ./models:/app/models:ro
     build:
       context: .
     image: ai_prototype-signal_maker
