@@ -2,7 +2,7 @@ import os
 import time
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -37,6 +37,16 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return int(default)
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -62,8 +72,22 @@ def _as_float(x):
         return None
 
 
+def _as_dt(x):
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        # ensure tz-aware
+        return x if x.tzinfo is not None else x.replace(tzinfo=timezone.utc)
+    # alpaca-py usually returns datetime already; keep fallback minimal
+    try:
+        s = str(x)
+        # best-effort ISO parsing
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def _round_price(px: float) -> float:
-    # US equities are usually 2dp; keep it simple
     return round(float(px), 2)
 
 
@@ -73,7 +97,6 @@ def get_trading_client() -> TradingClient:
     if not key or not secret:
         raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
 
-    # safety-first: default paper=True if not set
     paper = _env_bool("ALPACA_PAPER", default=True)
     return TradingClient(key, secret, paper=paper)
 
@@ -93,7 +116,6 @@ def _tp_sl_from_pct(ref_price: float, position_qty: float) -> tuple[float, float
 
 
 def _get_ref_price(position) -> float | None:
-    # alpaca position has current_price & avg_entry_price (strings)
     for attr in ("current_price", "avg_entry_price"):
         v = _as_float(getattr(position, attr, None))
         if v and v > 0:
@@ -108,14 +130,38 @@ def _symbols_filter() -> list[str] | None:
     return [x.strip().upper() for x in s.split(",") if x.strip()]
 
 
+def _is_oco(order) -> bool:
+    return str(_val(getattr(order, "order_class", None))).lower() == "oco"
+
+
+def _is_ours_exit(order) -> bool:
+    coid = (getattr(order, "client_order_id", "") or "")
+    return coid.startswith("exit-oco-")
+
+
+def _tif_str(order) -> str:
+    return str(_val(getattr(order, "time_in_force", ""))).lower()
+
+
+def _side_str(order) -> str:
+    return str(_val(getattr(order, "side", ""))).lower()
+
+
+def _qty_norm(x) -> float | None:
+    v = _as_float(x)
+    if v is None:
+        return None
+    return abs(float(v))
+
+
 def _list_oco_parents(tc: TradingClient, symbol: str):
     req = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, limit=500)
     orders = tc.get_orders(req) or []
     out = []
     for o in orders:
-        if getattr(o, "symbol", None) != symbol:
+        if str(getattr(o, "symbol", "") or "").upper() != symbol:
             continue
-        if str(_val(getattr(o, "order_class", None))).lower() != "oco":
+        if not _is_oco(o):
             continue
         out.append(o)
     return out
@@ -134,7 +180,6 @@ def _collect_cancel_ids(oco_parent) -> list[str]:
         if lid:
             ids.append(str(lid))
 
-    # de-dupe while preserving order
     seen = set()
     uniq = []
     for i in ids:
@@ -146,13 +191,42 @@ def _collect_cancel_ids(oco_parent) -> list[str]:
 
 
 def _extract_tp_sl_from_oco_parent(oco_parent) -> tuple[float | None, float | None]:
-    # Take-profit: parent is typically the LIMIT price
-    tp = _as_float(getattr(oco_parent, "limit_price", None))
-
-    # Stop-loss: often present on the STOP leg
+    """
+    Robust extraction:
+      - TP may be on parent.limit_price OR parent.take_profit.limit_price OR a LIMIT leg
+      - SL may be on parent.stop_loss.stop_price OR STOP leg stop_price
+    """
+    tp = None
     sl = None
 
-    # Some alpaca versions include stop_loss on the parent
+    # ---- TP candidates ----
+    tp = _as_float(getattr(oco_parent, "limit_price", None))
+
+    if tp is None:
+        take_profit = getattr(oco_parent, "take_profit", None)
+        if take_profit is not None:
+            if isinstance(take_profit, dict):
+                tp = _as_float(take_profit.get("limit_price"))
+            else:
+                tp = _as_float(getattr(take_profit, "limit_price", None))
+
+    if tp is None:
+        # sometimes TP is a leg
+        for leg in (getattr(oco_parent, "legs", None) or []):
+            if isinstance(leg, dict):
+                typ = str(leg.get("order_type") or leg.get("type") or "").lower()
+                if "limit" in typ:
+                    tp = _as_float(leg.get("limit_price"))
+                    if tp is not None:
+                        break
+            else:
+                typ = str(getattr(leg, "order_type", None) or getattr(leg, "type", None) or "").lower()
+                if "limit" in typ:
+                    tp = _as_float(getattr(leg, "limit_price", None))
+                    if tp is not None:
+                        break
+
+    # ---- SL candidates ----
     stop_loss = getattr(oco_parent, "stop_loss", None)
     if stop_loss is not None:
         if isinstance(stop_loss, dict):
@@ -207,6 +281,8 @@ def _submit_exit_oco(
     if intent is not None:
         kwargs["position_intent"] = intent
 
+    # NOTE:
+    # Some Alpaca representations show only STOP as "leg" because the TP is the parent LIMIT itself.
     req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
@@ -229,13 +305,57 @@ def _cancel_ids(tc: TradingClient, ids: list[str]) -> None:
         try:
             tc.cancel_order_by_id(oid)
         except Exception:
-            # already canceled / not cancelable -> ignore
             pass
 
 
-def _tif_is_day(order) -> bool:
-    tif = str(_val(getattr(order, "time_in_force", ""))).lower()
-    return tif == "day"
+def _expected_exit_side(position_qty: float) -> str:
+    return "sell" if position_qty > 0 else "buy"
+
+
+def _is_valid_exit_oco_for_position(order, position_qty: float, allow_stop_only: bool) -> tuple[bool, str]:
+    """
+    Returns (ok, reason_if_not_ok)
+    """
+    if not _is_oco(order):
+        return False, "not_oco"
+
+    tif = _tif_str(order)
+    if tif != "gtc":
+        return False, f"bad_tif:{tif}"
+
+    # must be our managed exit to consider "valid" (so we don't trust random oco)
+    if not _is_ours_exit(order):
+        return False, "not_ours"
+
+    # side should match position direction
+    exp_side = _expected_exit_side(position_qty)
+    if _side_str(order) != exp_side:
+        return False, f"bad_side:{_side_str(order)}!= {exp_side}"
+
+    oq = _qty_norm(getattr(order, "qty", None))
+    pq = _qty_norm(position_qty)
+    if oq is not None and pq is not None:
+        # allow tiny float noise
+        if abs(oq - pq) > 1e-9:
+            return False, f"bad_qty:{oq}!= {pq}"
+
+    tp, sl = _extract_tp_sl_from_oco_parent(order)
+    if sl is None:
+        return False, "missing_sl"
+    if (tp is None) and (not allow_stop_only):
+        return False, "missing_tp"
+
+    return True, "ok"
+
+
+def _needs_renew(order, renew_days: int) -> bool:
+    if renew_days <= 0:
+        return False
+    exp = _as_dt(getattr(order, "expires_at", None))
+    if exp is None:
+        return False
+    now = datetime.now(timezone.utc)
+    return exp <= (now + timedelta(days=renew_days))
 
 
 def main() -> None:
@@ -248,13 +368,21 @@ def main() -> None:
     heartbeat = _env_float("HEARTBEAT_SECONDS", 60.0)
     sym_filter = _symbols_filter()
 
+    # behavior knobs
+    treat_any_oco_as_protected = _env_bool("OCO_TREAT_ANY_OCO_AS_PROTECTED", True)
+    allow_stop_only = _env_bool("OCO_ALLOW_STOP_ONLY", False)
+    renew_days = _env_int("OCO_RENEW_DAYS", 3)
+
     tc = get_trading_client()
 
     log.info(
-        "Started | poll=%.1fs | heartbeat=%.1fs | symbols_filter=%s",
+        "Started | poll=%.1fs | heartbeat=%.1fs | symbols_filter=%s | treat_any_oco_as_protected=%s | allow_stop_only=%s | renew_days=%s",
         poll,
         heartbeat,
         sym_filter,
+        treat_any_oco_as_protected,
+        allow_stop_only,
+        renew_days,
     )
 
     last_hb = 0.0
@@ -275,9 +403,10 @@ def main() -> None:
             positions = tc.get_all_positions() or []
             stats["positions"] = len(positions)
 
-            # open orders count (for heartbeat)
             try:
-                stats["open_orders"] = len(tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=False, limit=500)) or [])
+                stats["open_orders"] = len(
+                    tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=False, limit=500)) or []
+                )
             except Exception:
                 stats["open_orders"] = 0
 
@@ -294,47 +423,84 @@ def main() -> None:
                 if qty == 0:
                     continue
 
-                # If the position is being closed, skip placing/repairing exits
+                # keep your existing "closing" skip (rarely used, but harmless)
                 if str(_val(getattr(p, "side", ""))).lower() == "closed":
                     stats["skipped_closing"] += 1
                     continue
 
                 oco_parents = _list_oco_parents(tc, sym)
+                ours = [o for o in oco_parents if _is_ours_exit(o)]
+                others = [o for o in oco_parents if not _is_ours_exit(o)]
 
-                if oco_parents:
-                    # If any existing OCO is DAY, repair it to GTC but KEEP tp/sl as-is.
-                    if any(_tif_is_day(o) for o in oco_parents):
-                        tp, sl = _extract_tp_sl_from_oco_parent(oco_parents[0])
-                        if tp is None or sl is None:
+                # If we have our exits, validate/repair them.
+                if ours:
+                    # choose newest as "primary"
+                    def _created(o):
+                        return _as_dt(getattr(o, "created_at", None)) or datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+                    ours_sorted = sorted(ours, key=_created, reverse=True)
+                    primary = ours_sorted[0]
+
+                    ok, reason = _is_valid_exit_oco_for_position(primary, qty, allow_stop_only)
+
+                    # also renew if close to expiry
+                    if ok and _needs_renew(primary, renew_days):
+                        ok = False
+                        reason = f"renew_before_expiry({renew_days}d)"
+
+                    # if multiple ours exist -> repair (dedupe)
+                    if ok and len(ours_sorted) > 1:
+                        ok = False
+                        reason = f"duplicate_exits({len(ours_sorted)})"
+
+                    if not ok:
+                        # keep tp/sl if we can; otherwise compute from position ref
+                        tp, sl = _extract_tp_sl_from_oco_parent(primary)
+                        if sl is None or (tp is None and not allow_stop_only):
                             ref = _get_ref_price(p)
                             if ref is None:
-                                raise RuntimeError(f"{sym}: cannot compute TP/SL (no ref price)")
+                                stats["errors"] += 1
+                                log.warning("%s: cannot repair exit OCO (%s) because no ref price", sym, reason)
+                                stats["unprotected"].append(sym)
+                                continue
                             tp, sl = _tp_sl_from_pct(ref, qty)
 
                         cancel_ids = []
-                        for o in oco_parents:
+                        for o in ours_sorted:
                             cancel_ids.extend(_collect_cancel_ids(o))
-
-                        # de-dupe
                         cancel_ids = list(dict.fromkeys(cancel_ids))
 
                         log.info(
-                            "Repair EXIT OCO TIF (DAY->GTC) | %s | cancel_ids=%s | keep tp=%s sl=%s",
+                            "Repair EXIT OCO | %s | reason=%s | cancel_ids=%s | tp=%s sl=%s",
                             sym,
+                            reason,
                             ",".join(cancel_ids),
                             tp,
                             sl,
                         )
                         _cancel_ids(tc, cancel_ids)
-
                         new_o = _submit_exit_oco(tc, sym, qty, tp, sl, tif=TimeInForce.GTC)
                         stats["repaired"] += 1
-                        log.info("Repaired EXIT OCO | %s | order_id=%s tif=%s", sym, getattr(new_o, "id", None), getattr(new_o, "time_in_force", None))
+                        stats["protected"] += 1
+                        log.info(
+                            "Repaired EXIT OCO | %s | order_id=%s tif=%s expires_at=%s",
+                            sym,
+                            getattr(new_o, "id", None),
+                            getattr(new_o, "time_in_force", None),
+                            getattr(new_o, "expires_at", None),
+                        )
+                    else:
+                        stats["protected"] += 1
 
+                    continue
+
+                # No "our" exit found.
+                # If there are other OCO orders and you want to treat them as protected -> do nothing.
+                if others and treat_any_oco_as_protected:
                     stats["protected"] += 1
                     continue
 
-                # No OCO -> place one
+                # Place a new exit OCO
                 ref = _get_ref_price(p)
                 if ref is None:
                     stats["errors"] += 1
@@ -348,13 +514,14 @@ def main() -> None:
                 stats["placed"] += 1
                 stats["protected"] += 1
                 log.info(
-                    "Placed EXIT OCO | %s qty=%s ref=%s tp=%s sl=%s | order_id=%s",
+                    "Placed EXIT OCO | %s qty=%s ref=%s tp=%s sl=%s | order_id=%s expires_at=%s",
                     sym,
                     qty,
                     _round_price(ref),
                     tp,
                     sl,
                     getattr(new_o, "id", None),
+                    getattr(new_o, "expires_at", None),
                 )
 
         except Exception:
