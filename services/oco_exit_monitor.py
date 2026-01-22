@@ -76,12 +76,9 @@ def _as_dt(x):
     if x is None:
         return None
     if isinstance(x, datetime):
-        # ensure tz-aware
         return x if x.tzinfo is not None else x.replace(tzinfo=timezone.utc)
-    # alpaca-py usually returns datetime already; keep fallback minimal
     try:
         s = str(x)
-        # best-effort ISO parsing
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
@@ -147,6 +144,10 @@ def _side_str(order) -> str:
     return str(_val(getattr(order, "side", ""))).lower()
 
 
+def _status_str(order) -> str:
+    return str(_val(getattr(order, "status", ""))).lower()
+
+
 def _qty_norm(x) -> float | None:
     v = _as_float(x)
     if v is None:
@@ -192,9 +193,11 @@ def _collect_cancel_ids(oco_parent) -> list[str]:
 
 def _extract_tp_sl_from_oco_parent(oco_parent) -> tuple[float | None, float | None]:
     """
-    Robust extraction:
-      - TP may be on parent.limit_price OR parent.take_profit.limit_price OR a LIMIT leg
-      - SL may be on parent.stop_loss.stop_price OR STOP leg stop_price
+    Alpaca OCO representation often looks like you pasted:
+      - parent is LIMIT with limit_price = take-profit
+      - legs contains 1 STOP (held)
+      - parent.take_profit/stop_loss can be None
+    So we treat parent.limit_price as TP and STOP leg stop_price as SL.
     """
     tp = None
     sl = None
@@ -281,8 +284,6 @@ def _submit_exit_oco(
     if intent is not None:
         kwargs["position_intent"] = intent
 
-    # NOTE:
-    # Some Alpaca representations show only STOP as "leg" because the TP is the parent LIMIT itself.
     req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
@@ -290,6 +291,7 @@ def _submit_exit_oco(
         order_class=OrderClass.OCO,
         time_in_force=tif,
         limit_price=tp,
+        # these may appear as None in the returned model for OCO; that's OK
         take_profit=TakeProfitRequest(limit_price=tp),
         stop_loss=StopLossRequest(stop_price=sl),
         client_order_id=f"exit-oco-{symbol.lower()}-{uuid.uuid4().hex[:8]}",
@@ -312,10 +314,26 @@ def _expected_exit_side(position_qty: float) -> str:
     return "sell" if position_qty > 0 else "buy"
 
 
+def _is_in_flight(order) -> bool:
+    """
+    Avoid cancel/replace loops when the exit is already executing.
+    """
+    inflight = {"partially_filled", "pending_cancel", "pending_replace", "pending_review"}
+    if _status_str(order) in inflight:
+        return True
+
+    for leg in (getattr(order, "legs", None) or []):
+        if isinstance(leg, dict):
+            st = str(leg.get("status") or "").lower()
+        else:
+            st = _status_str(leg)
+        if st in inflight:
+            return True
+
+    return False
+
+
 def _is_valid_exit_oco_for_position(order, position_qty: float, allow_stop_only: bool) -> tuple[bool, str]:
-    """
-    Returns (ok, reason_if_not_ok)
-    """
     if not _is_oco(order):
         return False, "not_oco"
 
@@ -323,11 +341,9 @@ def _is_valid_exit_oco_for_position(order, position_qty: float, allow_stop_only:
     if tif != "gtc":
         return False, f"bad_tif:{tif}"
 
-    # must be our managed exit to consider "valid" (so we don't trust random oco)
     if not _is_ours_exit(order):
         return False, "not_ours"
 
-    # side should match position direction
     exp_side = _expected_exit_side(position_qty)
     if _side_str(order) != exp_side:
         return False, f"bad_side:{_side_str(order)}!= {exp_side}"
@@ -335,7 +351,6 @@ def _is_valid_exit_oco_for_position(order, position_qty: float, allow_stop_only:
     oq = _qty_norm(getattr(order, "qty", None))
     pq = _qty_norm(position_qty)
     if oq is not None and pq is not None:
-        # allow tiny float noise
         if abs(oq - pq) > 1e-9:
             return False, f"bad_qty:{oq}!= {pq}"
 
@@ -368,7 +383,6 @@ def main() -> None:
     heartbeat = _env_float("HEARTBEAT_SECONDS", 60.0)
     sym_filter = _symbols_filter()
 
-    # behavior knobs
     treat_any_oco_as_protected = _env_bool("OCO_TREAT_ANY_OCO_AS_PROTECTED", True)
     allow_stop_only = _env_bool("OCO_ALLOW_STOP_ONLY", False)
     renew_days = _env_int("OCO_RENEW_DAYS", 3)
@@ -423,7 +437,6 @@ def main() -> None:
                 if qty == 0:
                     continue
 
-                # keep your existing "closing" skip (rarely used, but harmless)
                 if str(_val(getattr(p, "side", ""))).lower() == "closed":
                     stats["skipped_closing"] += 1
                     continue
@@ -432,29 +445,28 @@ def main() -> None:
                 ours = [o for o in oco_parents if _is_ours_exit(o)]
                 others = [o for o in oco_parents if not _is_ours_exit(o)]
 
-                # If we have our exits, validate/repair them.
                 if ours:
-                    # choose newest as "primary"
                     def _created(o):
                         return _as_dt(getattr(o, "created_at", None)) or datetime(1970, 1, 1, tzinfo=timezone.utc)
 
                     ours_sorted = sorted(ours, key=_created, reverse=True)
                     primary = ours_sorted[0]
 
+                    if _is_in_flight(primary):
+                        stats["protected"] += 1
+                        continue
+
                     ok, reason = _is_valid_exit_oco_for_position(primary, qty, allow_stop_only)
 
-                    # also renew if close to expiry
                     if ok and _needs_renew(primary, renew_days):
                         ok = False
                         reason = f"renew_before_expiry({renew_days}d)"
 
-                    # if multiple ours exist -> repair (dedupe)
                     if ok and len(ours_sorted) > 1:
                         ok = False
                         reason = f"duplicate_exits({len(ours_sorted)})"
 
                     if not ok:
-                        # keep tp/sl if we can; otherwise compute from position ref
                         tp, sl = _extract_tp_sl_from_oco_parent(primary)
                         if sl is None or (tp is None and not allow_stop_only):
                             ref = _get_ref_price(p)
@@ -467,7 +479,15 @@ def main() -> None:
 
                         cancel_ids = []
                         for o in ours_sorted:
+                            if _is_in_flight(o):
+                                cancel_ids = []
+                                break
                             cancel_ids.extend(_collect_cancel_ids(o))
+
+                        if not cancel_ids:
+                            stats["protected"] += 1
+                            continue
+
                         cancel_ids = list(dict.fromkeys(cancel_ids))
 
                         log.info(
@@ -494,13 +514,10 @@ def main() -> None:
 
                     continue
 
-                # No "our" exit found.
-                # If there are other OCO orders and you want to treat them as protected -> do nothing.
                 if others and treat_any_oco_as_protected:
                     stats["protected"] += 1
                     continue
 
-                # Place a new exit OCO
                 ref = _get_ref_price(p)
                 if ref is None:
                     stats["errors"] += 1
