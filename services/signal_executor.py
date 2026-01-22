@@ -81,7 +81,11 @@ class Cfg:
     allow_short: bool
     long_only: bool
     max_notional: float
-    max_qty: int
+    max_qty: int  # max qty per single order
+
+    # NEW: position sizing guard (per-symbol)
+    max_position_qty: int  # max absolute position qty per symbol
+    allow_add_to_position: bool  # if False: never pyramid; if True: cap up to max_position_qty
 
     alpaca_dedupe_minutes: int
     cancel_opposite_open_orders: bool
@@ -101,6 +105,10 @@ class Cfg:
 
 
 def load_cfg() -> Cfg:
+    max_qty = _env_int("MAX_QTY", 1)
+    # MAX_POSITION_QTY defaults to MAX_QTY to preserve your current behavior unless overridden.
+    max_pos_qty = _env_int("MAX_POSITION_QTY", max_qty)
+
     return Cfg(
         symbols=_parse_symbols(_env_str("SYMBOLS", "AAPL,MSFT,SPY,NVDA,AMD")),
         portfolio_id=_env_int("PORTFOLIO_ID", 1),
@@ -109,7 +117,9 @@ def load_cfg() -> Cfg:
         allow_short=_env_bool("ALLOW_SHORT", False),
         long_only=_env_bool("LONG_ONLY", False),
         max_notional=_env_float("MAX_NOTIONAL", 200.0),
-        max_qty=_env_int("MAX_QTY", 1),
+        max_qty=max_qty,
+        max_position_qty=max_pos_qty,
+        allow_add_to_position=_env_bool("ALLOW_ADD_TO_POSITION", False),
         alpaca_dedupe_minutes=_env_int("ALPACA_DEDUPE_MINUTES", 2),
         cancel_opposite_open_orders=_env_bool("CANCEL_OPPOSITE_OPEN_ORDERS", True),
         max_open_positions=_env_int("MAX_OPEN_POSITIONS", 1),
@@ -366,6 +376,83 @@ def submit_limit(tc: TradingClient, symbol: str, side: OrderSide, qty: int, limi
     return str(o.id)
 
 
+def _positions_qty_map(tc: TradingClient) -> Dict[str, float]:
+    """
+    Returns signed qty per symbol: long -> +qty, short -> -qty.
+    Alpaca positions typically return qty as string and side as 'long'/'short'.
+    """
+    out: Dict[str, float] = {}
+    pos = tc.get_all_positions() or []
+    for p in pos:
+        sym = str(getattr(p, "symbol", "") or "").upper()
+        if not sym:
+            continue
+        try:
+            q = float(getattr(p, "qty", 0) or 0)
+        except Exception:
+            continue
+        side = str(getattr(p, "side", "") or "").strip().lower()
+        if side == "short":
+            q = -abs(q)
+        else:
+            q = abs(q)
+        out[sym] = q
+    return out
+
+
+def _open_entry_orders_map(tc: TradingClient) -> Dict[Tuple[str, OrderSide], int]:
+    """
+    Counts open *entry* orders by (symbol, side).
+    We ignore your exit OCO orders via client_order_id prefix 'exit-oco-'
+    and also ignore any OCO order_class.
+    """
+    out: Dict[Tuple[str, OrderSide], int] = {}
+    opens = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=False)) or []
+    for o in opens:
+        sym = str(getattr(o, "symbol", "") or "").upper()
+        if not sym:
+            continue
+        side = getattr(o, "side", None)
+        if side not in (OrderSide.BUY, OrderSide.SELL):
+            continue
+
+        coid = str(getattr(o, "client_order_id", "") or "")
+        if coid.startswith("exit-oco-"):
+            continue
+
+        oc = str(getattr(o, "order_class", "") or "").lower()
+        if oc == "oco":
+            continue
+
+        k = (sym, side)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _cap_qty_to_max_position(cfg: Cfg, side: OrderSide, pos_qty: float, desired_qty: int) -> int:
+    """
+    If allow_add_to_position=False -> returns 0 when pos already exists in same direction.
+    If allow_add_to_position=True -> caps qty so abs(position) <= max_position_qty.
+    """
+    if desired_qty <= 0:
+        return 0
+
+    # same direction?
+    if side == OrderSide.BUY and pos_qty > 0:
+        if not cfg.allow_add_to_position:
+            return 0
+        remaining = max(0.0, float(cfg.max_position_qty) - pos_qty)
+        return int(min(float(desired_qty), remaining))
+    if side == OrderSide.SELL and pos_qty < 0:
+        if not cfg.allow_add_to_position:
+            return 0
+        remaining = max(0.0, float(cfg.max_position_qty) - abs(pos_qty))
+        return int(min(float(desired_qty), remaining))
+
+    # opening new position: cap to max_position_qty too
+    return int(min(desired_qty, cfg.max_position_qty))
+
+
 def main() -> None:
     _setup_logging()
     cfg = load_cfg()
@@ -375,13 +462,13 @@ def main() -> None:
 
     LOG.info(
         "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
-        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | ALPACA_DEDUPE_MINUTES=%s | "
-        "CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%.1f | "
+        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | MAX_POSITION_QTY=%s | ALLOW_ADD_TO_POSITION=%s | "
+        "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%.1f | "
         "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
         "TRADING_PAUSED=%s | DRY_RUN=%s",
         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
-        cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.alpaca_dedupe_minutes,
-        cfg.cancel_opposite_open_orders, cfg.max_open_positions, cfg.max_open_orders,
+        cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.max_position_qty, cfg.allow_add_to_position,
+        cfg.alpaca_dedupe_minutes, cfg.cancel_opposite_open_orders, cfg.max_open_positions, cfg.max_open_orders,
         cfg.daily_loss_stop_pct, cfg.max_daily_loss_usd, cfg.enable_daily_risk_guard,
         cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds, cfg.trading_paused, cfg.dry_run
     )
@@ -418,6 +505,10 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
+            # Snapshot (once per loop) to prevent pyramiding + duplicate entries
+            pos_qty_map = _positions_qty_map(tc)
+            open_entry_map = _open_entry_orders_map(tc)
+
             last_ts = get_symbol_last_trade_ts(engine, cfg.symbols)
             now = _now_utc()
 
@@ -446,6 +537,22 @@ def main() -> None:
                         LOG.info("skip | sid=%s %s %s | symbol_cooldown_%ss", sid, sym, side_s, cfg.symbol_cooldown_seconds)
                         continue
 
+                side = OrderSide.BUY if side_s == "buy" else OrderSide.SELL
+
+                # NEW: avoid stacking multiple entry orders on same symbol+side
+                if open_entry_map.get((sym, side), 0) > 0:
+                    mark_one(engine, sid, "skipped", "open_order_same_side")
+                    LOG.info("skip | sid=%s %s %s | open_order_same_side", sid, sym, side_s)
+                    continue
+
+                # NEW: per-symbol position guard (no pyramiding by default)
+                pos_qty = float(pos_qty_map.get(sym, 0.0))
+                desired_direction_exists = (side == OrderSide.BUY and pos_qty > 0) or (side == OrderSide.SELL and pos_qty < 0)
+                if desired_direction_exists and not cfg.allow_add_to_position:
+                    mark_one(engine, sid, "skipped", f"already_in_position_qty={pos_qty:g}")
+                    LOG.info("skip | sid=%s %s %s | already_in_position qty=%s", sid, sym, side_s, pos_qty)
+                    continue
+
                 ok, reason = risk_guard(tc, cfg)
                 if not ok:
                     remaining = len(selected) - idx
@@ -464,8 +571,6 @@ def main() -> None:
                         conn.execute(q, {"ids": ids, "note": f"unpicked_risk_guard:{reason}"})
                     break
 
-                side = OrderSide.BUY if side_s == "buy" else OrderSide.SELL
-
                 if _recent_alpaca_dedupe(tc, sym, side, cfg.alpaca_dedupe_minutes):
                     mark_one(engine, sid, "skipped", f"dedupe_alpaca_{cfg.alpaca_dedupe_minutes}m")
                     LOG.info("skip | sid=%s %s %s | dedupe_alpaca_%sm", sid, sym, side_s, cfg.alpaca_dedupe_minutes)
@@ -483,6 +588,14 @@ def main() -> None:
                     LOG.info("skip | sid=%s %s %s | qty_zero_by_limits", sid, sym, side_s)
                     continue
 
+                # NEW: cap qty so abs(position) never exceeds MAX_POSITION_QTY
+                capped = _cap_qty_to_max_position(cfg, side, pos_qty, qty)
+                if capped <= 0:
+                    mark_one(engine, sid, "skipped", f"max_position_qty_reached={cfg.max_position_qty}")
+                    LOG.info("skip | sid=%s %s %s | max_position_qty_reached=%s (pos_qty=%s)", sid, sym, side_s, cfg.max_position_qty, pos_qty)
+                    continue
+                qty = capped
+
                 if cfg.cancel_opposite_open_orders:
                     _cancel_opposite_open_orders(tc, sym, side)
 
@@ -494,6 +607,7 @@ def main() -> None:
                         sid, sym, side_s, qty, round(limit_price, 2), alpaca_id
                     )
                     last_ts[sym] = _now_utc()
+                    open_entry_map[(sym, side)] = open_entry_map.get((sym, side), 0) + 1
                 except Exception as e:
                     mark_one(engine, sid, "error", f"submit_error:{type(e).__name__}")
                     LOG.exception("submit failed | sid=%s %s %s | %s", sid, sym, side_s, e)
