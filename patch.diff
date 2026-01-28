@@ -1,24 +1,23 @@
 ﻿diff --git a/services/signal_executor.py b/services/signal_executor.py
-index 1111111..2222222 100644
 --- a/services/signal_executor.py
 +++ b/services/signal_executor.py
-@@ -79,6 +79,7 @@ from alpaca.data.historical import StockHistoricalDataClient
- from alpaca.data.requests import StockLatestTradeRequest
-
-
- LOG = logging.getLogger("signal_executor")
-
-@@ -104,6 +105,7 @@ class Cfg:
+@@ -78,9 +78,12 @@ class Cfg:
+     enable_daily_risk_guard: bool
+     daily_loss_stop_pct: float
+     max_daily_loss_usd: float
+ 
      symbol_cooldown_seconds: int
      pick_ttl_seconds: int
-
+ 
 +    trade_only_when_market_open: bool
 +    preopen_window_seconds: int
++
      trading_paused: bool
      dry_run: bool
-
-
-@@ -128,6 +130,8 @@ def load_cfg() -> Cfg:
+ 
+@@ -118,9 +121,11 @@ def load_cfg() -> Cfg:
+         enable_daily_risk_guard=_env_bool("ENABLE_DAILY_RISK_GUARD", True),
+         daily_loss_stop_pct=_env_float("DAILY_LOSS_STOP_PCT", 1.0),
          max_daily_loss_usd=_env_float("MAX_DAILY_LOSS_USD", 200.0),
          symbol_cooldown_seconds=_env_int("SYMBOL_COOLDOWN_SECONDS", 60),
          pick_ttl_seconds=_env_int("PICK_TTL_SECONDS", 120),
@@ -27,68 +26,60 @@ index 1111111..2222222 100644
          trading_paused=_env_bool("TRADING_PAUSED", False),  # kill switch
          dry_run=_env_bool("DRY_RUN", False),
      )
-
-@@ -170,6 +174,34 @@ def make_data_client() -> StockHistoricalDataClient:
+ 
+@@ -164,6 +167,36 @@ def make_data_client() -> StockHistoricalDataClient:
+     if not key or not sec:
+         raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
      return StockHistoricalDataClient(key, sec)
-
+ 
 +
 +def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
 +    """
++    Market-hours gate using Alpaca clock.
++
 +    Returns:
-+      - None  => OK to trade now
-+      - int   => sleep seconds and skip this loop iteration
++        - None => ok to trade now
++        - int  => sleep seconds and skip this loop iteration
 +    """
 +    if not cfg.trade_only_when_market_open:
 +        return None
 +    try:
-+        c = tc.get_clock()
++        clock = tc.get_clock()
 +    except Exception as e:
-+        LOG.warning("market_clock_error | err=%s", e)
-+        return 60
-+
-+    if c.is_open:
++        # fail-open: availability beats perfect gating; other risk guards still apply
++        LOG.warning("market_gate | clock_error=%s | allow_trade", e)
 +        return None
++    if getattr(clock, "is_open", False):
++        return None
++    now = getattr(clock, "timestamp", None)
++    nxt = getattr(clock, "next_open", None)
++    if not now or not nxt:
++        return max(10, int(cfg.poll_seconds))
++    secs_to_open = int((nxt - now).total_seconds())
++    pre = int(cfg.preopen_window_seconds or 0)
++    if pre > 0 and secs_to_open <= pre:
++        return None
++    remain = max(secs_to_open - pre, 0)
++    return int(min(max(remain, 10), 300))
 +
-+    # allow trading shortly before open (optional)
-+    try:
-+        if cfg.preopen_window_seconds and c.next_open and c.timestamp:
-+            secs_to_open = (c.next_open - c.timestamp).total_seconds()
-+            if 0 <= secs_to_open <= cfg.preopen_window_seconds:
-+                return None
-+            if secs_to_open > 0:
-+                return max(10, min(int(secs_to_open), 300))
-+    except Exception:
-+        pass
+@@ -401,6 +401,23 @@ def main():
+         while True:
+             if cfg.trading_paused:
+                 time.sleep(cfg.poll_seconds)
+                 continue
+ 
++            # Market-hours gate (prevents orders outside regular session; avoids stale-signal backlog)
++            gate_sleep = _market_gate_sleep_seconds(tc, cfg)
++            if gate_sleep is not None:
++                pending = fetch_new_signals(engine, cfg)
++                if pending:
++                    ids = [int(s["id"]) for s in pending]
++                    mark(engine, ids, "skipped", "market_closed")
++                    LOG.info("market_gate | market_closed | skipped=%s | sleep=%ss", len(ids), int(gate_sleep))
++                else:
++                    LOG.info("market_gate | market_closed | skipped=0 | sleep=%ss", int(gate_sleep))
++                time.sleep(int(gate_sleep))
++                continue
 +
-+    return 60
-+
-@@ -456,7 +488,8 @@ def main() -> None:
-         "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%.1f | "
-         "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
--        "TRADING_PAUSED=%s | DRY_RUN=%s",
-+        "TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | TRADING_PAUSED=%s | DRY_RUN=%s",
-         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
-         cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.max_position_qty, cfg.allow_add_to_position,
-         cfg.alpaca_dedupe_minutes, cfg.cancel_opposite_open_orders, cfg.max_open_positions, cfg.max_open_orders, cfg.daily_loss_stop_pct,
--        cfg.max_daily_loss_usd, cfg.enable_daily_risk_guard, cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds,
-+        cfg.max_daily_loss_usd, cfg.enable_daily_risk_guard, cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds,
-+        cfg.trade_only_when_market_open, cfg.preopen_window_seconds,
-         cfg.trading_paused, cfg.dry_run,
-     )
-
-@@ -468,6 +501,16 @@ def main() -> None:
-     while True:
-         if cfg.trading_paused:
-             LOG.info("trading paused | TRADING_PAUSED=1")
-             time.sleep(cfg.poll_seconds)
-             continue
-+
-+        sleep_s = _market_gate_sleep_seconds(tc, cfg)
-+        if sleep_s is not None:
-+            try:
-+                c = tc.get_clock()
-+                LOG.info("market_closed | is_open=%s ts=%s next_open=%s sleep=%ss", c.is_open, c.timestamp, c.next_open, sleep_s)
-+            except Exception:
-+                LOG.info("market_closed | sleep=%ss", sleep_s)
-+            time.sleep(sleep_s)
-+            continue
+             signals = fetch_new_signals(engine, cfg)
+             LOG.info("fetch_new_signals | fetched %s rows", len(signals))
