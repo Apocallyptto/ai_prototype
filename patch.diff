@@ -1,24 +1,22 @@
-﻿diff --git a/services/signal_executor.py b/services/signal_executor.py
+diff --git a/services/signal_executor.py b/services/signal_executor.py
 --- a/services/signal_executor.py
 +++ b/services/signal_executor.py
-@@ -78,9 +78,12 @@ class Cfg:
-     enable_daily_risk_guard: bool
-     daily_loss_stop_pct: float
-     max_daily_loss_usd: float
- 
+@@
+ class Cfg:
+@@
      symbol_cooldown_seconds: int
      pick_ttl_seconds: int
- 
+
 +    trade_only_when_market_open: bool
 +    preopen_window_seconds: int
 +
      trading_paused: bool
      dry_run: bool
- 
-@@ -118,9 +121,11 @@ def load_cfg() -> Cfg:
-         enable_daily_risk_guard=_env_bool("ENABLE_DAILY_RISK_GUARD", True),
-         daily_loss_stop_pct=_env_float("DAILY_LOSS_STOP_PCT", 1.0),
-         max_daily_loss_usd=_env_float("MAX_DAILY_LOSS_USD", 200.0),
+@@
+ def load_cfg() -> Cfg:
+@@
+     return Cfg(
+@@
          symbol_cooldown_seconds=_env_int("SYMBOL_COOLDOWN_SECONDS", 60),
          pick_ttl_seconds=_env_int("PICK_TTL_SECONDS", 120),
 +        trade_only_when_market_open=_env_bool("TRADE_ONLY_WHEN_MARKET_OPEN", True),
@@ -26,12 +24,14 @@
          trading_paused=_env_bool("TRADING_PAUSED", False),  # kill switch
          dry_run=_env_bool("DRY_RUN", False),
      )
- 
-@@ -164,6 +167,36 @@ def make_data_client() -> StockHistoricalDataClient:
+@@
+ def make_data_client() -> StockHistoricalDataClient:
+     key = os.getenv("ALPACA_API_KEY")
+     sec = os.getenv("ALPACA_API_SECRET")
      if not key or not sec:
          raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
      return StockHistoricalDataClient(key, sec)
- 
+
 +
 +def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
 +    """
@@ -46,28 +46,34 @@
 +    try:
 +        clock = tc.get_clock()
 +    except Exception as e:
-+        # fail-open: availability beats perfect gating; other risk guards still apply
-+        LOG.warning("market_gate | clock_error=%s | allow_trade", e)
-+        return None
++        # fail-closed (safer): if clock not available, don't trade now
++        LOG.warning("market_gate | clock_error=%s | sleep=%ss", e, int(cfg.poll_seconds))
++        return max(10, int(cfg.poll_seconds))
++
 +    if getattr(clock, "is_open", False):
 +        return None
++
 +    now = getattr(clock, "timestamp", None)
 +    nxt = getattr(clock, "next_open", None)
 +    if not now or not nxt:
 +        return max(10, int(cfg.poll_seconds))
++
 +    secs_to_open = int((nxt - now).total_seconds())
 +    pre = int(cfg.preopen_window_seconds or 0)
 +    if pre > 0 and secs_to_open <= pre:
 +        return None
++
 +    remain = max(secs_to_open - pre, 0)
 +    return int(min(max(remain, 10), 300))
 +
-@@ -401,6 +401,23 @@ def main():
+@@
+ def main():
+@@
          while True:
              if cfg.trading_paused:
                  time.sleep(cfg.poll_seconds)
                  continue
- 
+
 +            # Market-hours gate (prevents orders outside regular session; avoids stale-signal backlog)
 +            gate_sleep = _market_gate_sleep_seconds(tc, cfg)
 +            if gate_sleep is not None:
