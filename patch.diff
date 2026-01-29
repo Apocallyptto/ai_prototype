@@ -1,99 +1,127 @@
-diff --git a/services/signal_executor.py b/services/signal_executor.py
---- a/services/signal_executor.py
-+++ b/services/signal_executor.py
-@@ -99,6 +99,9 @@
+cd C:\Users\NDojc\Documents\GitHub\ai_prototype
 
-     symbol_cooldown_seconds: int
-     pick_ttl_seconds: int
-+
-+    trade_only_when_market_open: bool
-+    preopen_window_seconds: int
+@'
+import re
+from pathlib import Path
 
-     trading_paused: bool
-     dry_run: bool
-@@ -129,6 +132,8 @@
-         max_daily_loss_usd=_env_float("MAX_DAILY_LOSS_USD", 200.0),
-         symbol_cooldown_seconds=_env_int("SYMBOL_COOLDOWN_SECONDS", 60),
-         pick_ttl_seconds=_env_int("PICK_TTL_SECONDS", 120),
-+        trade_only_when_market_open=_env_bool("TRADE_ONLY_WHEN_MARKET_OPEN", True),
-+        preopen_window_seconds=_env_int("PREOPEN_WINDOW_SECONDS", 0),
-         trading_paused=_env_bool("TRADING_PAUSED", False),  # kill switch
-         dry_run=_env_bool("DRY_RUN", False),
-     )
-@@ -166,6 +171,41 @@
-         raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
-     return StockHistoricalDataClient(key, sec)
+path = Path("services/signal_executor.py")
+data = path.read_bytes()
+has_bom = data.startswith(b"\xef\xbb\xbf")
+src = data.decode("utf-8-sig" if has_bom else "utf-8")
 
-+
-+def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
-+    """
-+    Market-hours gate using Alpaca clock.
-+
-+    Returns:
-+        - None => ok to trade now
-+        - int  => sleep seconds and skip this loop iteration
-+    """
-+    if not cfg.trade_only_when_market_open:
-+        return None
-+    try:
-+        clock = tc.get_clock()
-+    except Exception as e:
-+        # fail-open: availability beats perfect gating; other risk guards still apply
-+        LOG.warning("market_gate | clock_error=%s | allow_trade", e)
-+        return None
-+
-+    if getattr(clock, "is_open", False):
-+        return None
-+
-+    now = getattr(clock, "timestamp", None)
-+    nxt = getattr(clock, "next_open", None)
-+    if not now or not nxt:
-+        return max(10, int(cfg.poll_seconds))
-+
-+    secs_to_open = int((nxt - now).total_seconds())
-+    pre = int(cfg.preopen_window_seconds or 0)
-+    if pre > 0 and secs_to_open <= pre:
-+        return None
-+
-+    remain = max(secs_to_open - pre, 0)
-+    # cap sleep so container stays responsive
-+    return int(min(max(remain, 10), 300))
+orig = src
 
- def fetch_new_signals(engine, cfg: Cfg, limit: int = 300) -> List[dict]:
-     q = text(
-@@ -464,13 +504,13 @@
-         "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
-         "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | MAX_POSITION_QTY=%s | ALLOW_ADD_TO_POSITION=%s | "
-         "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%.1f | "
--        "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
-+        "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | "
-         "TRADING_PAUSED=%s | DRY_RUN=%s",
-         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
-         cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.max_position_qty, cfg.allow_add_to_position,
-         cfg.alpaca_dedupe_minutes, cfg.cancel_opposite_open_orders, cfg.max_open_positions, cfg.max_open_orders,
-         cfg.daily_loss_stop_pct, cfg.max_daily_loss_usd, cfg.enable_daily_risk_guard,
--        cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds, cfg.trading_paused, cfg.dry_run
-+        cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds, cfg.trade_only_when_market_open, cfg.preopen_window_seconds, cfg.trading_paused, cfg.dry_run
-     )
+def ensure_cfg_fields(s: str) -> str:
+    if "trade_only_when_market_open" in s and "preopen_window_seconds" in s:
+        return s
+    pat = r"(\n\s*pick_ttl_seconds:\s*int\s*\n\s*\n)(\s*trading_paused:\s*bool)"
+    m = re.search(pat, s)
+    if not m:
+        raise SystemExit("ERROR: neviem nájsť miesto v Cfg (pick_ttl_seconds -> trading_paused).")
+    ins = "    trade_only_when_market_open: bool\n    preopen_window_seconds: int\n\n"
+    return s[:m.start(2)] + ins + s[m.start(2):]
 
-     while True:
-@@ -485,6 +525,20 @@
-             if n:
-                 LOG.info("auto_unpick | count=%s", n)
+def ensure_load_cfg(s: str) -> str:
+    if 'TRADE_ONLY_WHEN_MARKET_OPEN' in s and 'PREOPEN_WINDOW_SECONDS' in s:
+        return s
+    pat = r'(pick_ttl_seconds=_env_int\("PICK_TTL_SECONDS",\s*120\),\n)'
+    m = re.search(pat, s)
+    if not m:
+        raise SystemExit('ERROR: neviem nájsť riadok pick_ttl_seconds=_env_int("PICK_TTL_SECONDS", 120), v load_cfg().')
+    ins = (
+        m.group(1) +
+        '        trade_only_when_market_open=_env_bool("TRADE_ONLY_WHEN_MARKET_OPEN", True),\n' +
+        '        preopen_window_seconds=_env_int("PREOPEN_WINDOW_SECONDS", 0),\n'
+    )
+    return s[:m.start(1)] + ins + s[m.end(1):]
 
-+            # Market-hours gate (prevents orders outside regular session; avoids stale-signal backlog)
-+            gate_sleep = _market_gate_sleep_seconds(tc, cfg)
-+            if gate_sleep is not None:
-+                pending = fetch_new_signals(engine, cfg)
-+                if pending:
-+                    ids = [int(s["id"]) for s in pending]
-+                    mark(engine, ids, "skipped", "market_closed")
-+                    LOG.info("market_gate | market_closed | skipped=%s | sleep=%ss", len(ids), int(gate_sleep))
-+                else:
-+                    LOG.info("market_gate | market_closed | skipped=0 | sleep=%ss", int(gate_sleep))
-+                time.sleep(int(gate_sleep))
-+                continue
-+
-             signals = fetch_new_signals(engine, cfg)
-             LOG.info("fetch_new_signals | fetched %s rows", len(signals))
+MARKET_GATE_FUNC = r'''
+def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
+    """
+    Market-hours gate using Alpaca clock.
 
+    Returns:
+        - None => ok to trade now
+        - int  => sleep seconds and skip this loop iteration
+    """
+    if not cfg.trade_only_when_market_open:
+        return None
+    try:
+        clock = tc.get_clock()
+    except Exception as e:
+        # fail-open: availability beats perfect gating; other risk guards still apply
+        LOG.warning("market_gate | clock_error=%s | allow_trade", e)
+        return None
+
+    if getattr(clock, "is_open", False):
+        return None
+
+    now = getattr(clock, "timestamp", None)
+    nxt = getattr(clock, "next_open", None)
+    if not now or not nxt:
+        return max(10, int(cfg.poll_seconds))
+
+    secs_to_open = int((nxt - now).total_seconds())
+    pre = int(cfg.preopen_window_seconds or 0)
+    if pre > 0 and secs_to_open <= pre:
+        return None
+
+    remain = max(secs_to_open - pre, 0)
+    # cap sleep so container stays responsive
+    return int(min(max(remain, 10), 300))
+'''
+
+def ensure_market_gate_func(s: str) -> str:
+    if "def _market_gate_sleep_seconds" in s:
+        return s
+    m = re.search(r"def make_data_client\(\).*?:.*?\n(.*?\n)\s*return StockHistoricalDataClient\(key, sec\)\n", s, flags=re.S)
+    if not m:
+        # fallback: insert after the return line if we can find it
+        m2 = re.search(r"return StockHistoricalDataClient\(key, sec\)\n", s)
+        if not m2:
+            raise SystemExit("ERROR: neviem nájsť make_data_client / return StockHistoricalDataClient(key, sec).")
+        insert_pos = m2.end()
+        return s[:insert_pos] + "\n\n" + MARKET_GATE_FUNC.strip("\n") + "\n\n" + s[insert_pos:]
+    # insert right after the 'return StockHistoricalDataClient(...)' line
+    m2 = re.search(r"return StockHistoricalDataClient\(key, sec\)\n", s)
+    insert_pos = m2.end()
+    return s[:insert_pos] + "\n\n" + MARKET_GATE_FUNC.strip("\n") + "\n\n" + s[insert_pos:]
+
+def ensure_market_gate_block(s: str) -> str:
+    if 'LOG.info("market_gate | market_closed' in s or "market_closed" in s and "_market_gate_sleep_seconds" in s:
+        return s
+    pat = r"(\n(\s*)if cfg\.trading_paused:\n\2\s*time\.sleep\(cfg\.poll_seconds\)\n\2\s*continue\n)"
+    m = re.search(pat, s)
+    if not m:
+        raise SystemExit("ERROR: neviem nájsť blok if cfg.trading_paused ... continue v main loop-e.")
+    indent = m.group(2)
+    block = (
+        f"\n{indent}# Market-hours gate (prevents orders outside regular session; avoids stale-signal backlog)\n"
+        f"{indent}gate_sleep = _market_gate_sleep_seconds(tc, cfg)\n"
+        f"{indent}if gate_sleep is not None:\n"
+        f"{indent}    pending = fetch_new_signals(engine, cfg)\n"
+        f"{indent}    if pending:\n"
+        f"{indent}        ids = [int(x['id']) for x in pending]\n"
+        f"{indent}        mark(engine, ids, 'skipped', 'market_closed')\n"
+        f"{indent}        LOG.info('market_gate | market_closed | skipped=%s | sleep=%ss', len(ids), int(gate_sleep))\n"
+        f"{indent}    else:\n"
+        f"{indent}        LOG.info('market_gate | market_closed | skipped=0 | sleep=%ss', int(gate_sleep))\n"
+        f"{indent}    time.sleep(int(gate_sleep))\n"
+        f"{indent}    continue\n"
+    )
+    insert_pos = m.end(1)
+    return s[:insert_pos] + block + s[insert_pos:]
+
+src = ensure_cfg_fields(src)
+src = ensure_load_cfg(src)
+src = ensure_market_gate_func(src)
+src = ensure_market_gate_block(src)
+
+if src == orig:
+    print("OK: nič som nemenil (už to tam pravdepodobne je).")
+else:
+    out = (b"\xef\xbb\xbf" if has_bom else b"") + src.encode("utf-8")
+    path.write_bytes(out)
+    print("OK: upravené services/signal_executor.py")
+
+'@ | py -
