@@ -100,6 +100,9 @@ class Cfg:
     symbol_cooldown_seconds: int
     pick_ttl_seconds: int
 
+    trade_only_when_market_open: bool
+    preopen_window_seconds: int
+
     trading_paused: bool
     dry_run: bool
 
@@ -129,6 +132,8 @@ def load_cfg() -> Cfg:
         max_daily_loss_usd=_env_float("MAX_DAILY_LOSS_USD", 200.0),
         symbol_cooldown_seconds=_env_int("SYMBOL_COOLDOWN_SECONDS", 60),
         pick_ttl_seconds=_env_int("PICK_TTL_SECONDS", 120),
+        trade_only_when_market_open=_env_bool("TRADE_ONLY_WHEN_MARKET_OPEN", True),
+        preopen_window_seconds=_env_int("PREOPEN_WINDOW_SECONDS", 0),
         trading_paused=_env_bool("TRADING_PAUSED", False),  # kill switch
         dry_run=_env_bool("DRY_RUN", False),
     )
@@ -165,6 +170,41 @@ def make_data_client() -> StockHistoricalDataClient:
     if not key or not sec:
         raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
     return StockHistoricalDataClient(key, sec)
+
+
+def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
+    """
+    Market-hours gate using Alpaca clock.
+
+    Returns:
+        - None => ok to trade now
+        - int  => sleep seconds and skip this loop iteration
+    """
+    if not cfg.trade_only_when_market_open:
+        return None
+    try:
+        clock = tc.get_clock()
+    except Exception as e:
+        # fail-open: availability beats perfect gating; other risk guards still apply
+        LOG.warning("market_gate | clock_error=%s | allow_trade", e)
+        return None
+
+    if getattr(clock, "is_open", False):
+        return None
+
+    now = getattr(clock, "timestamp", None)
+    nxt = getattr(clock, "next_open", None)
+    if not now or not nxt:
+        return max(10, int(cfg.poll_seconds))
+
+    secs_to_open = int((nxt - now).total_seconds())
+    pre = int(cfg.preopen_window_seconds or 0)
+    if pre > 0 and secs_to_open <= pre:
+        return None
+
+    remain = max(secs_to_open - pre, 0)
+    return int(min(max(remain, 10), 300))
+
 
 
 def fetch_new_signals(engine, cfg: Cfg, limit: int = 300) -> List[dict]:
@@ -478,6 +518,31 @@ def main() -> None:
             n = unpick_stale_picks(engine, cfg)
             if n:
                 LOG.info("auto_unpick | count=%s", n)
+
+            # Market-hours gate (prevents orders outside regular session; avoids stale-signal backlog)
+
+            gate_sleep = _market_gate_sleep_seconds(tc, cfg)
+
+            if gate_sleep is not None:
+
+                pending = fetch_new_signals(engine, cfg)
+
+                if pending:
+
+                    ids = [int(x['id']) for x in pending]
+
+                    mark(engine, ids, 'skipped', 'market_closed')
+
+                    LOG.info('market_gate | market_closed | skipped=%s | sleep=%ss', len(ids), int(gate_sleep))
+
+                else:
+
+                    LOG.info('market_gate | market_closed | skipped=0 | sleep=%ss', int(gate_sleep))
+
+                time.sleep(int(gate_sleep))
+
+                continue
+
 
             signals = fetch_new_signals(engine, cfg)
             LOG.info("fetch_new_signals | fetched %s rows", len(signals))
