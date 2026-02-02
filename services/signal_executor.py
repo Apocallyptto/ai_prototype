@@ -172,6 +172,7 @@ def make_data_client() -> StockHistoricalDataClient:
     return StockHistoricalDataClient(key, sec)
 
 
+
 def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
     """
     Market-hours gate using Alpaca clock.
@@ -182,6 +183,7 @@ def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
     """
     if not cfg.trade_only_when_market_open:
         return None
+
     try:
         clock = tc.get_clock()
     except Exception as e:
@@ -199,13 +201,15 @@ def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
 
     secs_to_open = int((nxt - now).total_seconds())
     pre = int(cfg.preopen_window_seconds or 0)
+
+    # Allow trading within PREOPEN_WINDOW_SECONDS before open (optional)
     if pre > 0 and secs_to_open <= pre:
         return None
 
     remain = max(secs_to_open - pre, 0)
+
+    # Cap sleep so container stays responsive
     return int(min(max(remain, 10), 300))
-
-
 
 def fetch_new_signals(engine, cfg: Cfg, limit: int = 300) -> List[dict]:
     q = text(
@@ -504,13 +508,13 @@ def main() -> None:
         "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
         "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | MAX_POSITION_QTY=%s | ALLOW_ADD_TO_POSITION=%s | "
         "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%.1f | "
-        "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
+        "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | "
         "TRADING_PAUSED=%s | DRY_RUN=%s",
         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
         cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.max_position_qty, cfg.allow_add_to_position,
         cfg.alpaca_dedupe_minutes, cfg.cancel_opposite_open_orders, cfg.max_open_positions, cfg.max_open_orders,
         cfg.daily_loss_stop_pct, cfg.max_daily_loss_usd, cfg.enable_daily_risk_guard,
-        cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds, cfg.trading_paused, cfg.dry_run
+        cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds, cfg.trade_only_when_market_open, cfg.preopen_window_seconds, cfg.trading_paused, cfg.dry_run
     )
 
     while True:
@@ -518,6 +522,17 @@ def main() -> None:
             n = unpick_stale_picks(engine, cfg)
             if n:
                 LOG.info("auto_unpick | count=%s", n)
+
+            # Early kill switch (do not consume signals; just wait)
+
+            if cfg.trading_paused:
+
+                LOG.info("trading_paused | sleep=%ss", cfg.poll_seconds)
+
+                time.sleep(cfg.poll_seconds)
+
+                continue
+
 
             # Market-hours gate (prevents orders outside regular session; avoids stale-signal backlog)
 
@@ -529,19 +544,20 @@ def main() -> None:
 
                 if pending:
 
-                    ids = [int(x['id']) for x in pending]
+                    ids = [int(s["id"]) for s in pending]
 
-                    mark(engine, ids, 'skipped', 'market_closed')
+                    mark(engine, ids, "skipped", "market_closed")
 
-                    LOG.info('market_gate | market_closed | skipped=%s | sleep=%ss', len(ids), int(gate_sleep))
+                    LOG.info("market_gate | market_closed | skipped=%s | sleep=%ss", len(ids), int(gate_sleep))
 
                 else:
 
-                    LOG.info('market_gate | market_closed | skipped=0 | sleep=%ss', int(gate_sleep))
+                    LOG.info("market_gate | market_closed | skipped=0 | sleep=%ss", int(gate_sleep))
 
                 time.sleep(int(gate_sleep))
 
                 continue
+
 
 
             signals = fetch_new_signals(engine, cfg)
