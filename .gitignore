@@ -10,3 +10,7 @@ __pycache__/
 patch.diff
 change.patch.diff
 market_gate*.patch.diff
+*.patch.diff
+patch.diff
+change.patch.diff
+market_gate*.patch.diff
