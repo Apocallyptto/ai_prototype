@@ -6,3 +6,7 @@ __pycache__/
 
 # Streamlit
 .streamlit/secrets.toml
+*.patch.diff
+patch.diff
+change.patch.diff
+market_gate*.patch.diff
