@@ -15,3 +15,5 @@ patch.diff
 change.patch.diff
 market_gate*.patch.diff
 .env
+*.diff
+
