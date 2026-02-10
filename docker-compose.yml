@@ -65,6 +65,7 @@ services:
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
       POLL_SECONDS: "${EXEC_POLL_SECONDS:-20}"
+      ALLOW_TRADE_ON_CLOCK_ERROR: "${EXEC_ALLOW_TRADE_ON_CLOCK_ERROR:-0}"
     command: sh -lc "python -u -m services.signal_executor"
     restart: always
 

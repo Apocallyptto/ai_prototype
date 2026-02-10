@@ -1,23 +1,22 @@
 # --- core ---
-pandas
+pandas==2.3.3
 numpy
 psycopg2-binary
 SQLAlchemy>=2.0
 
 # --- ML ---
-scikit-learn
+scikit-learn==1.7.2
 joblib
 
 # --- data sources ---
 alpaca-py
+alpaca-trade-api
 yfinance
 
 # --- optional UI/tools ---
 streamlit
 plotly
 
-alpaca-py
-alpaca-trade-api
 # --- HTTP stack (pin to avoid urllib3/six breakage) ---
 requests==2.31.0
 urllib3==1.26.18
@@ -25,4 +24,3 @@ six==1.16.0
 certifi>=2024.7.4
 charset-normalizer>=3.3.2
 idna>=3.7
-scikit-learn==1.7.2
