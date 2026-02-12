@@ -687,6 +687,36 @@ def main() -> None:
                     _cancel_opposite_open_orders(tc, sym, side)
 
                 try:
+                    # Guard: avoid Alpaca 40310000 when long shares are already held by existing SELL orders (e.g., exit OCO)
+                    if side == "sell" and pos_qty > 0:
+                        open_orders_raw = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)) or []
+                        held_sell_qty = 0.0
+                        sym_u = str(sym).upper()
+                        for oo in open_orders_raw:
+                            if str(getattr(oo, "symbol", "") or "").upper() != sym_u:
+                                continue
+                            if not str(getattr(oo, "side", "") or "").lower().endswith("sell"):
+                                continue
+                            try:
+                                held_sell_qty += float(getattr(oo, "qty", 0) or 0)
+                            except Exception:
+                                pass
+                        available_qty = float(pos_qty) - float(held_sell_qty)
+                        if available_qty < 1:
+                            mark_one(engine, sid, "skipped", f"held_for_orders pos={pos_qty} held_sell={held_sell_qty}")
+                            LOG.info("skip | sid=%s %s sell | held_for_orders pos=%.2f held_sell=%.2f",
+                                     sid, sym_u, float(pos_qty), held_sell_qty)
+                            continue
+                        if qty > int(available_qty):
+                            new_qty = int(available_qty)
+                            if new_qty < 1:
+                                mark_one(engine, sid, "skipped", f"held_for_orders pos={pos_qty} held_sell={held_sell_qty}")
+                                LOG.info("skip | sid=%s %s sell | held_for_orders pos=%.2f held_sell=%.2f",
+                                         sid, sym_u, float(pos_qty), held_sell_qty)
+                                continue
+                            LOG.info("adjust_qty | sid=%s %s sell | qty=%s -> %s | pos=%.2f held_sell=%.2f",
+                                     sid, sym_u, qty, new_qty, float(pos_qty), held_sell_qty)
+                            qty = new_qty
                     alpaca_id = submit_limit(tc, sym, side, qty, limit_price)
                     mark_one(engine, sid, "submitted", "order submitted")
                     LOG.info(
