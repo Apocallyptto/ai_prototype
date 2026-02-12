@@ -19,3 +19,5 @@ market_gate*.patch.diff
 
 
 *.diff
+
+services/*.bak_heldsell_*
