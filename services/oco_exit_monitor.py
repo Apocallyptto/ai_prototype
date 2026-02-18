@@ -1,50 +1,43 @@
 import os
 import time
-import uuid
 import logging
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from collections import defaultdict
+from typing import Optional
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.trading.requests import (
     GetOrdersRequest,
+    GetOrderByIdRequest,
+    MarketOrderRequest,
     LimitOrderRequest,
+    StopOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
-)
-from alpaca.trading.enums import (
-    QueryOrderStatus,
-    OrderClass,
-    OrderSide,
-    TimeInForce,
+    ReplaceOrderRequest,
 )
 
-try:
-    # available in newer alpaca-py
-    from alpaca.trading.enums import PositionIntent
-except Exception:  # pragma: no cover
-    PositionIntent = None
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("oco_exit_monitor")
-
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
 
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
-        return int(default)
-    try:
-        return int(float(v))
-    except Exception:
-        return int(default)
+        return default
+    return int(v)
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return float(v)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -54,38 +47,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
     v = str(v).strip().lower()
     if v in ("1", "true", "yes", "y", "on"):
         return True
-    if v in ("0", "false", "no", "n", "off"):
+    if v in ("0", "false", "no", "n", "off", ""):
         return False
     return default
 
 
-def _val(x):
-    return getattr(x, "value", x)
+def _resolve_mode() -> str:
+    return (os.getenv("TRADING_MODE") or "paper").strip().lower()
 
 
-def _as_float(x):
-    if x is None:
-        return None
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
-def _as_dt(x):
-    if x is None:
-        return None
-    if isinstance(x, datetime):
-        return x if x.tzinfo is not None else x.replace(tzinfo=timezone.utc)
-    try:
-        s = str(x)
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def _round_price(px: float) -> float:
-    return round(float(px), 2)
+def _resolve_paper() -> bool:
+    # If ALPACA_PAPER is explicitly set, respect it (hard override).
+    if os.getenv("ALPACA_PAPER") is not None:
+        return _env_bool("ALPACA_PAPER", default=True)
+    return _resolve_mode() != "live"
 
 
 def get_trading_client() -> TradingClient:
@@ -94,473 +69,252 @@ def get_trading_client() -> TradingClient:
     if not key or not secret:
         raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
 
-    paper = _env_bool("ALPACA_PAPER", default=True)
+    paper = _resolve_paper()
     return TradingClient(key, secret, paper=paper)
 
 
+def get_data_client() -> StockHistoricalDataClient:
+    key = os.getenv("ALPACA_API_KEY")
+    secret = os.getenv("ALPACA_API_SECRET")
+    if not key or not secret:
+        raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
+    return StockHistoricalDataClient(key, secret)
+
+
 def _tp_sl_from_pct(ref_price: float, position_qty: float) -> tuple[float, float]:
-    tp_pct = _env_float("OCO_TP_PCT", 0.015)
-    sl_pct = _env_float("OCO_SL_PCT", 0.010)
-
-    if position_qty > 0:  # long -> exits are SELL
-        tp = ref_price * (1.0 + tp_pct)
-        sl = ref_price * (1.0 - sl_pct)
-    else:  # short -> exits are BUY
-        tp = ref_price * (1.0 - tp_pct)
-        sl = ref_price * (1.0 + sl_pct)
-
-    return _round_price(tp), _round_price(sl)
-
-
-def _get_ref_price(position) -> float | None:
-    for attr in ("current_price", "avg_entry_price"):
-        v = _as_float(getattr(position, attr, None))
-        if v and v > 0:
-            return v
-    return None
-
-
-def _symbols_filter() -> list[str] | None:
-    s = (os.getenv("SYMBOLS_FILTER") or "").strip()
-    if not s:
-        return None
-    return [x.strip().upper() for x in s.split(",") if x.strip()]
-
-
-def _is_oco(order) -> bool:
-    return str(_val(getattr(order, "order_class", None))).lower() == "oco"
-
-
-def _is_ours_exit(order) -> bool:
-    coid = (getattr(order, "client_order_id", "") or "")
-    return coid.startswith("exit-oco-")
-
-
-def _tif_str(order) -> str:
-    return str(_val(getattr(order, "time_in_force", ""))).lower()
-
-
-def _side_str(order) -> str:
-    return str(_val(getattr(order, "side", ""))).lower()
-
-
-def _status_str(order) -> str:
-    return str(_val(getattr(order, "status", ""))).lower()
-
-
-def _qty_norm(x) -> float | None:
-    v = _as_float(x)
-    if v is None:
-        return None
-    return abs(float(v))
-
-
-def _list_oco_parents(tc: TradingClient, symbol: str):
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, limit=500)
-    orders = tc.get_orders(req) or []
-    out = []
-    for o in orders:
-        if str(getattr(o, "symbol", "") or "").upper() != symbol:
-            continue
-        if not _is_oco(o):
-            continue
-        out.append(o)
-    return out
-
-
-def _collect_cancel_ids(oco_parent) -> list[str]:
-    ids: list[str] = []
-    if getattr(oco_parent, "id", None):
-        ids.append(str(oco_parent.id))
-
-    for leg in (getattr(oco_parent, "legs", None) or []):
-        if isinstance(leg, dict):
-            lid = leg.get("id")
-        else:
-            lid = getattr(leg, "id", None)
-        if lid:
-            ids.append(str(lid))
-
-    seen = set()
-    uniq = []
-    for i in ids:
-        if i in seen:
-            continue
-        seen.add(i)
-        uniq.append(i)
-    return uniq
-
-
-def _extract_tp_sl_from_oco_parent(oco_parent) -> tuple[float | None, float | None]:
-    """
-    Alpaca OCO representation often looks like you pasted:
-      - parent is LIMIT with limit_price = take-profit
-      - legs contains 1 STOP (held)
-      - parent.take_profit/stop_loss can be None
-    So we treat parent.limit_price as TP and STOP leg stop_price as SL.
-    """
-    tp = None
-    sl = None
-
-    # ---- TP candidates ----
-    tp = _as_float(getattr(oco_parent, "limit_price", None))
-
-    if tp is None:
-        take_profit = getattr(oco_parent, "take_profit", None)
-        if take_profit is not None:
-            if isinstance(take_profit, dict):
-                tp = _as_float(take_profit.get("limit_price"))
-            else:
-                tp = _as_float(getattr(take_profit, "limit_price", None))
-
-    if tp is None:
-        # sometimes TP is a leg
-        for leg in (getattr(oco_parent, "legs", None) or []):
-            if isinstance(leg, dict):
-                typ = str(leg.get("order_type") or leg.get("type") or "").lower()
-                if "limit" in typ:
-                    tp = _as_float(leg.get("limit_price"))
-                    if tp is not None:
-                        break
-            else:
-                typ = str(getattr(leg, "order_type", None) or getattr(leg, "type", None) or "").lower()
-                if "limit" in typ:
-                    tp = _as_float(getattr(leg, "limit_price", None))
-                    if tp is not None:
-                        break
-
-    # ---- SL candidates ----
-    stop_loss = getattr(oco_parent, "stop_loss", None)
-    if stop_loss is not None:
-        if isinstance(stop_loss, dict):
-            sl = _as_float(stop_loss.get("stop_price"))
-        else:
-            sl = _as_float(getattr(stop_loss, "stop_price", None))
-
-    if sl is None:
-        for leg in (getattr(oco_parent, "legs", None) or []):
-            if isinstance(leg, dict):
-                typ = str(leg.get("order_type") or leg.get("type") or "").lower()
-                if "stop" in typ:
-                    sl = _as_float(leg.get("stop_price"))
-                    if sl is not None:
-                        break
-            else:
-                typ = str(getattr(leg, "order_type", None) or getattr(leg, "type", None) or "").lower()
-                if "stop" in typ:
-                    sl = _as_float(getattr(leg, "stop_price", None))
-                    if sl is not None:
-                        break
-
-    if tp is not None:
-        tp = _round_price(tp)
-    if sl is not None:
-        sl = _round_price(sl)
-
+    tp_pct = _env_float("TP_PCT", 1.0)
+    sl_pct = _env_float("SL_PCT", 0.75)
+    # For long positions, tp above and sl below; for shorts we invert later by side.
+    tp = ref_price * (1.0 + tp_pct / 100.0)
+    sl = ref_price * (1.0 - sl_pct / 100.0)
     return tp, sl
 
 
-def _submit_exit_oco(
+def _atr_pct(dc: StockHistoricalDataClient, sym: str, lookback: int = 50) -> Optional[float]:
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=sym,
+            timeframe=TimeFrame.Minute,
+            start=None,
+            end=None,
+            limit=lookback,
+        )
+        bars = dc.get_stock_bars(req).data.get(sym, [])
+        if not bars or len(bars) < 2:
+            return None
+        trs = []
+        prev_close = float(bars[0].close)
+        for b in bars[1:]:
+            high = float(b.high)
+            low = float(b.low)
+            close = float(b.close)
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            trs.append(tr)
+            prev_close = close
+        if not trs:
+            return None
+        atr = sum(trs) / float(len(trs))
+        last_close = float(bars[-1].close)
+        if last_close <= 0:
+            return None
+        return atr / last_close
+    except Exception as e:
+        log.warning("atr_pct error %s: %s", sym, e)
+        return None
+
+
+def _get_open_orders(tc: TradingClient, symbols: Optional[list[str]] = None):
+    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True, symbols=symbols)
+    return tc.get_orders(req) or []
+
+
+def _is_exit_order(o, prefix: str) -> bool:
+    cid = (getattr(o, "client_order_id", "") or "")
+    return cid.startswith(prefix)
+
+
+def _place_exit_oco(
     tc: TradingClient,
-    symbol: str,
-    position_qty: float,
+    sym: str,
+    qty: float,
+    side: OrderSide,
     tp: float,
     sl: float,
-    tif: TimeInForce = TimeInForce.GTC,
-):
-    side = OrderSide.SELL if position_qty > 0 else OrderSide.BUY
+    tif: TimeInForce,
+    allow_ah: bool,
+    prefix: str,
+    dry_run: bool,
+) -> bool:
+    # For long (BUY entry), exits are SELL; for short, exits are BUY.
+    exit_side = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
 
-    intent = None
-    if PositionIntent is not None:
-        if position_qty > 0:
-            intent = getattr(PositionIntent, "SELL_TO_CLOSE", None)
-        else:
-            intent = getattr(PositionIntent, "BUY_TO_CLOSE", None)
-
-    qty = abs(float(position_qty))
-    qty = int(qty) if float(qty).is_integer() else qty
-
-    kwargs = {}
-    if intent is not None:
-        kwargs["position_intent"] = intent
-
-    req = LimitOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=side,
-        order_class=OrderClass.OCO,
-        time_in_force=tif,
-        limit_price=tp,
-        # these may appear as None in the returned model for OCO; that's OK
-        take_profit=TakeProfitRequest(limit_price=tp),
-        stop_loss=StopLossRequest(stop_price=sl),
-        client_order_id=f"exit-oco-{symbol.lower()}-{uuid.uuid4().hex[:8]}",
-        extended_hours=False,
-        **kwargs,
-    )
-
-    return tc.submit_order(req)
-
-
-def _cancel_ids(tc: TradingClient, ids: list[str]) -> None:
-    for oid in ids:
-        try:
-            tc.cancel_order_by_id(oid)
-        except Exception:
-            pass
-
-
-def _expected_exit_side(position_qty: float) -> str:
-    return "sell" if position_qty > 0 else "buy"
-
-
-def _is_in_flight(order) -> bool:
-    """
-    Avoid cancel/replace loops when the exit is already executing.
-    """
-    inflight = {"partially_filled", "pending_cancel", "pending_replace", "pending_review"}
-    if _status_str(order) in inflight:
+    client_oid_parent = f"{prefix}{sym}-{int(time.time())}"
+    if dry_run:
+        log.info("DRY_RUN place_exit_oco | sym=%s qty=%s exit_side=%s tp=%.4f sl=%.4f tif=%s allow_ah=%s cid=%s",
+                 sym, qty, exit_side.value, tp, sl, tif.value, allow_ah, client_oid_parent)
         return True
 
-    for leg in (getattr(order, "legs", None) or []):
-        if isinstance(leg, dict):
-            st = str(leg.get("status") or "").lower()
-        else:
-            st = _status_str(leg)
-        if st in inflight:
-            return True
-
-    return False
-
-
-def _is_valid_exit_oco_for_position(order, position_qty: float, allow_stop_only: bool) -> tuple[bool, str]:
-    if not _is_oco(order):
-        return False, "not_oco"
-
-    tif = _tif_str(order)
-    if tif != "gtc":
-        return False, f"bad_tif:{tif}"
-
-    if not _is_ours_exit(order):
-        return False, "not_ours"
-
-    exp_side = _expected_exit_side(position_qty)
-    if _side_str(order) != exp_side:
-        return False, f"bad_side:{_side_str(order)}!= {exp_side}"
-
-    oq = _qty_norm(getattr(order, "qty", None))
-    pq = _qty_norm(position_qty)
-    if oq is not None and pq is not None:
-        if abs(oq - pq) > 1e-9:
-            return False, f"bad_qty:{oq}!= {pq}"
-
-    tp, sl = _extract_tp_sl_from_oco_parent(order)
-    if sl is None:
-        return False, "missing_sl"
-    if (tp is None) and (not allow_stop_only):
-        return False, "missing_tp"
-
-    return True, "ok"
-
-
-def _needs_renew(order, renew_days: int) -> bool:
-    if renew_days <= 0:
+    # Bracket class with take profit & stop loss legs
+    try:
+        req = MarketOrderRequest(
+            symbol=sym,
+            qty=qty,
+            side=exit_side,
+            time_in_force=tif,
+            order_class="bracket",
+            take_profit=TakeProfitRequest(limit_price=str(round(tp, 2))),
+            stop_loss=StopLossRequest(stop_price=str(round(sl, 2))),
+            client_order_id=client_oid_parent,
+            extended_hours=allow_ah,
+        )
+        tc.submit_order(req)
+        return True
+    except Exception as e:
+        log.error("place_exit_oco failed sym=%s: %s", sym, e, exc_info=True)
         return False
-    exp = _as_dt(getattr(order, "expires_at", None))
-    if exp is None:
-        return False
-    now = datetime.now(timezone.utc)
-    return exp <= (now + timedelta(days=renew_days))
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-    )
+def _needs_protection(open_orders, sym: str, prefix: str) -> bool:
+    for o in open_orders:
+        if (getattr(o, "symbol", "") or "").upper() != sym.upper():
+            continue
+        if _is_exit_order(o, prefix=prefix):
+            return False
+        # also treat bracket legs as protected (some APIs don't propagate CID)
+        if (getattr(o, "order_class", "") or "") in ("bracket", "oco", "oto"):
+            return False
+    return True
 
-    poll = _env_float("POLL_SECONDS", 5.0)
-    heartbeat = _env_float("HEARTBEAT_SECONDS", 60.0)
-    sym_filter = _symbols_filter()
 
-    treat_any_oco_as_protected = _env_bool("OCO_TREAT_ANY_OCO_AS_PROTECTED", True)
-    allow_stop_only = _env_bool("OCO_ALLOW_STOP_ONLY", False)
-    renew_days = _env_int("OCO_RENEW_DAYS", 3)
+def main():
+    poll_seconds = _env_int("POLL_SECONDS", 5)
+    heartbeat_seconds = _env_int("HEARTBEAT_SECONDS", 60)
 
-    tc = get_trading_client()
+    min_qty = float(os.getenv("MIN_QTY", "0") or "0")
+    qty_buffer_pct = _env_float("QTY_BUFFER_PCT", 0.0)
+
+    use_atr = _env_bool("USE_ATR", True)
+    atr_lookback = _env_int("ATR_LOOKBACK", 50)
+    atr_mult_tp = _env_float("ATR_MULT_TP", 2.0)
+    atr_mult_sl = _env_float("ATR_MULT_SL", 1.5)
+
+    tp_pct = _env_float("TP_PCT", 1.0)
+    sl_pct = _env_float("SL_PCT", 0.75)
+
+    allow_ah = _env_bool("ALLOW_AH", False)
+    tif = TimeInForce(os.getenv("TIF", "day").strip().lower())
+
+    enable_repair = _env_bool("ENABLE_REPAIR", True)
+    dry_run = _env_bool("DRY_RUN", False)
+
+    prefix = os.getenv("EXIT_PREFIX", "EXIT-OCO-").strip()
+
+    mode = _resolve_mode()
+    paper = _resolve_paper()
+    base = os.getenv("ALPACA_BASE_URL")
 
     log.info(
-        "Started | poll=%.1fs | heartbeat=%.1fs | symbols_filter=%s | treat_any_oco_as_protected=%s | allow_stop_only=%s | renew_days=%s",
-        poll,
-        heartbeat,
-        sym_filter,
-        treat_any_oco_as_protected,
-        allow_stop_only,
-        renew_days,
+        "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | min_qty=%s | qty_buffer_pct=%s | use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | allow_ah=%s | tif=%s | enable_repair=%s | dry_run=%s | prefix=%s",
+        mode, paper, base, poll_seconds, heartbeat_seconds, min_qty, qty_buffer_pct, use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct, allow_ah, tif.value, enable_repair, dry_run, prefix
     )
 
-    last_hb = 0.0
+    tc = get_trading_client()
+    dc = get_data_client()
+
+    last_heartbeat = 0.0
+    counts = defaultdict(int)
+    errors = 0
 
     while True:
-        stats = {
-            "positions": 0,
-            "protected": 0,
-            "placed": 0,
-            "repaired": 0,
-            "skipped_closing": 0,
-            "open_orders": 0,
-            "errors": 0,
-            "unprotected": [],
-        }
-
         try:
             positions = tc.get_all_positions() or []
-            stats["positions"] = len(positions)
+            open_orders = _get_open_orders(tc)
 
-            try:
-                stats["open_orders"] = len(
-                    tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=False, limit=500)) or []
-                )
-            except Exception:
-                stats["open_orders"] = 0
+            protected = 0
+            placed = 0
+            repaired = 0
+            skipped_closing = 0
+            unprotected = []
 
             for p in positions:
-                sym = getattr(p, "symbol", None)
-                if not sym:
-                    continue
-                sym = str(sym).upper()
-
-                if sym_filter and sym not in sym_filter:
-                    continue
-
-                qty = _as_float(getattr(p, "qty", None)) or 0.0
+                sym = (getattr(p, "symbol", "") or "").upper()
+                qty = float(getattr(p, "qty", 0) or 0)
                 if qty == 0:
                     continue
 
-                if str(_val(getattr(p, "side", ""))).lower() == "closed":
-                    stats["skipped_closing"] += 1
+                side = OrderSide.BUY if qty > 0 else OrderSide.SELL
+                qty_abs = abs(qty)
+                if qty_abs < min_qty:
                     continue
 
-                oco_parents = _list_oco_parents(tc, sym)
-                ours = [o for o in oco_parents if _is_ours_exit(o)]
-                others = [o for o in oco_parents if not _is_ours_exit(o)]
+                # buffer qty down a bit if desired
+                qty_eff = qty_abs * (1.0 - qty_buffer_pct / 100.0)
+                if qty_eff <= 0:
+                    continue
 
-                if ours:
-                    def _created(o):
-                        return _as_dt(getattr(o, "created_at", None)) or datetime(1970, 1, 1, tzinfo=timezone.utc)
+                if not _needs_protection(open_orders, sym, prefix=prefix):
+                    protected += 1
+                    continue
 
-                    ours_sorted = sorted(ours, key=_created, reverse=True)
-                    primary = ours_sorted[0]
+                unprotected.append(sym)
 
-                    if _is_in_flight(primary):
-                        stats["protected"] += 1
-                        continue
+                # reference price = avg entry price (fallback to current price if missing)
+                avg_entry = float(getattr(p, "avg_entry_price", 0) or 0)
+                ref_price = avg_entry if avg_entry > 0 else float(getattr(p, "current_price", 0) or 0)
+                if ref_price <= 0:
+                    continue
 
-                    ok, reason = _is_valid_exit_oco_for_position(primary, qty, allow_stop_only)
-
-                    if ok and _needs_renew(primary, renew_days):
-                        ok = False
-                        reason = f"renew_before_expiry({renew_days}d)"
-
-                    if ok and len(ours_sorted) > 1:
-                        ok = False
-                        reason = f"duplicate_exits({len(ours_sorted)})"
-
-                    if not ok:
-                        tp, sl = _extract_tp_sl_from_oco_parent(primary)
-                        if sl is None or (tp is None and not allow_stop_only):
-                            ref = _get_ref_price(p)
-                            if ref is None:
-                                stats["errors"] += 1
-                                log.warning("%s: cannot repair exit OCO (%s) because no ref price", sym, reason)
-                                stats["unprotected"].append(sym)
-                                continue
-                            tp, sl = _tp_sl_from_pct(ref, qty)
-
-                        cancel_ids = []
-                        for o in ours_sorted:
-                            if _is_in_flight(o):
-                                cancel_ids = []
-                                break
-                            cancel_ids.extend(_collect_cancel_ids(o))
-
-                        if not cancel_ids:
-                            stats["protected"] += 1
-                            continue
-
-                        cancel_ids = list(dict.fromkeys(cancel_ids))
-
-                        log.info(
-                            "Repair EXIT OCO | %s | reason=%s | cancel_ids=%s | tp=%s sl=%s",
-                            sym,
-                            reason,
-                            ",".join(cancel_ids),
-                            tp,
-                            sl,
-                        )
-                        _cancel_ids(tc, cancel_ids)
-                        new_o = _submit_exit_oco(tc, sym, qty, tp, sl, tif=TimeInForce.GTC)
-                        stats["repaired"] += 1
-                        stats["protected"] += 1
-                        log.info(
-                            "Repaired EXIT OCO | %s | order_id=%s tif=%s expires_at=%s",
-                            sym,
-                            getattr(new_o, "id", None),
-                            getattr(new_o, "time_in_force", None),
-                            getattr(new_o, "expires_at", None),
-                        )
+                # compute tp/sl either ATR-based or pct-based
+                if use_atr:
+                    atrp = _atr_pct(dc, sym, lookback=atr_lookback)
+                    if atrp is None:
+                        tp, sl = _tp_sl_from_pct(ref_price, qty_eff)
                     else:
-                        stats["protected"] += 1
+                        if side == OrderSide.BUY:
+                            tp = ref_price * (1.0 + atrp * atr_mult_tp)
+                            sl = ref_price * (1.0 - atrp * atr_mult_sl)
+                        else:
+                            tp = ref_price * (1.0 - atrp * atr_mult_tp)
+                            sl = ref_price * (1.0 + atrp * atr_mult_sl)
+                else:
+                    if side == OrderSide.BUY:
+                        tp = ref_price * (1.0 + tp_pct / 100.0)
+                        sl = ref_price * (1.0 - sl_pct / 100.0)
+                    else:
+                        tp = ref_price * (1.0 - tp_pct / 100.0)
+                        sl = ref_price * (1.0 + sl_pct / 100.0)
 
-                    continue
+                ok = _place_exit_oco(
+                    tc=tc,
+                    sym=sym,
+                    qty=qty_eff,
+                    side=side,
+                    tp=tp,
+                    sl=sl,
+                    tif=tif,
+                    allow_ah=allow_ah,
+                    prefix=prefix,
+                    dry_run=dry_run,
+                )
+                if ok:
+                    placed += 1
+                else:
+                    errors += 1
 
-                if others and treat_any_oco_as_protected:
-                    stats["protected"] += 1
-                    continue
-
-                ref = _get_ref_price(p)
-                if ref is None:
-                    stats["errors"] += 1
-                    log.warning("%s: no ref price on position -> cannot place exit OCO", sym)
-                    stats["unprotected"].append(sym)
-                    continue
-
-                tp, sl = _tp_sl_from_pct(ref, qty)
-
-                new_o = _submit_exit_oco(tc, sym, qty, tp, sl, tif=TimeInForce.GTC)
-                stats["placed"] += 1
-                stats["protected"] += 1
+            # heartbeat
+            now = time.time()
+            if now - last_heartbeat >= heartbeat_seconds:
+                last_heartbeat = now
                 log.info(
-                    "Placed EXIT OCO | %s qty=%s ref=%s tp=%s sl=%s | order_id=%s expires_at=%s",
-                    sym,
-                    qty,
-                    _round_price(ref),
-                    tp,
-                    sl,
-                    getattr(new_o, "id", None),
-                    getattr(new_o, "expires_at", None),
+                    "Heartbeat | positions=%s protected=%s placed=%s repaired=%s skipped_closing=%s open_orders=%s errors=%s | unprotected=%s",
+                    len(positions), protected, placed, repaired, skipped_closing, len(open_orders), errors, unprotected
                 )
 
         except Exception:
-            stats["errors"] += 1
-            log.exception("cycle_error")
+            errors += 1
+            log.error("cycle_error", exc_info=True)
 
-        now = time.time()
-        if now - last_hb >= heartbeat:
-            log.info(
-                "Heartbeat | positions=%d protected=%d placed=%d repaired=%d skipped_closing=%d open_orders=%d errors=%d | unprotected=%s",
-                stats["positions"],
-                stats["protected"],
-                stats["placed"],
-                stats["repaired"],
-                stats["skipped_closing"],
-                stats["open_orders"],
-                stats["errors"],
-                stats["unprotected"],
-            )
-            last_hb = now
-
-        time.sleep(poll)
+        time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":
