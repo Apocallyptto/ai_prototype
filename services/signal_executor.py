@@ -158,12 +158,32 @@ def make_engine():
     return create_engine(db_url, pool_pre_ping=True)
 
 
+def _resolve_trading_mode() -> str:
+    """Return normalized trading mode.
+
+    Supported values:
+      - live  -> use Alpaca live trading endpoints
+      - paper -> use Alpaca paper trading endpoints
+
+    Backwards compatibility:
+      If TRADING_MODE is not set, we fall back to ALPACA_PAPER (default True).
+    """
+    mode = (os.getenv("TRADING_MODE") or "").strip().lower()
+    if mode:
+        return mode
+    return "paper" if _env_bool("ALPACA_PAPER", True) else "live"
+
+
+def _resolve_paper_flag() -> bool:
+    return _resolve_trading_mode() != "live"
+
+
 def make_trading_client() -> TradingClient:
     key = os.getenv("ALPACA_API_KEY")
     sec = os.getenv("ALPACA_API_SECRET")
     if not key or not sec:
         raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
-    return TradingClient(key, sec, paper=_env_bool("ALPACA_PAPER", True))
+    return TradingClient(key, sec, paper=_resolve_paper_flag())
 
 
 def make_data_client() -> StockHistoricalDataClient:
