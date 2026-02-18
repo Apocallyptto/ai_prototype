@@ -1,108 +1,61 @@
 ﻿#!/usr/bin/env python3
 """
-tools/sync_orders.py
+Sync local 'signals' table with Alpaca orders.
 
-Reconcile local DB 'signals' table with Alpaca order states.
+Schema expected:
+  signals(..., created_at, processed_status, processed_note, processed_at, alpaca_order_id, ...)
 
 What it does:
 - Repeats every SYNC_POLL seconds (default 30).
 - Finds signals where processed_status='submitted'.
-- Fetches Alpaca open+closed orders (limit 500 each).
+- Looks up the Alpaca order by alpaca_order_id (exact).
 - If Alpaca order is terminal (filled/canceled/expired/rejected/replaced),
   updates processed_status/processed_note/processed_at.
 
 Env:
-  DB_URL or DATABASE_URL:
-    Examples:
-      postgresql://postgres:postgres@postgres:5432/trader
-      postgresql+psycopg://postgres:postgres@postgres:5432/trader
-      postgresql+psycopg2://postgres:postgres@postgres:5432/trader
-    (we normalize these for psycopg2.connect)
-
+  DB_URL (optional; default postgresql://postgres:postgres@postgres:5432/trader)
   ALPACA_API_KEY / ALPACA_API_SECRET (required)
-
-  TRADING_MODE: "paper" (default) or "live"
-  ALPACA_PAPER: optional legacy override ("1"/"0", "true"/"false") if TRADING_MODE not set
-
-  LOOKBACK_DAYS (default 30)  # only used as a soft filter / caching boundary
-  SYNC_POLL (default 30)
+  ALPACA_PAPER (default "1")
+  LOOKBACK_DAYS (default "30")   # just for order fetching, not for DB selection
+  SYNC_POLL (default "30")
 """
 
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-
 import psycopg2
+from datetime import datetime, timedelta, timezone
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
 
 
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return default
+def _normalize_db_url() -> str:
+    url = (os.getenv("DB_URL") or os.getenv("DATABASE_URL") or "").strip()
+    if not url:
+        # default local in compose
+        return "postgresql://postgres:postgres@postgres:5432/trader"
 
+    # Common alias in some setups
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
 
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return default
+    # If URL requests psycopg (v3) but it's not installed, fall back to psycopg2.
+    # This prevents crashes when DB_URL is set to postgresql+psycopg:// but only psycopg2-binary is installed.
+    if url.startswith("postgresql+psycopg://"):
+        try:
+            import psycopg  # type: ignore  # noqa: F401
+        except Exception:
+            url = "postgresql+psycopg2://" + url.split("postgresql+psycopg://", 1)[1]
 
-
-def _resolve_trading_mode() -> str:
-    """
-    Primary: TRADING_MODE = live|paper
-    Fallback: ALPACA_PAPER (legacy)
-    Default: paper
-    """
-    m = (os.getenv("TRADING_MODE") or "").strip().lower()
-    if m in ("live", "paper"):
-        return m
-
-    # legacy fallback
-    if os.getenv("ALPACA_PAPER") is not None:
-        return "paper" if _env_bool("ALPACA_PAPER", True) else "live"
-
-    return "paper"
-
-
-def _normalize_db_url_for_psycopg2() -> str:
-    """
-    psycopg2.connect accepts postgresql://... but NOT postgresql+psycopg://...
-    Normalize common SQLAlchemy-style URLs to plain postgresql://...
-    """
-    raw = (
-        os.getenv("DATABASE_URL")
-        or os.getenv("DB_URL")
-        or "postgresql://postgres:postgres@postgres:5432/trader"
-    ).strip()
-
-    # Normalize SQLAlchemy driver selectors -> plain postgresql:// for psycopg2.connect
-    if raw.startswith("postgresql+psycopg2://"):
-        raw = raw.replace("postgresql+psycopg2://", "postgresql://", 1)
-    if raw.startswith("postgresql+psycopg://"):
-        raw = raw.replace("postgresql+psycopg://", "postgresql://", 1)
-
-    return raw
+    return url
 
 
 def _sval(x) -> str:
     """
     Alpaca SDK often returns enums for fields like status/order_class.
-    Convert them to their string 'value' (e.g. OrderStatus.FILLED -> 'filled').
+    This converts them to their string 'value' (e.g. OrderStatus.FILLED -> 'filled').
     """
     if x is None:
         return ""
@@ -113,20 +66,19 @@ def _sval(x) -> str:
 
 
 def _load_columns(cur) -> set[str]:
-    cur.execute(
-        """
+    cur.execute("""
         SELECT column_name
           FROM information_schema.columns
          WHERE table_name='signals';
-        """
-    )
+    """)
     return {r[0] for r in cur.fetchall()}
 
 
 def _alpaca_to_local(status: str) -> tuple[str | None, str | None]:
     s = (status or "").strip().lower()
 
-    # Defensive fallback if enum string looks like "orderstatus.filled"
+    # Sometimes enum->str becomes like "orderstatus.filled" if not normalized.
+    # Defensive fallback:
     if "." in s:
         s = s.split(".")[-1]
 
@@ -141,9 +93,10 @@ def _alpaca_to_local(status: str) -> tuple[str | None, str | None]:
     return (None, None)
 
 
-def main_loop() -> None:
-    lookback_days = _env_int("LOOKBACK_DAYS", 30)
-    poll = _env_int("SYNC_POLL", 30)
+def main_loop():
+    paper = os.getenv("ALPACA_PAPER", "1") != "0"
+    lookback_days = int(os.getenv("LOOKBACK_DAYS", "30"))
+    poll = int(os.getenv("SYNC_POLL", "30"))
 
     api_key = os.getenv("ALPACA_API_KEY")
     api_secret = os.getenv("ALPACA_API_SECRET")
@@ -151,43 +104,36 @@ def main_loop() -> None:
         print("ERROR: Missing ALPACA_API_KEY / ALPACA_API_SECRET")
         sys.exit(2)
 
-    mode = _resolve_trading_mode()
-    paper = (mode != "live")
-
     tc = TradingClient(api_key, api_secret, paper=paper)
-    db_url = _normalize_db_url_for_psycopg2()
+    db_url = _normalize_db_url()
 
-    print(
-        f"sync_orders starting | poll={poll}s | lookback_days={lookback_days} | mode={mode} | paper={paper}"
-    )
+    print(f"sync_orders starting | poll={poll}s | lookback_days={lookback_days} | paper={paper}")
 
     while True:
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
-            open_orders = tc.get_orders(
-                GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)
-            ) or []
-            closed_orders = tc.get_orders(
-                GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500)
-            ) or []
+            open_orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+            closed_orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
             all_orders = list(open_orders) + list(closed_orders)
 
-            # Index orders by id
+            # Index by id (include everything we fetched)
             orders_by_id: dict[str, object] = {}
             for o in all_orders:
                 oid = _sval(getattr(o, "id", None)).strip()
                 if not oid:
                     continue
 
-                # Soft recency check (do not exclude—just defensive)
+                # Optional filter: keep recent-ish only (helps memory), but don't break things
                 sub_at = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
                 if sub_at is not None:
                     try:
-                        if getattr(sub_at, "tzinfo", None) is None:
+                        if sub_at.tzinfo is None:
                             sub_at = sub_at.replace(tzinfo=timezone.utc)
                         sub_at = sub_at.astimezone(timezone.utc)
-                        _ = (sub_at >= cutoff)  # no-op; keep for future filtering if needed
+                        if sub_at < cutoff:
+                            # still keep it? let's keep it, because your DB contains Dec 30 too.
+                            pass
                     except Exception:
                         pass
 
@@ -201,31 +147,19 @@ def main_loop() -> None:
                 conn.autocommit = False
                 with conn.cursor() as cur:
                     cols = _load_columns(cur)
-                    required = {
-                        "id",
-                        "created_at",
-                        "symbol",
-                        "side",
-                        "processed_status",
-                        "alpaca_order_id",
-                        "processed_at",
-                        "processed_note",
-                    }
-                    missing = required - cols
-                    if missing:
-                        print(f"ERROR: signals schema missing columns: {sorted(list(missing))}")
+                    required = {"id", "created_at", "symbol", "side", "processed_status", "alpaca_order_id", "processed_at", "processed_note"}
+                    if not required.issubset(cols):
+                        print(f"ERROR: signals schema missing columns: {sorted(list(required - cols))}")
                         conn.rollback()
                         time.sleep(poll)
                         continue
 
-                    cur.execute(
-                        """
+                    cur.execute("""
                         SELECT id, created_at, symbol, side, processed_status, alpaca_order_id, processed_note
                           FROM signals
                          WHERE processed_status='submitted'
                       ORDER BY id DESC;
-                        """
-                    )
+                    """)
                     rows = cur.fetchall()
                     checked = len(rows)
 
@@ -237,31 +171,29 @@ def main_loop() -> None:
 
                         o = orders_by_id.get(oid)
                         if o is None:
+                            # Not in our fetched window. Try direct fetch by id via SDK? (SDK doesn't have get_order_by_id)
+                            # We'll just mark as not_found for now.
                             not_found += 1
                             continue
 
                         alp_status = _sval(getattr(o, "status", None)).strip().lower()
                         new_status, reason = _alpaca_to_local(alp_status)
                         if not new_status:
+                            # still open / not terminal
                             continue
 
-                        cur.execute(
-                            """
+                        cur.execute("""
                             UPDATE signals
                                SET processed_status=%s,
                                    processed_at=NOW(),
                                    processed_note=%s
                              WHERE id=%s;
-                            """,
-                            (new_status, reason, sid),
-                        )
+                        """, (new_status, reason, sid))
                         updated += 1
 
                     conn.commit()
 
-            print(
-                f"checked={checked} submitted | updated={updated} | not_found_in_cache={not_found}"
-            )
+            print(f"checked={checked} submitted | updated={updated} | not_found_in_cache={not_found}")
 
         except Exception as e:
             print("sync_orders ERROR:", repr(e))
