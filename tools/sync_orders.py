@@ -1,30 +1,26 @@
 ﻿#!/usr/bin/env python3
-"""
-Sync local 'signals' table with Alpaca orders.
+"""sync_orders: sync Alpaca order states into Postgres.
 
-Schema expected:
-  signals(..., created_at, processed_status, processed_note, processed_at, alpaca_order_id, ...)
-
-What it does:
-- Repeats every SYNC_POLL seconds (default 30).
-- Finds signals where processed_status='submitted'.
-- Looks up the Alpaca order by alpaca_order_id (exact).
-- If Alpaca order is terminal (filled/canceled/expired/rejected/replaced),
-  updates processed_status/processed_note/processed_at.
+- Reads signals where processed_status='submitted'
+- Pulls recent Alpaca orders (after LOOKBACK_DAYS) and matches by alpaca_order_id
+- When an Alpaca order reaches terminal status, updates processed_status/processed_note/processed_at
 
 Env:
-  DB_URL (optional; default postgresql://postgres:postgres@postgres:5432/trader)
+  DB_URL or DATABASE_URL (optional; defaults to local docker postgres)
   ALPACA_API_KEY / ALPACA_API_SECRET (required)
-  ALPACA_PAPER (default "1")
-  LOOKBACK_DAYS (default "30")   # just for order fetching, not for DB selection
-  SYNC_POLL (default "30")
+  TRADING_MODE ('paper' or 'live'; default 'paper')          # preferred
+  ALPACA_PAPER (legacy bool; 0/false/no => live; else paper) # fallback
+  ALPACA_BASE_URL (optional hint; if contains 'paper' => paper; else live)
+  LOOKBACK_DAYS (default 30)
+  SYNC_POLL_SECONDS (default 30)
 """
 
 import os
-import sys
 import time
-import psycopg2
 from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, Optional
+
+import psycopg2
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest
@@ -32,171 +28,153 @@ from alpaca.trading.enums import QueryOrderStatus
 
 
 def _normalize_db_url() -> str:
-    url = (os.getenv("DB_URL") or os.getenv("DATABASE_URL") or "").strip()
-    if not url:
-        # default local in compose
-        return "postgresql://postgres:postgres@postgres:5432/trader"
-
-    # Common alias in some setups
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-
-    # If URL requests psycopg (v3) but it's not installed, fall back to psycopg2.
-    # This prevents crashes when DB_URL is set to postgresql+psycopg:// but only psycopg2-binary is installed.
-    if url.startswith("postgresql+psycopg://"):
-        try:
-            import psycopg  # type: ignore  # noqa: F401
-        except Exception:
-            url = "postgresql+psycopg2://" + url.split("postgresql+psycopg://", 1)[1]
-
-    return url
+    raw_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or "postgresql://postgres:postgres@postgres:5432/trader"
+    # Allow SQLAlchemy-style URLs as well; psycopg2 expects plain postgresql://
+    if raw_url.startswith("postgresql+psycopg://"):
+        raw_url = raw_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    if raw_url.startswith("postgresql+psycopg2://"):
+        raw_url = raw_url.replace("postgresql+psycopg2://", "postgresql://", 1)
+    # legacy
+    if raw_url.startswith("postgres://"):
+        raw_url = raw_url.replace("postgres://", "postgresql://", 1)
+    return raw_url
 
 
 def _sval(x) -> str:
-    """
-    Alpaca SDK often returns enums for fields like status/order_class.
-    This converts them to their string 'value' (e.g. OrderStatus.FILLED -> 'filled').
-    """
     if x is None:
         return ""
-    v = getattr(x, "value", None)
-    if v is not None:
-        return str(v)
     return str(x)
 
 
-def _load_columns(cur) -> set[str]:
-    cur.execute("""
-        SELECT column_name
-          FROM information_schema.columns
-         WHERE table_name='signals';
-    """)
-    return {r[0] for r in cur.fetchall()}
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    v = (v or "").strip().lower()
+    return v not in ("0", "false", "no")
 
 
-def _alpaca_to_local(status: str) -> tuple[str | None, str | None]:
-    s = (status or "").strip().lower()
+def _infer_mode_and_paper() -> tuple[str, bool]:
+    """Resolve mode/paper with safe precedence.
 
-    # Sometimes enum->str becomes like "orderstatus.filled" if not normalized.
-    # Defensive fallback:
-    if "." in s:
-        s = s.split(".")[-1]
+    Priority:
+      1) TRADING_MODE: 'live' or 'paper'
+      2) ALPACA_PAPER: 0/false/no => live, otherwise paper
+      3) ALPACA_BASE_URL: contains 'paper' => paper, otherwise live
+      4) default => paper (fail-safe)
+    """
+    mode = (os.getenv("TRADING_MODE") or "").strip().lower()
+    if mode in ("live", "paper"):
+        return mode, (mode != "live")
 
-    if s in ("new", "accepted", "partially_filled", "held"):
-        return (None, None)  # keep submitted
-    if s == "filled":
-        return ("filled", "order filled")
-    if s in ("canceled", "expired"):
-        return ("skipped", f"broker {s}")
-    if s in ("rejected", "replaced"):
-        return ("error", f"broker {s}")
-    return (None, None)
+    if os.getenv("ALPACA_PAPER") not in (None, ""):
+        paper = _env_bool("ALPACA_PAPER", True)
+        return ("paper" if paper else "live"), paper
+
+    base = (os.getenv("ALPACA_BASE_URL") or "").strip().lower()
+    if base:
+        paper = "paper" in base
+        return ("paper" if paper else "live"), paper
+
+    return "paper", True
 
 
-def main_loop():
-    paper = os.getenv("ALPACA_PAPER", "1") != "0"
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _is_terminal(status: str) -> bool:
+    s = (status or "").lower()
+    return s in ("filled", "canceled", "expired", "rejected", "replaced")
+
+
+def main_loop() -> None:
+    poll = int(os.getenv("SYNC_POLL_SECONDS", "30"))
     lookback_days = int(os.getenv("LOOKBACK_DAYS", "30"))
-    poll = int(os.getenv("SYNC_POLL", "30"))
 
-    api_key = os.getenv("ALPACA_API_KEY")
-    api_secret = os.getenv("ALPACA_API_SECRET")
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    api_secret = os.getenv("ALPACA_API_SECRET", "")
     if not api_key or not api_secret:
-        print("ERROR: Missing ALPACA_API_KEY / ALPACA_API_SECRET")
-        sys.exit(2)
+        raise SystemExit("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
+
+    mode, paper = _infer_mode_and_paper()
+
+    print(f"sync_orders starting | poll={poll}s | lookback_days={lookback_days} | mode={mode} | paper={paper}")
 
     tc = TradingClient(api_key, api_secret, paper=paper)
-    db_url = _normalize_db_url()
 
-    print(f"sync_orders starting | poll={poll}s | lookback_days={lookback_days} | paper={paper}")
+    db_url = _normalize_db_url()
+    conn = psycopg2.connect(db_url)
+    conn.autocommit = True
 
     while True:
         try:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            # Find submitted signals we need to finalize
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, alpaca_order_id
+                    FROM signals
+                    WHERE processed_status='submitted'
+                    ORDER BY id DESC
+                    LIMIT 500
+                    """
+                )
+                rows = cur.fetchall()
 
-            open_orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
-            closed_orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
-            all_orders = list(open_orders) + list(closed_orders)
+            if not rows:
+                time.sleep(poll)
+                continue
 
-            # Index by id (include everything we fetched)
-            orders_by_id: dict[str, object] = {}
-            for o in all_orders:
-                oid = _sval(getattr(o, "id", None)).strip()
-                if not oid:
-                    continue
-
-                # Optional filter: keep recent-ish only (helps memory), but don't break things
-                sub_at = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
-                if sub_at is not None:
-                    try:
-                        if sub_at.tzinfo is None:
-                            sub_at = sub_at.replace(tzinfo=timezone.utc)
-                        sub_at = sub_at.astimezone(timezone.utc)
-                        if sub_at < cutoff:
-                            # still keep it? let's keep it, because your DB contains Dec 30 too.
-                            pass
-                    except Exception:
-                        pass
-
-                orders_by_id[oid] = o
+            # Fetch recent orders from Alpaca and index by id
+            after = (_utcnow() - timedelta(days=lookback_days)).isoformat()
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                limit=500,
+                nested=True,
+                after=after,
+            )
+            orders = tc.get_orders(req) or []
+            orders_by_id: Dict[str, Any] = {str(getattr(o, "id", "")): o for o in orders if getattr(o, "id", None)}
 
             checked = 0
             updated = 0
             not_found = 0
 
-            with psycopg2.connect(db_url) as conn:
-                conn.autocommit = False
+            for sid, alpaca_order_id in rows:
+                checked += 1
+                oid = _sval(alpaca_order_id)
+                if not oid:
+                    continue
+
+                o = orders_by_id.get(oid)
+                if not o:
+                    not_found += 1
+                    continue
+
+                status = _sval(getattr(o, "status", ""))
+                if not _is_terminal(status):
+                    continue
+
+                note = f"alpaca_status={status}"
+
                 with conn.cursor() as cur:
-                    cols = _load_columns(cur)
-                    required = {"id", "created_at", "symbol", "side", "processed_status", "alpaca_order_id", "processed_at", "processed_note"}
-                    if not required.issubset(cols):
-                        print(f"ERROR: signals schema missing columns: {sorted(list(required - cols))}")
-                        conn.rollback()
-                        time.sleep(poll)
-                        continue
-
-                    cur.execute("""
-                        SELECT id, created_at, symbol, side, processed_status, alpaca_order_id, processed_note
-                          FROM signals
-                         WHERE processed_status='submitted'
-                      ORDER BY id DESC;
-                    """)
-                    rows = cur.fetchall()
-                    checked = len(rows)
-
-                    for sid, created_at, sym, side, st, oid, note in rows:
-                        oid = (oid or "").strip()
-                        if not oid:
-                            not_found += 1
-                            continue
-
-                        o = orders_by_id.get(oid)
-                        if o is None:
-                            # Not in our fetched window. Try direct fetch by id via SDK? (SDK doesn't have get_order_by_id)
-                            # We'll just mark as not_found for now.
-                            not_found += 1
-                            continue
-
-                        alp_status = _sval(getattr(o, "status", None)).strip().lower()
-                        new_status, reason = _alpaca_to_local(alp_status)
-                        if not new_status:
-                            # still open / not terminal
-                            continue
-
-                        cur.execute("""
-                            UPDATE signals
-                               SET processed_status=%s,
-                                   processed_at=NOW(),
-                                   processed_note=%s
-                             WHERE id=%s;
-                        """, (new_status, reason, sid))
-                        updated += 1
-
-                    conn.commit()
+                    cur.execute(
+                        """
+                        UPDATE signals
+                        SET processed_status=%s,
+                            processed_note=%s,
+                            processed_at=NOW()
+                        WHERE id=%s
+                        """,
+                        (status, note, sid),
+                    )
+                updated += 1
 
             print(f"checked={checked} submitted | updated={updated} | not_found_in_cache={not_found}")
 
         except Exception as e:
-            print("sync_orders ERROR:", repr(e))
+            print(f"sync_orders ERROR: {e!r}")
 
         time.sleep(poll)
 
