@@ -15,7 +15,7 @@ import time
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import psycopg2
 from alpaca.trading.client import TradingClient
@@ -125,9 +125,7 @@ def _ensure_table(con):
 
 
 def _upsert_order(con, o: Any) -> None:
-    # Alpaca SDK objects are usually dataclasses / have __dict__-like access via vars()
     d = getattr(o, "__dict__", None) or {}
-    # Some versions wrap in ._raw or ._raw_data
     raw = getattr(o, "_raw", None) or getattr(o, "_raw_data", None) or d
     if not isinstance(raw, dict):
         raw = d
@@ -245,7 +243,6 @@ def main_loop() -> None:
         try:
             since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
-            # Pull orders (OPEN + CLOSED) since lookback
             req_open = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, after=since)
             req_closed = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500, after=since)
 
