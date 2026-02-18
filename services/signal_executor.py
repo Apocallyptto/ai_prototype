@@ -1,759 +1,368 @@
 ﻿import os
 import time
 import math
+import uuid
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Sequence, Set, Tuple
-
-from sqlalchemy import create_engine, text
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Iterable
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from sqlalchemy import text
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
-
+from tools.db import get_engine
 
 LOG = logging.getLogger("signal_executor")
+logging.basicConfig(level=logging.INFO)
 
 
-def _env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return default if v is None or str(v).strip() == "" else str(v).strip()
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    try:
-        return int(float(v))
-    except Exception:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
     if v is None:
         return default
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return default
+    v = (v or "").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _resolve_mode_and_paper() -> tuple[str, bool]:
+    """Resolve trading mode and whether to use Alpaca paper endpoint.
+
+    Priority:
+      1) TRADING_MODE=live|paper
+      2) explicit ALPACA_PAPER override (backwards compatibility)
+      3) default -> paper (fail-safe)
+    """
+    mode = (os.getenv("TRADING_MODE") or "paper").strip().lower()
+    if mode not in ("live", "paper"):
+        mode = "paper"
+
+    paper = (mode != "live")
+
+    # Back-compat / emergency override
+    if os.getenv("ALPACA_PAPER") is not None:
+        paper = _env_bool("ALPACA_PAPER", paper)
+        mode = "paper" if paper else "live"
+
+    return mode, paper
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_symbols(raw: str) -> List[str]:
-    syms = [s.strip().upper() for s in raw.replace(";", ",").split(",") if s.strip()]
-    out: List[str] = []
-    seen: Set[str] = set()
-    for s in syms:
-        if s not in seen:
-            out.append(s)
-            seen.add(s)
-    return out
+def _round_price(p: float) -> float:
+    return round(p + 1e-9, 2)
 
 
-@dataclass(frozen=True)
+@dataclass
 class Cfg:
-    symbols: List[str]
-    portfolio_id: int
-    min_strength: float
     poll_seconds: int
-
+    min_strength: float
+    symbols: list[str]
+    portfolio_id: int
     allow_short: bool
     long_only: bool
     max_notional: float
-    max_qty: int  # max qty per single order
-
-    # NEW: position sizing guard (per-symbol)
-    max_position_qty: int  # max absolute position qty per symbol
-    allow_add_to_position: bool  # if False: never pyramid; if True: cap up to max_position_qty
-
+    max_qty: float
+    max_position_qty: float
+    allow_add_to_position: bool
     alpaca_dedupe_minutes: int
     cancel_opposite_open_orders: bool
-
     max_open_positions: int
     max_open_orders: int
-
-    enable_daily_risk_guard: bool
     daily_loss_stop_pct: float
     max_daily_loss_usd: float
-
+    enable_daily_risk_guard: bool
     symbol_cooldown_seconds: int
     pick_ttl_seconds: int
-
     trade_only_when_market_open: bool
     preopen_window_seconds: int
     allow_trade_on_clock_error: bool
-
     trading_paused: bool
     dry_run: bool
 
 
-def load_cfg() -> Cfg:
-    max_qty = _env_int("MAX_QTY", 1)
-    # MAX_POSITION_QTY defaults to MAX_QTY to preserve your current behavior unless overridden.
-    max_pos_qty = _env_int("MAX_POSITION_QTY", max_qty)
+def _load_cfg() -> Cfg:
+    symbols_raw = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
+    symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
 
     return Cfg(
-        symbols=_parse_symbols(_env_str("SYMBOLS", "AAPL,MSFT,SPY,NVDA,AMD")),
-        portfolio_id=_env_int("PORTFOLIO_ID", 1),
-        min_strength=_env_float("MIN_STRENGTH", 0.75),
-        poll_seconds=_env_int("POLL_SECONDS", _env_int("SIGNAL_POLL_SECONDS", 20)),
+        poll_seconds=int(os.getenv("POLL_SECONDS", "20")),
+        min_strength=float(os.getenv("MIN_STRENGTH", "0.60")),
+        symbols=symbols,
+        portfolio_id=int(os.getenv("PORTFOLIO_ID", "1")),
         allow_short=_env_bool("ALLOW_SHORT", False),
-        long_only=_env_bool("LONG_ONLY", False),
-        max_notional=_env_float("MAX_NOTIONAL", 200.0),
-        max_qty=max_qty,
-        max_position_qty=max_pos_qty,
+        long_only=_env_bool("LONG_ONLY", True),
+        max_notional=float(os.getenv("MAX_NOTIONAL", "100")),
+        max_qty=float(os.getenv("MAX_QTY", "1")),
+        max_position_qty=float(os.getenv("MAX_POSITION_QTY", "1")),
         allow_add_to_position=_env_bool("ALLOW_ADD_TO_POSITION", False),
-        alpaca_dedupe_minutes=_env_int("ALPACA_DEDUPE_MINUTES", 2),
+        alpaca_dedupe_minutes=int(os.getenv("ALPACA_DEDUPE_MINUTES", "2")),
         cancel_opposite_open_orders=_env_bool("CANCEL_OPPOSITE_OPEN_ORDERS", True),
-        max_open_positions=_env_int("MAX_OPEN_POSITIONS", 1),
-        max_open_orders=_env_int("MAX_OPEN_ORDERS", 1),
+        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
+        max_open_orders=int(os.getenv("MAX_OPEN_ORDERS", "1")),
+        daily_loss_stop_pct=float(os.getenv("DAILY_LOSS_STOP_PCT", "1.0")),
+        max_daily_loss_usd=float(os.getenv("MAX_DAILY_LOSS_USD", "200.0")),
         enable_daily_risk_guard=_env_bool("ENABLE_DAILY_RISK_GUARD", True),
-        daily_loss_stop_pct=_env_float("DAILY_LOSS_STOP_PCT", 1.0),
-        max_daily_loss_usd=_env_float("MAX_DAILY_LOSS_USD", 200.0),
-        symbol_cooldown_seconds=_env_int("SYMBOL_COOLDOWN_SECONDS", 60),
-        pick_ttl_seconds=_env_int("PICK_TTL_SECONDS", 120),
+        symbol_cooldown_seconds=int(os.getenv("SYMBOL_COOLDOWN_SECONDS", "60")),
+        pick_ttl_seconds=int(os.getenv("PICK_TTL_SECONDS", "120")),
         trade_only_when_market_open=_env_bool("TRADE_ONLY_WHEN_MARKET_OPEN", True),
-        preopen_window_seconds=_env_int("PREOPEN_WINDOW_SECONDS", 0),
-        allow_trade_on_clock_error=_env_bool("ALLOW_TRADE_ON_CLOCK_ERROR", True),
-        trading_paused=_env_bool("TRADING_PAUSED", False),  # kill switch
-        dry_run=_env_bool("DRY_RUN", False),
+        preopen_window_seconds=int(os.getenv("PREOPEN_WINDOW_SECONDS", "0")),
+        allow_trade_on_clock_error=_env_bool("ALLOW_TRADE_ON_CLOCK_ERROR", False),
+        trading_paused=_env_bool("TRADING_PAUSED", True),
+        dry_run=_env_bool("DRY_RUN", True),
     )
 
 
-def _setup_logging() -> None:
-    level = _env_str("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
-
-
-def make_engine():
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        host = _env_str("POSTGRES_HOST", _env_str("PGHOST", "postgres"))
-        port = _env_int("POSTGRES_PORT", _env_int("PGPORT", 5432))
-        user = _env_str("POSTGRES_USER", _env_str("PGUSER", "postgres"))
-        pwd = _env_str("POSTGRES_PASSWORD", _env_str("PGPASSWORD", "postgres"))
-        db = _env_str("POSTGRES_DB", _env_str("PGDATABASE", "trader"))
-        db_url = f"postgresql+psycopg2://{user}:{pwd}@{host}:{port}/{db}"
-    return create_engine(db_url, pool_pre_ping=True)
-
-
-def _resolve_trading_mode() -> str:
-    """Return normalized trading mode.
-
-    Supported values:
-      - live  -> use Alpaca live trading endpoints
-      - paper -> use Alpaca paper trading endpoints
-
-    Backwards compatibility:
-      If TRADING_MODE is not set, we fall back to ALPACA_PAPER (default True).
-    """
-    mode = (os.getenv("TRADING_MODE") or "").strip().lower()
-    if mode:
-        return mode
-    return "paper" if _env_bool("ALPACA_PAPER", True) else "live"
-
-
-def _resolve_paper_flag() -> bool:
-    return _resolve_trading_mode() != "live"
-
-
-def make_trading_client() -> TradingClient:
+def make_trading_client() -> tuple[TradingClient, str, bool, str]:
     key = os.getenv("ALPACA_API_KEY")
     sec = os.getenv("ALPACA_API_SECRET")
     if not key or not sec:
         raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
-    return TradingClient(key, sec, paper=_resolve_paper_flag())
 
-
-def make_data_client() -> StockHistoricalDataClient:
-    key = os.getenv("ALPACA_API_KEY")
-    sec = os.getenv("ALPACA_API_SECRET")
-    if not key or not sec:
-        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
-    return StockHistoricalDataClient(key, sec)
-
-
-
-def _market_gate_sleep_seconds(tc: TradingClient, cfg: Cfg) -> Optional[int]:
-    """
-    Market-hours gate using Alpaca clock.
-
-    Returns:
-        - None => ok to trade now
-        - int  => sleep seconds and skip this loop iteration
-    """
-    if not cfg.trade_only_when_market_open:
-        return None
-
-    try:
-        clock = tc.get_clock()
-    except Exception as e:
-        if cfg.allow_trade_on_clock_error:
-            # fail-open: availability beats perfect gating; other risk guards still apply
-            LOG.warning("market_gate | clock_error=%s | allow_trade", e)
-            return None
-        LOG.error("market_gate | clock_error=%s | block_trade", e)
-        return max(10, int(cfg.poll_seconds))
-
-    if getattr(clock, "is_open", False):
-        return None
-
-    now = getattr(clock, "timestamp", None)
-    nxt = getattr(clock, "next_open", None)
-    if not now or not nxt:
-        return max(10, int(cfg.poll_seconds))
-
-    secs_to_open = int((nxt - now).total_seconds())
-    pre = int(cfg.preopen_window_seconds or 0)
-
-    # Allow trading within PREOPEN_WINDOW_SECONDS before open (optional)
-    if pre > 0 and secs_to_open <= pre:
-        return None
-
-    remain = max(secs_to_open - pre, 0)
-
-    # Cap sleep so container stays responsive
-    return int(min(max(remain, 10), 300))
-
-def fetch_new_signals(engine, cfg: Cfg, limit: int = 300) -> List[dict]:
-    q = text(
-        """
-        SELECT id, created_at, symbol, side, strength
-        FROM signals
-        WHERE processed_at IS NULL
-          AND portfolio_id = :pid
-          AND symbol = ANY(:symbols)
-          AND strength >= :min_strength
-        ORDER BY created_at ASC
-        LIMIT :limit
-        """
+    mode, paper = _resolve_mode_and_paper()
+    base = (os.getenv("ALPACA_BASE_URL") or "").strip() or (
+        "https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets"
     )
-    with engine.connect() as conn:
-        rows = conn.execute(
-            q,
-            {"pid": cfg.portfolio_id, "symbols": cfg.symbols, "min_strength": cfg.min_strength, "limit": limit},
-        ).mappings().all()
-    return [dict(r) for r in rows]
+
+    return TradingClient(key, sec, paper=paper), mode, paper, base
 
 
-def mark(engine, ids: Sequence[int], status: str, note: str) -> None:
-    if not ids:
-        return
-    q = text(
-        """
-        UPDATE signals
-        SET processed_at = now(),
-            processed_status = :status,
-            processed_note = :note
-        WHERE id = ANY(:ids)
-        """
-    )
-    with engine.begin() as conn:
-        conn.execute(q, {"ids": list(ids), "status": status, "note": note})
+def _get_clock_is_open(tc: TradingClient) -> bool:
+    clk = tc.get_clock()
+    return bool(getattr(clk, "is_open", False))
 
 
-def mark_one(engine, sid: int, status: str, note: str) -> None:
-    mark(engine, [sid], status, note)
-
-
-def pick(engine, ids: Sequence[int]) -> None:
-    if not ids:
-        return
-    q = text(
-        """
-        UPDATE signals
-        SET processed_at = now(),
-            processed_status = 'picked',
-            processed_note = 'picked'
-        WHERE id = ANY(:ids)
-          AND processed_at IS NULL
-        """
-    )
-    with engine.begin() as conn:
-        conn.execute(q, {"ids": list(ids)})
-
-
-def unpick_stale_picks(engine, cfg: Cfg) -> int:
-    q = text(
-        """
-        UPDATE signals
-        SET processed_at = NULL,
-            processed_status = NULL,
-            processed_note = 'auto_unpick_pick_ttl'
-        WHERE processed_status = 'picked'
-          AND processed_at < (now() - (:ttl || ' seconds')::interval)
-        """
-    )
-    with engine.begin() as conn:
-        res = conn.execute(q, {"ttl": cfg.pick_ttl_seconds})
-        return int(res.rowcount or 0)
-
-
-def get_symbol_last_trade_ts(engine, symbols: Sequence[str]) -> Dict[str, datetime]:
-    q = text(
-        """
-        SELECT symbol, max(processed_at) AS last_ts
-        FROM signals
-        WHERE symbol = ANY(:symbols)
-          AND processed_at IS NOT NULL
-          AND processed_status IN ('submitted','filled')
-        GROUP BY symbol
-        """
-    )
-    out: Dict[str, datetime] = {}
-    with engine.connect() as conn:
-        for r in conn.execute(q, {"symbols": list(symbols)}).mappings().all():
-            if r["last_ts"] is not None:
-                out[str(r["symbol"]).upper()] = r["last_ts"]
-    return out
-
-
-def select_signals(engine, cfg: Cfg, signals: List[dict]) -> Tuple[List[dict], int]:
-    now = _now_utc()
-    selected: List[dict] = []
-    seen: Set[Tuple[str, str]] = set()
-    stale_ids: List[int] = []
-
-    for s in signals:
-        sid = int(s["id"])
-        sym = str(s["symbol"]).upper()
-        side = str(s["side"]).lower()
-        created_at = s["created_at"]
-
-        if isinstance(created_at, datetime):
-            ca = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
-            if (now - ca).total_seconds() > cfg.pick_ttl_seconds:
-                stale_ids.append(sid)
-                continue
-
-        k = (sym, side)
-        if k in seen:
-            continue
-        seen.add(k)
-        selected.append(s)
-
-    if stale_ids:
-        mark(engine, stale_ids, "skipped", f"stale_signal_ttl_{cfg.pick_ttl_seconds}s")
-
-    return selected, len(stale_ids)
-
-
-def risk_guard(tc: TradingClient, cfg: Cfg) -> Tuple[bool, str]:
-    positions = tc.get_all_positions()
-    open_orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)) or []
-    open_orders_for_limit = [o for o in open_orders if not str(getattr(o, 'client_order_id', '') or '').startswith('exit-oco-')]
-
-    if len(positions) >= cfg.max_open_positions:
-        return False, f"max_open_positions_reached:{len(positions)}/{cfg.max_open_positions}"
-    if len(open_orders_for_limit) >= cfg.max_open_orders:
-        return False, f"max_open_orders_reached:{len(open_orders_for_limit)}/{cfg.max_open_orders} (raw={len(open_orders)})"
-
-    if cfg.enable_daily_risk_guard:
-        try:
-            acct = tc.get_account()
-            equity = float(acct.equity)
-            last_equity = getattr(acct, "last_equity", None)
-            if last_equity is not None:
-                last_equity_f = float(last_equity)
-                if last_equity_f > 0:
-                    dd_pct = max(0.0, (last_equity_f - equity) / last_equity_f * 100.0)
-                    if dd_pct >= cfg.daily_loss_stop_pct:
-                        return False, f"daily_loss_stop_pct_hit:{dd_pct:.2f}%"
-                loss_usd = max(0.0, last_equity_f - equity)
-                if loss_usd >= cfg.max_daily_loss_usd:
-                    return False, f"max_daily_loss_usd_hit:{loss_usd:.2f}"
-        except Exception as e:
-            LOG.warning("risk_guard | daily guard calc failed: %s", e)
-
-    return True, ""
-
-
-def _recent_alpaca_dedupe(tc: TradingClient, symbol: str, side: OrderSide, window_minutes: int) -> bool:
-    if window_minutes <= 0:
+def _within_preopen_window(tc: TradingClient, window_seconds: int) -> bool:
+    clk = tc.get_clock()
+    if not getattr(clk, "next_open", None):
         return False
-    cutoff = _now_utc() - timedelta(minutes=window_minutes)
-    orders = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=200))
-    for o in orders:
-        if str(o.symbol).upper() != symbol.upper():
-            continue
-        if o.side != side:
-            continue
-        if o.submitted_at and o.submitted_at >= cutoff:
-            return True
-    return False
+    now = _now_utc()
+    nxt = getattr(clk, "next_open")
+    # next_open from alpaca is usually ISO string or datetime
+    if isinstance(nxt, str):
+        try:
+            nxt_dt = datetime.fromisoformat(nxt.replace("Z", "+00:00"))
+        except Exception:
+            return False
+    else:
+        nxt_dt = nxt
+    delta = (nxt_dt - now).total_seconds()
+    return 0 <= delta <= window_seconds
 
 
-def _cancel_opposite_open_orders(tc: TradingClient, symbol: str, side: OrderSide) -> int:
-    opposite = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
-    canceled = 0
-    opens = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
-    for o in opens:
-        if str(o.symbol).upper() == symbol.upper() and o.side == opposite:
-            tc.cancel_order_by_id(o.id)
-            canceled += 1
-    return canceled
+def _get_open_orders(tc: TradingClient) -> list:
+    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True)
+    return list(tc.get_orders(filter=req) or [])
 
 
-def _latest_trade_price(data: StockHistoricalDataClient, symbol: str) -> Optional[float]:
-    try:
-        req = StockLatestTradeRequest(symbol_or_symbols=[symbol])
-        resp = data.get_stock_latest_trade(req)
-        t = resp.get(symbol)
-        if t and t.price is not None:
-            return float(t.price)
-    except Exception as e:
-        LOG.warning("price | latest trade failed for %s: %s", symbol, e)
+def _get_positions(tc: TradingClient) -> list:
+    return list(tc.get_all_positions() or [])
+
+
+def _safe_mid_from_quotes(symbol: str) -> Optional[float]:
+    # Placeholder: your project likely has quote fetching elsewhere.
+    # Return None to fall back on price from signal if present.
     return None
 
 
-def _calc_qty(limit_price: float, cfg: Cfg) -> int:
-    if limit_price <= 0:
-        return 0
-    qty_by_notional = int(math.floor(cfg.max_notional / limit_price))
-    return max(0, min(cfg.max_qty, qty_by_notional if qty_by_notional > 0 else 0))
+def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
+    # returns False if same symbol+side signal executed within last N minutes (DB-driven dedupe)
+    with engine.begin() as con:
+        r = con.execute(
+            text(
+                """
+                SELECT created_at
+                FROM orders
+                WHERE symbol=:symbol AND side=:side
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"symbol": symbol, "side": side},
+        ).fetchone()
+        if not r:
+            return True
+        ts = r[0]
+        try:
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            return True
+        return (_now_utc() - ts).total_seconds() > minutes * 60
 
 
-def submit_limit(tc: TradingClient, symbol: str, side: OrderSide, qty: int, limit_price: float) -> str:
+def _pick_signal(engine, cfg: Cfg) -> Optional[dict]:
+    # pick strongest recent signal for allowed symbols
+    with engine.begin() as con:
+        rows = con.execute(
+            text(
+                """
+                SELECT id, created_at, symbol, side, strength, price
+                FROM signals
+                WHERE portfolio_id=:pid
+                  AND symbol = ANY(:symbols)
+                  AND strength >= :min_strength
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"pid": cfg.portfolio_id, "symbols": cfg.symbols, "min_strength": cfg.min_strength},
+        ).fetchall()
+
+    if not rows:
+        return None
+
+    r = rows[0]
+    return {
+        "id": r[0],
+        "created_at": r[1],
+        "symbol": (r[2] or "").upper(),
+        "side": (r[3] or "").lower(),
+        "strength": float(r[4]),
+        "price": float(r[5]) if r[5] is not None else None,
+    }
+
+
+def _calc_qty(cfg: Cfg, price: float) -> float:
+    if price <= 0:
+        return 0.0
+    qty = cfg.max_notional / price
+    qty = min(qty, cfg.max_qty)
+    qty = max(0.0, qty)
+    # round down to 3 decimals for fractional
+    qty = math.floor(qty * 1000) / 1000.0
+    return qty
+
+
+def _place_limit(tc: TradingClient, symbol: str, side: str, qty: float, limit_price: float) -> str:
     req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
-        side=side,
+        side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
-        limit_price=round(float(limit_price), 2),
+        limit_price=str(_round_price(limit_price)),
+        order_class=None,
+        client_order_id=f"ENTRY-{symbol}-{uuid.uuid4().hex[:10]}",
     )
-    o = tc.submit_order(req)
-    return str(o.id)
-
-
-def _positions_qty_map(tc: TradingClient) -> Dict[str, float]:
-    """
-    Returns signed qty per symbol: long -> +qty, short -> -qty.
-    Alpaca positions typically return qty as string and side as 'long'/'short'.
-    """
-    out: Dict[str, float] = {}
-    pos = tc.get_all_positions() or []
-    for p in pos:
-        sym = str(getattr(p, "symbol", "") or "").upper()
-        if not sym:
-            continue
-        try:
-            q = float(getattr(p, "qty", 0) or 0)
-        except Exception:
-            continue
-        side = str(getattr(p, "side", "") or "").strip().lower()
-        if side == "short":
-            q = -abs(q)
-        else:
-            q = abs(q)
-        out[sym] = q
-    return out
-
-
-def _open_entry_orders_map(tc: TradingClient) -> Dict[Tuple[str, OrderSide], int]:
-    """
-    Counts open *entry* orders by (symbol, side).
-    We ignore your exit OCO orders via client_order_id prefix 'exit-oco-'
-    and also ignore any OCO order_class.
-    """
-    out: Dict[Tuple[str, OrderSide], int] = {}
-    opens = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=False)) or []
-    for o in opens:
-        sym = str(getattr(o, "symbol", "") or "").upper()
-        if not sym:
-            continue
-        side = getattr(o, "side", None)
-        if side not in (OrderSide.BUY, OrderSide.SELL):
-            continue
-
-        coid = str(getattr(o, "client_order_id", "") or "")
-        if coid.startswith("exit-oco-"):
-            continue
-
-        oc = str(getattr(o, "order_class", "") or "").lower()
-        if oc == "oco":
-            continue
-
-        k = (sym, side)
-        out[k] = out.get(k, 0) + 1
-    return out
-
-
-def _cap_qty_to_max_position(cfg: Cfg, side: OrderSide, pos_qty: float, desired_qty: int) -> int:
-    """
-    If allow_add_to_position=False -> returns 0 when pos already exists in same direction.
-    If allow_add_to_position=True -> caps qty so abs(position) <= max_position_qty.
-    """
-    if desired_qty <= 0:
-        return 0
-
-    # same direction?
-    if side == OrderSide.BUY and pos_qty > 0:
-        if not cfg.allow_add_to_position:
-            return 0
-        remaining = max(0.0, float(cfg.max_position_qty) - pos_qty)
-        return int(min(float(desired_qty), remaining))
-    if side == OrderSide.SELL and pos_qty < 0:
-        if not cfg.allow_add_to_position:
-            return 0
-        remaining = max(0.0, float(cfg.max_position_qty) - abs(pos_qty))
-        return int(min(float(desired_qty), remaining))
-
-    # opening new position: cap to max_position_qty too
-    return int(min(desired_qty, cfg.max_position_qty))
+    o = tc.submit_order(order_data=req)
+    return str(getattr(o, "id", ""))
 
 
 def main() -> None:
-    _setup_logging()
-    cfg = load_cfg()
-    engine = make_engine()
-    tc = make_trading_client()
-    data = make_data_client()
+    cfg = _load_cfg()
+    engine = get_engine()
+
+    tc, mode, paper, base = make_trading_client()
 
     LOG.info(
-        "signal_executor starting | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
-        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | MAX_POSITION_QTY=%s | ALLOW_ADD_TO_POSITION=%s | "
-        "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%.1f | "
-        "MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | "
-        "TRADING_PAUSED=%s | DRY_RUN=%s",
-        cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
-        cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.max_position_qty, cfg.allow_add_to_position,
-        cfg.alpaca_dedupe_minutes, cfg.cancel_opposite_open_orders, cfg.max_open_positions, cfg.max_open_orders,
-        cfg.daily_loss_stop_pct, cfg.max_daily_loss_usd, cfg.enable_daily_risk_guard,
-        cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds, cfg.trade_only_when_market_open, cfg.preopen_window_seconds, cfg.allow_trade_on_clock_error, cfg.trading_paused, cfg.dry_run
+        "signal_executor starting | MODE=%s | paper=%s | base=%s | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
+        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | MAX_POSITION_QTY=%s | "
+        "ALLOW_ADD_TO_POSITION=%s | ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | "
+        "MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%s | MAX_DAILY_LOSS_USD=%s | "
+        "ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | TRADE_ONLY_WHEN_MARKET_OPEN=%s | "
+        "PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s",
+        mode, paper, base,
+        cfg.min_strength,
+        cfg.symbols,
+        cfg.portfolio_id,
+        cfg.poll_seconds,
+        cfg.allow_short,
+        cfg.long_only,
+        cfg.max_notional,
+        cfg.max_qty,
+        cfg.max_position_qty,
+        cfg.allow_add_to_position,
+        cfg.alpaca_dedupe_minutes,
+        cfg.cancel_opposite_open_orders,
+        cfg.max_open_positions,
+        cfg.max_open_orders,
+        cfg.daily_loss_stop_pct,
+        cfg.max_daily_loss_usd,
+        cfg.enable_daily_risk_guard,
+        cfg.symbol_cooldown_seconds,
+        cfg.pick_ttl_seconds,
+        cfg.trade_only_when_market_open,
+        cfg.preopen_window_seconds,
+        cfg.allow_trade_on_clock_error,
+        cfg.trading_paused,
+        cfg.dry_run,
     )
 
     while True:
         try:
-            n = unpick_stale_picks(engine, cfg)
-            if n:
-                LOG.info("auto_unpick | count=%s", n)
-
-            # Early kill switch (do not consume signals; just wait)
-
             if cfg.trading_paused:
-
                 LOG.info("trading_paused | sleep=%ss", cfg.poll_seconds)
-
-                time.sleep(cfg.poll_seconds)
-
-                continue
-
-
-            # Market-hours gate (prevents orders outside regular session; avoids stale-signal backlog)
-
-            gate_sleep = _market_gate_sleep_seconds(tc, cfg)
-
-            if gate_sleep is not None:
-
-                pending = fetch_new_signals(engine, cfg)
-
-                if pending:
-
-                    ids = [int(s["id"]) for s in pending]
-
-                    mark(engine, ids, "skipped", "market_closed")
-
-                    LOG.info("market_gate | market_closed | skipped=%s | sleep=%ss", len(ids), int(gate_sleep))
-
-                else:
-
-                    LOG.info("market_gate | market_closed | skipped=0 | sleep=%ss", int(gate_sleep))
-
-                time.sleep(int(gate_sleep))
-
-                continue
-
-
-
-            signals = fetch_new_signals(engine, cfg)
-            LOG.info("fetch_new_signals | fetched %s rows", len(signals))
-            if not signals:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            selected, stale_cnt = select_signals(engine, cfg, signals)
-            LOG.info(
-                "select_signals | fetched=%s | selected=%s | unique_symbol_side=%s%s",
-                len(signals), len(selected),
-                len({(str(s['symbol']).upper(), str(s['side']).lower()) for s in selected}),
-                f" | stale_skipped={stale_cnt}" if stale_cnt else ""
-            )
-
-            if not selected:
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            if cfg.trading_paused or cfg.dry_run:
-                note = "paused" if cfg.trading_paused else "dry_run"
-                mark(engine, [int(s["id"]) for s in selected], "skipped", note)
-                for s in selected:
-                    LOG.info("skip | sid=%s %s %s | %s", s["id"], s["symbol"], s["side"], note)
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            # Snapshot (once per loop) to prevent pyramiding + duplicate entries
-            pos_qty_map = _positions_qty_map(tc)
-            open_entry_map = _open_entry_orders_map(tc)
-
-            last_ts = get_symbol_last_trade_ts(engine, cfg.symbols)
-            now = _now_utc()
-
-            pick(engine, [int(s["id"]) for s in selected])
-
-            for idx, s in enumerate(selected):
-                sid = int(s["id"])
-                sym = str(s["symbol"]).upper()
-                side_s = str(s["side"]).lower()
-
-                if cfg.long_only and side_s != "buy":
-                    mark_one(engine, sid, "skipped", "long_only")
-                    LOG.info("skip | sid=%s %s %s | long_only", sid, sym, side_s)
-                    continue
-
-                if side_s == "sell" and not cfg.allow_short:
-                    mark_one(engine, sid, "skipped", "short_disabled")
-                    LOG.info("skip | sid=%s %s %s | short_disabled", sid, sym, side_s)
-                    continue
-
-                ts = last_ts.get(sym)
-                if ts is not None:
-                    t0 = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-                    if (now - t0).total_seconds() < cfg.symbol_cooldown_seconds:
-                        mark_one(engine, sid, "skipped", f"symbol_cooldown_{cfg.symbol_cooldown_seconds}s")
-                        LOG.info("skip | sid=%s %s %s | symbol_cooldown_%ss", sid, sym, side_s, cfg.symbol_cooldown_seconds)
+            if cfg.trade_only_when_market_open:
+                try:
+                    is_open = _get_clock_is_open(tc)
+                    if not is_open:
+                        if cfg.preopen_window_seconds > 0 and _within_preopen_window(tc, cfg.preopen_window_seconds):
+                            pass
+                        else:
+                            LOG.info("market_closed | sleep=%ss", cfg.poll_seconds)
+                            time.sleep(cfg.poll_seconds)
+                            continue
+                except Exception as e:
+                    if cfg.allow_trade_on_clock_error:
+                        LOG.warning("clock_error allow_trade_on_clock_error=True | %r", e)
+                    else:
+                        LOG.warning("clock_error FAIL_CLOSED allow_trade_on_clock_error=False | %r", e)
+                        time.sleep(cfg.poll_seconds)
                         continue
 
-                side = OrderSide.BUY if side_s == "buy" else OrderSide.SELL
+            sig = _pick_signal(engine, cfg)
+            if not sig:
+                time.sleep(cfg.poll_seconds)
+                continue
 
-                # NEW: avoid stacking multiple entry orders on same symbol+side
-                if open_entry_map.get((sym, side), 0) > 0:
-                    mark_one(engine, sid, "skipped", "open_order_same_side")
-                    LOG.info("skip | sid=%s %s %s | open_order_same_side", sid, sym, side_s)
-                    continue
+            symbol = sig["symbol"]
+            side = sig["side"]
+            strength = sig["strength"]
+            price = sig["price"] or _safe_mid_from_quotes(symbol)
 
-                # NEW: per-symbol position guard (no pyramiding by default)
-                pos_qty = float(pos_qty_map.get(sym, 0.0))
-                desired_direction_exists = (side == OrderSide.BUY and pos_qty > 0) or (side == OrderSide.SELL and pos_qty < 0)
-                if desired_direction_exists and not cfg.allow_add_to_position:
-                    mark_one(engine, sid, "skipped", f"already_in_position_qty={pos_qty:g}")
-                    LOG.info("skip | sid=%s %s %s | already_in_position qty=%s", sid, sym, side_s, pos_qty)
-                    continue
+            if side not in ("buy", "sell"):
+                LOG.info("skip invalid side | %s", side)
+                time.sleep(cfg.poll_seconds)
+                continue
 
-                ok, reason = risk_guard(tc, cfg)
-                if not ok:
-                    remaining = len(selected) - idx
-                    LOG.warning("risk_guard | blocked mid-batch | %s | unpicked_remaining=%s", reason, remaining)
-                    ids = [int(x["id"]) for x in selected[idx:]]
-                    q = text(
-                        """
-                        UPDATE signals
-                        SET processed_at = NULL,
-                            processed_status = NULL,
-                            processed_note = :note
-                        WHERE id = ANY(:ids)
-                        """
-                    )
-                    with engine.begin() as conn:
-                        conn.execute(q, {"ids": ids, "note": f"unpicked_risk_guard:{reason}"})
-                    break
+            if cfg.long_only and side == "sell":
+                LOG.info("skip short signal (long_only) | %s", symbol)
+                time.sleep(cfg.poll_seconds)
+                continue
 
-                if _recent_alpaca_dedupe(tc, sym, side, cfg.alpaca_dedupe_minutes):
-                    mark_one(engine, sid, "skipped", f"dedupe_alpaca_{cfg.alpaca_dedupe_minutes}m")
-                    LOG.info("skip | sid=%s %s %s | dedupe_alpaca_%sm", sid, sym, side_s, cfg.alpaca_dedupe_minutes)
-                    continue
+            if not price or price <= 0:
+                LOG.info("skip no_price | %s", symbol)
+                time.sleep(cfg.poll_seconds)
+                continue
 
-                limit_price = _latest_trade_price(data, sym)
-                if limit_price is None:
-                    mark_one(engine, sid, "skipped", "no_price")
-                    LOG.warning("skip | sid=%s %s %s | no_price", sid, sym, side_s)
-                    continue
+            if not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
+                LOG.info("dedupe_skip | %s %s", symbol, side)
+                time.sleep(cfg.poll_seconds)
+                continue
 
-                qty = _calc_qty(limit_price, cfg)
-                if qty <= 0:
-                    mark_one(engine, sid, "skipped", "qty_zero_by_limits")
-                    LOG.info("skip | sid=%s %s %s | qty_zero_by_limits", sid, sym, side_s)
-                    continue
+            qty = _calc_qty(cfg, price)
+            if qty <= 0:
+                LOG.info("skip qty<=0 | %s", symbol)
+                time.sleep(cfg.poll_seconds)
+                continue
 
-                # NEW: cap qty so abs(position) never exceeds MAX_POSITION_QTY
-                capped = _cap_qty_to_max_position(cfg, side, pos_qty, qty)
-                if capped <= 0:
-                    mark_one(engine, sid, "skipped", f"max_position_qty_reached={cfg.max_position_qty}")
-                    LOG.info("skip | sid=%s %s %s | max_position_qty_reached=%s (pos_qty=%s)", sid, sym, side_s, cfg.max_position_qty, pos_qty)
-                    continue
-                qty = capped
-
-                if cfg.cancel_opposite_open_orders:
-                    _cancel_opposite_open_orders(tc, sym, side)
-
-                try:
-                    # Guard: avoid Alpaca 40310000 when long shares are already held by existing SELL orders (e.g., exit OCO)
-                    if side == "sell" and pos_qty > 0:
-                        open_orders_raw = tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)) or []
-                        held_sell_qty = 0.0
-                        sym_u = str(sym).upper()
-                        for oo in open_orders_raw:
-                            if str(getattr(oo, "symbol", "") or "").upper() != sym_u:
-                                continue
-                            if not str(getattr(oo, "side", "") or "").lower().endswith("sell"):
-                                continue
-                            try:
-                                held_sell_qty += float(getattr(oo, "qty", 0) or 0)
-                            except Exception:
-                                pass
-                        available_qty = float(pos_qty) - float(held_sell_qty)
-                        if available_qty < 1:
-                            mark_one(engine, sid, "skipped", f"held_for_orders pos={pos_qty} held_sell={held_sell_qty}")
-                            LOG.info("skip | sid=%s %s sell | held_for_orders pos=%.2f held_sell=%.2f",
-                                     sid, sym_u, float(pos_qty), held_sell_qty)
-                            continue
-                        if qty > int(available_qty):
-                            new_qty = int(available_qty)
-                            if new_qty < 1:
-                                mark_one(engine, sid, "skipped", f"held_for_orders pos={pos_qty} held_sell={held_sell_qty}")
-                                LOG.info("skip | sid=%s %s sell | held_for_orders pos=%.2f held_sell=%.2f",
-                                         sid, sym_u, float(pos_qty), held_sell_qty)
-                                continue
-                            LOG.info("adjust_qty | sid=%s %s sell | qty=%s -> %s | pos=%.2f held_sell=%.2f",
-                                     sid, sym_u, qty, new_qty, float(pos_qty), held_sell_qty)
-                            qty = new_qty
-                    alpaca_id = submit_limit(tc, sym, side, qty, limit_price)
-                    mark_one(engine, sid, "submitted", "order submitted")
-                    LOG.info(
-                        "submitted | sid=%s | %s %s qty=%s limit=%.2f | alpaca_id=%s",
-                        sid, sym, side_s, qty, round(limit_price, 2), alpaca_id
-                    )
-                    last_ts[sym] = _now_utc()
-                    open_entry_map[(sym, side)] = open_entry_map.get((sym, side), 0) + 1
-                except Exception as e:
-                    mark_one(engine, sid, "error", f"submit_error:{type(e).__name__}")
-                    LOG.exception("submit failed | sid=%s %s %s | %s", sid, sym, side_s, e)
-
-            time.sleep(cfg.poll_seconds)
+            limit_price = price
+            if cfg.dry_run:
+                LOG.info("DRY_RUN would_submit | %s %s qty=%s limit=%s strength=%.4f", symbol, side, qty, limit_price, strength)
+            else:
+                oid = _place_limit(tc, symbol, side, qty, limit_price)
+                LOG.info("submitted | %s %s qty=%s limit=%s oid=%s strength=%.4f", symbol, side, qty, limit_price, oid, strength)
 
         except Exception as e:
-            LOG.exception("loop error: %s", e)
-            time.sleep(max(5, cfg.poll_seconds))
+            LOG.exception("loop_error: %r", e)
+
+        time.sleep(cfg.poll_seconds)
 
 
 if __name__ == "__main__":
