@@ -6,7 +6,7 @@
       POSTGRES_DB: trader
       POSTGRES_USER: trader
       POSTGRES_PASSWORD: trader
-      ENV_FILE: ${ENV_FILE:-.env}
+      ENV_FILE: ${ENV_FILE:-.env.live}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U trader -d trader"]
       interval: 3s
@@ -24,9 +24,9 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
-      ENV_FILE: ${ENV_FILE:-.env}
+      ENV_FILE: ${ENV_FILE:-.env.live}
     command: >
       sh -lc "
         echo 'waiting postgres...' &&
@@ -53,9 +53,9 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
-      ENV_FILE: ${ENV_FILE:-.env}
+      ENV_FILE: ${ENV_FILE:-.env.live}
     command: ["python", "-u", "jobs/make_signals_ml.py"]
     restart: unless-stopped
 
@@ -68,10 +68,10 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
-      ENV_FILE: ${ENV_FILE:-.env}
-    command: ["python", "-u", "services/signal_executor.py"]
+      ENV_FILE: ${ENV_FILE:-.env.live}
+    command: ["python", "-u", "-m", "services.signal_executor"]
     restart: unless-stopped
 
   oco_exit_monitor:
@@ -83,10 +83,10 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
-      ENV_FILE: ${ENV_FILE:-.env}
-    command: ["python", "-u", "services/oco_exit_monitor.py"]
+      ENV_FILE: ${ENV_FILE:-.env.live}
+    command: ["python", "-u", "-m", "services.oco_exit_monitor"]
     restart: unless-stopped
 
   reprice_stale:
@@ -98,10 +98,10 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
-      ENV_FILE: ${ENV_FILE:-.env}
-    command: ["python", "-u", "services/reprice_stale.py"]
+      ENV_FILE: ${ENV_FILE:-.env.live}
+    command: ["python", "-u", "-m", "services.reprice_stale"]
     restart: unless-stopped
 
   sync_orders:
@@ -113,10 +113,10 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
-      ENV_FILE: ${ENV_FILE:-.env}
-    command: ["python", "-u", "tools/sync_orders.py"]
+      ENV_FILE: ${ENV_FILE:-.env.live}
+    command: ["python", "-u", "-m", "tools.sync_orders"]
     restart: unless-stopped
 
   pnl_recorder:
@@ -128,10 +128,10 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
-      ENV_FILE: ${ENV_FILE:-.env}
-    command: ["python", "-u", "services/record_pnl.py"]
+      ENV_FILE: ${ENV_FILE:-.env.live}
+    command: ["python", "-u", "-m", "services.record_pnl"]
     restart: unless-stopped
 
 volumes:
