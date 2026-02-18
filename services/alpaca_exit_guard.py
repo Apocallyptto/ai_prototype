@@ -28,21 +28,29 @@ __all__ = [
 
 def get_trading_client(paper: Optional[bool] = None) -> TradingClient:
     """
-    Single place to build Alpaca TradingClient (used by oco_exit_monitor).
-    Defaults to paper trading unless explicitly overridden.
+    Single place to build Alpaca TradingClient.
+
+    Precedence:
+      1) explicit `paper=` argument if provided
+      2) TRADING_MODE env var: live -> paper=False, otherwise paper=True
+      3) fallback to ALPACA_PAPER env var (default True)
     """
     key = os.getenv("ALPACA_API_KEY")
     secret = os.getenv("ALPACA_API_SECRET")
+
     if not key or not secret:
-        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET env vars")
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
 
     if paper is None:
-        # default paper unless user explicitly sets ALPACA_PAPER=false/0/no
-        v = (os.getenv("ALPACA_PAPER", "true") or "true").strip().lower()
-        paper = v not in ("0", "false", "no")
+        mode = (os.getenv("TRADING_MODE") or "").strip().lower()
+        if mode:
+            paper = (mode != "live")
+        else:
+            # default paper unless user explicitly sets ALPACA_PAPER=false/0/no
+            v = (os.getenv("ALPACA_PAPER", "true") or "true").strip().lower()
+            paper = v not in ("0", "false", "no")
 
-    return TradingClient(key, secret, paper=paper)
-
+    return TradingClient(key, secret, paper=bool(paper))
 
 def _get_open_orders(tc: TradingClient, symbol: Optional[str] = None):
     """
