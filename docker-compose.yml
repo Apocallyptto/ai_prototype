@@ -1,21 +1,21 @@
-﻿version: "3.9"
-
-services:
+﻿services:
   postgres:
     image: postgres:16
     container_name: trader_postgres
-    restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
       POSTGRES_DB: trader
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+      ENV_FILE: ${ENV_FILE:-.env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d trader"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
-      interval: 5s
-      timeout: 5s
-      retries: 25
 
   db_init:
     image: postgres:16
@@ -23,130 +23,116 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - ${ENV_FILE:-.env}
     environment:
-      PGPASSWORD: postgres
-    volumes:
-      - ./db/init.sql:/schema/init.sql:ro
-    command: bash -lc "psql -h postgres -U postgres -d trader -v ON_ERROR_STOP=1 -f /schema/init.sql"
-    restart: "no"
+      ENV_FILE: ${ENV_FILE:-.env}
+    command: >
+      sh -lc "
+        echo 'waiting postgres...' &&
+        sleep 1 &&
+        psql 'postgresql://trader:trader@postgres:5432/trader' -v ON_ERROR_STOP=1 <<'SQL'
+        CREATE TABLE IF NOT EXISTS signals (
+          id SERIAL PRIMARY KEY,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          symbol TEXT NOT NULL,
+          side TEXT NOT NULL,
+          strength DOUBLE PRECISION NOT NULL,
+          price DOUBLE PRECISION,
+          portfolio_id INTEGER DEFAULT 1
+        );
+        SQL
+      "
 
   signal_maker:
-    volumes:
-      - ./models:/app/models:ro
     build:
       context: .
-    image: ai_prototype-signal_maker
+      dockerfile: Dockerfile
     container_name: trader_signal_maker
     depends_on:
       postgres:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
     env_file:
       - ${ENV_FILE:-.env}
     environment:
-      PYTHONPATH: "/app"
-      MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.75}"
-      CRON_SLEEP_SECONDS: "${MAKER_SLEEP_SECONDS:-180}"
-    command: sh -lc "python -u -m jobs.make_signals_ml"
-    restart: always
+      ENV_FILE: ${ENV_FILE:-.env}
+    command: ["python", "-u", "jobs/make_signals_ml.py"]
+    restart: unless-stopped
 
   signal_executor:
     build:
       context: .
-    image: ai_prototype-signal_executor
+      dockerfile: Dockerfile
     container_name: trader_signal_executor
     depends_on:
       postgres:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
     env_file:
       - ${ENV_FILE:-.env}
     environment:
-      PYTHONPATH: "/app"
-      MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
-      POLL_SECONDS: "${EXEC_POLL_SECONDS:-20}"
-      ALLOW_TRADE_ON_CLOCK_ERROR: "${EXEC_ALLOW_TRADE_ON_CLOCK_ERROR:-0}"
-    command: sh -lc "python -u -m services.signal_executor"
-    restart: always
+      ENV_FILE: ${ENV_FILE:-.env}
+    command: ["python", "-u", "services/signal_executor.py"]
+    restart: unless-stopped
 
   oco_exit_monitor:
     build:
       context: .
-    image: ai_prototype-oco_exit_monitor
+      dockerfile: Dockerfile
     container_name: trader_oco_exit_monitor
     depends_on:
       postgres:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
     env_file:
       - ${ENV_FILE:-.env}
     environment:
-      PYTHONPATH: "/app"
-      POLL_SECONDS: "${OCO_POLL_SECONDS:-5}"
-      HEARTBEAT_SECONDS: "${OCO_HEARTBEAT_SECONDS:-60}"
-    command: sh -lc "python -u -m services.oco_exit_monitor"
-    restart: always
+      ENV_FILE: ${ENV_FILE:-.env}
+    command: ["python", "-u", "services/oco_exit_monitor.py"]
+    restart: unless-stopped
 
-  # ✅ NEW: stale limit repricer worker
   reprice_stale:
     build:
       context: .
-    image: ai_prototype-reprice_stale
+      dockerfile: Dockerfile
     container_name: trader_reprice_stale
     depends_on:
       postgres:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
     env_file:
       - ${ENV_FILE:-.env}
     environment:
-      PYTHONPATH: "/app"
-      REPRICE_STALE_SECONDS: "${REPRICE_STALE_SECONDS:-45}"
-      REPRICE_CANCEL_AFTER_SECONDS: "${REPRICE_CANCEL_AFTER_SECONDS:-300}"
-      REPRICE_MAX_SPREAD_PCT: "${REPRICE_MAX_SPREAD_PCT:-0.40}"
-      REPRICE_MIN_ABS_MOVE: "${REPRICE_MIN_ABS_MOVE:-0.01}"
-      REPRICE_LOOP_SLEEP_SECS: "${REPRICE_LOOP_SLEEP_SECS:-2}"
-      REPRICE_MAX_REPRICES_PER_ORDER: "${REPRICE_MAX_REPRICES_PER_ORDER:-20}"
-    command: sh -lc "python -u -m services.reprice_stale"
-    restart: always
+      ENV_FILE: ${ENV_FILE:-.env}
+    command: ["python", "-u", "services/reprice_stale.py"]
+    restart: unless-stopped
 
   sync_orders:
     build:
       context: .
-    image: ai_prototype-sync_orders
+      dockerfile: Dockerfile
     container_name: trader_sync_orders
     depends_on:
       postgres:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
     env_file:
       - ${ENV_FILE:-.env}
     environment:
-      PYTHONPATH: "/app"
-    command: sh -lc "python -u tools/sync_orders.py"
-    restart: always
+      ENV_FILE: ${ENV_FILE:-.env}
+    command: ["python", "-u", "tools/sync_orders.py"]
+    restart: unless-stopped
 
   pnl_recorder:
     build:
       context: .
-    image: ai_prototype-pnl_recorder
+      dockerfile: Dockerfile
     container_name: trader_pnl_recorder
     depends_on:
       postgres:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
     env_file:
       - ${ENV_FILE:-.env}
     environment:
-      PYTHONPATH: "/app"
-    command: sh -lc "python -u -m services.record_pnl"
-    restart: always
+      ENV_FILE: ${ENV_FILE:-.env}
+    command: ["python", "-u", "services/record_pnl.py"]
+    restart: unless-stopped
 
 volumes:
   pgdata:
