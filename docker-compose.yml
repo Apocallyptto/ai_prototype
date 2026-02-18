@@ -42,7 +42,8 @@ services:
         condition: service_healthy
       db_init:
         condition: service_completed_successfully
-    env_file: .env
+    env_file:
+      - ${ENV_FILE:-.env}
     environment:
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${MAKER_MIN_STRENGTH:-0.75}"
@@ -60,7 +61,8 @@ services:
         condition: service_healthy
       db_init:
         condition: service_completed_successfully
-    env_file: .env
+    env_file:
+      - ${ENV_FILE:-.env}
     environment:
       PYTHONPATH: "/app"
       MIN_STRENGTH: "${EXEC_MIN_STRENGTH:-0.60}"
@@ -79,7 +81,8 @@ services:
         condition: service_healthy
       db_init:
         condition: service_completed_successfully
-    env_file: .env
+    env_file:
+      - ${ENV_FILE:-.env}
     environment:
       PYTHONPATH: "/app"
       POLL_SECONDS: "${OCO_POLL_SECONDS:-5}"
@@ -98,7 +101,8 @@ services:
         condition: service_healthy
       db_init:
         condition: service_completed_successfully
-    env_file: .env
+    env_file:
+      - ${ENV_FILE:-.env}
     environment:
       PYTHONPATH: "/app"
       REPRICE_STALE_SECONDS: "${REPRICE_STALE_SECONDS:-45}"
@@ -137,7 +141,8 @@ services:
         condition: service_healthy
       db_init:
         condition: service_completed_successfully
-    env_file: .env
+    env_file:
+      - ${ENV_FILE:-.env}
     environment:
       PYTHONPATH: "/app"
     command: sh -lc "python -u -m services.record_pnl"
