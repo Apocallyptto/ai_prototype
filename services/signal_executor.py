@@ -4,11 +4,11 @@ import math
 import uuid
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Iterable
+from datetime import datetime, timezone
+from typing import Optional
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
 from sqlalchemy import text
 
@@ -141,7 +141,6 @@ def _within_preopen_window(tc: TradingClient, window_seconds: int) -> bool:
         return False
     now = _now_utc()
     nxt = getattr(clk, "next_open")
-    # next_open from alpaca is usually ISO string or datetime
     if isinstance(nxt, str):
         try:
             nxt_dt = datetime.fromisoformat(nxt.replace("Z", "+00:00"))
@@ -153,49 +152,50 @@ def _within_preopen_window(tc: TradingClient, window_seconds: int) -> bool:
     return 0 <= delta <= window_seconds
 
 
-def _get_open_orders(tc: TradingClient) -> list:
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True)
-    return list(tc.get_orders(filter=req) or [])
-
-
-def _get_positions(tc: TradingClient) -> list:
-    return list(tc.get_all_positions() or [])
-
-
 def _safe_mid_from_quotes(symbol: str) -> Optional[float]:
-    # Placeholder: your project likely has quote fetching elsewhere.
-    # Return None to fall back on price from signal if present.
     return None
 
 
 def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
-    # returns False if same symbol+side signal executed within last N minutes (DB-driven dedupe)
-    with engine.begin() as con:
-        r = con.execute(
-            text(
-                """
-                SELECT created_at
-                FROM orders
-                WHERE symbol=:symbol AND side=:side
-                ORDER BY created_at DESC
-                LIMIT 1
-                """
-            ),
-            {"symbol": symbol, "side": side},
-        ).fetchone()
-        if not r:
-            return True
-        ts = r[0]
-        try:
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except Exception:
-            return True
-        return (_now_utc() - ts).total_seconds() > minutes * 60
+    """Returns False if same symbol+side was seen in orders within last N minutes.
+
+    If the orders table doesn't exist yet (first run), we fail open to avoid blocking entries.
+    """
+    try:
+        with engine.begin() as con:
+            r = con.execute(
+                text(
+                    """
+                    SELECT created_at
+                    FROM orders
+                    WHERE symbol=:symbol AND side=:side
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"symbol": symbol, "side": side},
+            ).fetchone()
+    except Exception as e:
+        LOG.warning("dedupe_check_error allow=True | %r", e)
+        return True
+
+    if not r:
+        return True
+
+    ts = r[0]
+    try:
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return True
+
+    if isinstance(ts, datetime) and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+
+    return (_now_utc() - ts).total_seconds() > minutes * 60
 
 
 def _pick_signal(engine, cfg: Cfg) -> Optional[dict]:
-    # pick strongest recent signal for allowed symbols
     with engine.begin() as con:
         rows = con.execute(
             text(
@@ -203,7 +203,7 @@ def _pick_signal(engine, cfg: Cfg) -> Optional[dict]:
                 SELECT id, created_at, symbol, side, strength, price
                 FROM signals
                 WHERE portfolio_id=:pid
-                  AND symbol = ANY(:symbols)
+                  AND symbol = ANY(:symbols::text[])
                   AND strength >= :min_strength
                 ORDER BY created_at DESC
                 LIMIT 1
@@ -232,7 +232,6 @@ def _calc_qty(cfg: Cfg, price: float) -> float:
     qty = cfg.max_notional / price
     qty = min(qty, cfg.max_qty)
     qty = max(0.0, qty)
-    # round down to 3 decimals for fractional
     qty = math.floor(qty * 1000) / 1000.0
     return qty
 
@@ -265,30 +264,13 @@ def main() -> None:
         "ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | TRADE_ONLY_WHEN_MARKET_OPEN=%s | "
         "PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s",
         mode, paper, base,
-        cfg.min_strength,
-        cfg.symbols,
-        cfg.portfolio_id,
-        cfg.poll_seconds,
-        cfg.allow_short,
-        cfg.long_only,
-        cfg.max_notional,
-        cfg.max_qty,
-        cfg.max_position_qty,
-        cfg.allow_add_to_position,
-        cfg.alpaca_dedupe_minutes,
-        cfg.cancel_opposite_open_orders,
-        cfg.max_open_positions,
-        cfg.max_open_orders,
-        cfg.daily_loss_stop_pct,
-        cfg.max_daily_loss_usd,
-        cfg.enable_daily_risk_guard,
-        cfg.symbol_cooldown_seconds,
-        cfg.pick_ttl_seconds,
-        cfg.trade_only_when_market_open,
-        cfg.preopen_window_seconds,
-        cfg.allow_trade_on_clock_error,
-        cfg.trading_paused,
-        cfg.dry_run,
+        cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
+        cfg.allow_short, cfg.long_only, cfg.max_notional, cfg.max_qty, cfg.max_position_qty,
+        cfg.allow_add_to_position, cfg.alpaca_dedupe_minutes, cfg.cancel_opposite_open_orders,
+        cfg.max_open_positions, cfg.max_open_orders, cfg.daily_loss_stop_pct, cfg.max_daily_loss_usd,
+        cfg.enable_daily_risk_guard, cfg.symbol_cooldown_seconds, cfg.pick_ttl_seconds,
+        cfg.trade_only_when_market_open, cfg.preopen_window_seconds, cfg.allow_trade_on_clock_error,
+        cfg.trading_paused, cfg.dry_run,
     )
 
     while True:
