@@ -1,14 +1,14 @@
 # --- core ---
 pandas==2.3.3
-numpy
+numpy==2.2.2
 SQLAlchemy>=2.0
 
 # --- ML ---
 scikit-learn==1.7.2
-joblib
+joblib==1.5.1
 
 # --- data sources ---
-alpaca-trade-api
+alpaca-py==0.22.0
 yfinance
 
 # --- optional UI/tools ---
@@ -23,10 +23,9 @@ certifi>=2024.7.4
 charset-normalizer>=3.3.2
 idna>=3.7
 
-alpaca-py==0.22.0
 python-dotenv==1.0.1
+
+# DB drivers
 psycopg[binary]>=3.2.0
+# used by tools/sync_orders.py (psycopg2)
 psycopg2-binary==2.9.10
-numpy==2.2.2
-scikit-learn==1.7.2
-joblib==1.5.1
