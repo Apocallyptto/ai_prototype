@@ -4,11 +4,10 @@
     container_name: trader_postgres
     environment:
       POSTGRES_DB: trader
-      POSTGRES_USER: trader
-      POSTGRES_PASSWORD: trader
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trader -d trader"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trader"]
       interval: 3s
       timeout: 3s
       retries: 30
@@ -24,14 +23,12 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env.live}
-    environment:
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      - .env.live
     command: >
       sh -lc "
         echo 'waiting postgres...' &&
         sleep 1 &&
-        psql 'postgresql://trader:trader@postgres:5432/trader' -v ON_ERROR_STOP=1 <<'SQL'
+        psql 'postgresql://postgres:postgres@postgres:5432/trader' -v ON_ERROR_STOP=1 <<'SQL'
         CREATE TABLE IF NOT EXISTS signals (
           id SERIAL PRIMARY KEY,
           created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -53,9 +50,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env.live}
-    environment:
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      - .env.live
     command: ["python", "-u", "jobs/make_signals_ml.py"]
     restart: unless-stopped
 
@@ -68,9 +63,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env.live}
-    environment:
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      - .env.live
     command: ["python", "-u", "-m", "services.signal_executor"]
     restart: unless-stopped
 
@@ -83,9 +76,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env.live}
-    environment:
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      - .env.live
     command: ["python", "-u", "-m", "services.oco_exit_monitor"]
     restart: unless-stopped
 
@@ -98,9 +89,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env.live}
-    environment:
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      - .env.live
     command: ["python", "-u", "-m", "services.reprice_stale"]
     restart: unless-stopped
 
@@ -113,9 +102,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env.live}
-    environment:
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      - .env.live
     command: ["python", "-u", "-m", "tools.sync_orders"]
     restart: unless-stopped
 
@@ -128,9 +115,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env.live}
-    environment:
-      ENV_FILE: ${ENV_FILE:-.env.live}
+      - .env.live
     command: ["python", "-u", "-m", "services.record_pnl"]
     restart: unless-stopped
 
