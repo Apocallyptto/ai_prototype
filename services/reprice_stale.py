@@ -1,313 +1,252 @@
-# services/reprice_stale.py
-from __future__ import annotations
-
-import logging
-import math
 import os
 import time
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Iterable
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import QueryOrderStatus
-from alpaca.trading.requests import GetOrdersRequest, ReplaceOrderRequest
-from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.trading.requests import GetOrdersRequest, CancelOrderResponse
+from alpaca.trading.enums import QueryOrderStatus, OrderSide
+from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
-
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("reprice_stale")
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if v is None or not v.strip():
+    if v is None or str(v).strip() == "":
         return default
     return int(v)
 
 
 def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    if v is None or not v.strip():
+    if v is None or str(v).strip() == "":
         return default
     return float(v)
 
 
-def _tick_size(price: float) -> float:
-    # Reasonable default: sub-$1 stocks can require finer ticks.
-    return 0.0001 if price < 1.0 else 0.01
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = str(v).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off", ""):
+        return False
+    return default
 
 
-def _round_to_tick(price: float) -> float:
-    if price <= 0:
-        return price
-    tick = _tick_size(price)
-    return math.floor(price / tick + 0.5) * tick
+def _resolve_mode() -> str:
+    return (os.getenv("TRADING_MODE") or "paper").strip().lower()
 
 
-def _now_utc() -> datetime:
+def _resolve_paper() -> bool:
+    # Explicit override wins (useful for emergency forcing paper)
+    if os.getenv("ALPACA_PAPER") is not None:
+        return _env_bool("ALPACA_PAPER", True)
+    return _resolve_mode() != "live"
+
+
+def _parse_ts(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # alpaca returns ISO; python can parse with fromisoformat if it has offset
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _get_order_ts(o) -> Optional[datetime]:
-    # Alpaca order objects usually have submitted_at/created_at
-    ts = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
-    if ts is None:
-        return None
-    # Ensure timezone-aware
-    if getattr(ts, "tzinfo", None) is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+def _is_open_order(o) -> bool:
+    st = (getattr(o, "status", "") or "").lower()
+    return st in ("new", "accepted", "partially_filled", "held", "pending_new", "pending_cancel")
 
 
-def _is_limit_order(o) -> bool:
-    # robust across alpaca-py versions
-    typ = getattr(o, "type", None) or getattr(o, "order_type", None) or ""
-    return str(typ).upper().endswith("LIMIT")
-
-
-def _order_class(o) -> str:
-    oc = getattr(o, "order_class", "") or ""
-    return str(oc).lower()
-
-
-def _coid(o) -> str:
-    return str(getattr(o, "client_order_id", "") or "")
-
-
-def _should_skip_by_coid(coid: str) -> bool:
-    # hard skip exit/oco ids
-    coid_l = coid.lower()
-    return (
-        coid_l.startswith("exit-")
-        or coid_l.startswith("oco-")
-        or "-exit-" in coid_l
-        or "-tp-" in coid_l
-        or "-sl-" in coid_l
-    )
-
-
-@dataclass(frozen=True)
-class Quote:
-    bid: float
-    ask: float
-
-
-def _get_quote(data: StockHistoricalDataClient, symbol: str) -> Optional[Quote]:
+def _quote_mid(data: StockHistoricalDataClient, symbol: str) -> Optional[float]:
     try:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        resp = data.get_stock_latest_quote(req)
-        q = resp.get(symbol)
-        if not q:
+        q = data.get_stock_latest_quote(req)
+        obj = q.get(symbol)
+        if not obj:
             return None
-        bid = float(getattr(q, "bid_price", 0) or 0)
-        ask = float(getattr(q, "ask_price", 0) or 0)
+        bid = getattr(obj, "bid_price", None)
+        ask = getattr(obj, "ask_price", None)
+        if bid is None or ask is None:
+            return None
+        bid = float(bid)
+        ask = float(ask)
         if bid <= 0 or ask <= 0:
             return None
-        return Quote(bid=bid, ask=ask)
+        return (bid + ask) / 2.0
     except Exception as e:
-        logger.warning("%s: quote fetch failed: %s", symbol, e)
+        logger.warning("quote_mid error for %s: %s", symbol, e)
         return None
 
 
-def _spread_pct(q: Quote) -> float:
-    mid = (q.bid + q.ask) / 2.0
-    if mid <= 0:
-        return 999.0
-    return (q.ask - q.bid) / mid * 100.0
+def _pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return (a / b) * 100.0
 
 
-def _compute_new_price(o, q: Quote) -> float:
-    # Use mid, rounded to tick, clamped inside bid/ask
-    mid = (q.bid + q.ask) / 2.0
-    new_px = _round_to_tick(mid)
-
-    # keep inside market
-    if new_px > q.ask:
-        new_px = _round_to_tick(q.ask)
-    if new_px < q.bid:
-        new_px = _round_to_tick(q.bid)
-
-    return float(new_px)
+def _should_skip_afterhours(allow_ah: bool) -> bool:
+    return not allow_ah
 
 
-def _market_is_open(trading: TradingClient) -> bool:
-    try:
-        clk = trading.get_clock()
-        return bool(getattr(clk, "is_open", False))
-    except Exception:
-        # If clock fails, be conservative: treat as closed
-        return False
+def _market_is_open(tc: TradingClient) -> bool:
+    clk = tc.get_clock()
+    return bool(getattr(clk, "is_open", False))
 
 
-def _get_open_orders(trading: TradingClient):
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True)
-    try:
-        orders = trading.get_orders(req) or []
-    except TypeError:
-        # older signature
-        orders = trading.get_orders(filter=req) or []
-    return orders
-
-
-def _filter_reprice_candidates(orders):
+def _filter_reprice_candidates(orders) -> list:
     out = []
     for o in orders:
-        if not _is_limit_order(o):
+        if not _is_open_order(o):
             continue
-        if _order_class(o) != "simple":
-            # do NOT touch bracket/oco exits
-            continue
-        coid = _coid(o)
-        if coid and _should_skip_by_coid(coid):
+        # only limit orders we can reprice
+        if (getattr(o, "type", "") or "").lower() != "limit":
             continue
         out.append(o)
     return out
 
 
+def _cancel_if_too_old(tc: TradingClient, o, cancel_after_s: int) -> bool:
+    if cancel_after_s <= 0:
+        return False
+    submitted_at = _parse_ts(getattr(o, "submitted_at", None))
+    if not submitted_at:
+        return False
+    age_s = (_utcnow() - submitted_at).total_seconds()
+    if age_s < cancel_after_s:
+        return False
+    try:
+        tc.cancel_order_by_id(getattr(o, "id"))
+        return True
+    except Exception as e:
+        logger.warning("cancel_order_by_id failed id=%s sym=%s: %s", getattr(o, "id"), getattr(o, "symbol"), e)
+        return False
+
+
+def _reprice_one(tc: TradingClient, data: StockHistoricalDataClient, o, max_spread_pct: float) -> bool:
+    sym = (getattr(o, "symbol", "") or "").upper()
+    side = (getattr(o, "side", "") or "").lower()
+    limit_price = getattr(o, "limit_price", None)
+    if limit_price is None:
+        return False
+
+    mid = _quote_mid(data, sym)
+    if mid is None:
+        return False
+
+    # avoid repricing when spread too wide (mid far from current limit)
+    lp = float(limit_price)
+    spread = abs(lp - mid)
+    sp_pct = _pct(spread, mid)
+    if max_spread_pct > 0 and sp_pct > max_spread_pct:
+        return False
+
+    # nudge toward mid depending on side
+    new_price = mid
+    try:
+        tc.replace_order_by_id(getattr(o, "id"), limit_price=str(round(new_price, 2)))
+        return True
+    except Exception as e:
+        logger.warning("replace_order_by_id failed id=%s sym=%s: %s", getattr(o, "id"), sym, e)
+        return False
+
+
+def _get_open_orders(tc: TradingClient, symbols: Optional[list[str]] = None):
+    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True, symbols=symbols)
+    return tc.get_orders(req) or []
+
+
 def run_once(
     trading: TradingClient,
     data: StockHistoricalDataClient,
+    symbols: list[str],
     stale_seconds: int,
     cancel_after_seconds: int,
     max_spread_pct: float,
-    dry_run: bool,
-    reprice_counts: dict[str, int],
-    max_reprices_per_order: int,
+    require_market_open: bool,
+    allow_ah: bool,
+    counts: dict[str, int],
 ):
-    orders = _filter_reprice_candidates(_get_open_orders(trading))
-
-    if not orders:
-        logger.info("no open orders to reprice")
+    if require_market_open and not _market_is_open(trading):
         return
 
-    now = _now_utc()
+    if _should_skip_afterhours(allow_ah) and not _market_is_open(trading):
+        return
 
+    orders = _filter_reprice_candidates(_get_open_orders(trading, symbols=symbols))
+
+    now = _utcnow()
     for o in orders:
-        oid = str(getattr(o, "id", "") or "")
-        sym = str(getattr(o, "symbol", "") or "")
-        old_px = float(getattr(o, "limit_price", 0) or 0)
-        ts = _get_order_ts(o)
-        if not oid or not sym or old_px <= 0 or ts is None:
+        sym = (getattr(o, "symbol", "") or "").upper()
+        submitted_at = _parse_ts(getattr(o, "submitted_at", None))
+        if not submitted_at:
             continue
 
-        age = (now - ts).total_seconds()
-
-        # Safety cap per process lifetime
-        if reprice_counts[oid] >= max_reprices_per_order:
+        age_s = (now - submitted_at).total_seconds()
+        if stale_seconds > 0 and age_s < stale_seconds:
             continue
 
-        # Cancel first if too old
-        if cancel_after_seconds > 0 and age >= cancel_after_seconds:
-            if dry_run:
-                logger.info("%s: would_cancel age=%.0fs id=%s limit=%.2f", sym, age, oid, old_px)
-            else:
-                try:
-                    trading.cancel_order_by_id(oid)
-                    logger.info("%s: canceled age=%.0fs id=%s limit=%.2f", sym, age, oid, old_px)
-                except Exception as e:
-                    logger.warning("%s: cancel failed id=%s: %s", sym, oid, e)
+        if _cancel_if_too_old(trading, o, cancel_after_seconds):
+            counts[f"{sym}:canceled_old"] += 1
             continue
 
-        # Only reprice when stale
-        if age < stale_seconds:
-            continue
-
-        q = _get_quote(data, sym)
-        if not q:
-            continue
-
-        sp = _spread_pct(q)
-        if sp > max_spread_pct:
-            logger.info("%s: skip (wide spread %.3f%% bid=%.2f ask=%.2f)", sym, sp, q.bid, q.ask)
-            continue
-
-        new_px = _compute_new_price(o, q)
-        if math.isclose(new_px, old_px, rel_tol=0.0, abs_tol=_tick_size(old_px)):
-            continue
-
-        if dry_run:
-            logger.info(
-                "%s: would_replace age=%.0fs id=%s old=%.2f new=%.2f bid=%.2f ask=%.2f",
-                sym, age, oid, old_px, new_px, q.bid, q.ask
-            )
-            continue
-
-        try:
-            req = ReplaceOrderRequest(limit_price=new_px)
-            trading.replace_order_by_id(oid, req)
-            reprice_counts[oid] += 1
-            logger.info(
-                "%s: replaced age=%.0fs id=%s old=%.2f new=%.2f bid=%.2f ask=%.2f",
-                sym, age, oid, old_px, new_px, q.bid, q.ask
-            )
-        except Exception as e:
-            logger.warning("%s: replace failed id=%s: %s", sym, oid, e)
+        if _reprice_one(trading, data, o, max_spread_pct=max_spread_pct):
+            counts[f"{sym}:repriced"] += 1
 
 
 def main():
-    # minimal logging (your container/other modules can override format)
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s | %(message)s")
+    poll_seconds = _env_int("POLL_SECONDS", 10)
+    stale_seconds = _env_int("STALE_SECONDS", 60)
+    cancel_after_seconds = _env_int("CANCEL_AFTER_SECONDS", 0)
+    max_spread_pct = _env_float("MAX_SPREAD_PCT", 0.25)
+    require_market_open = _env_bool("REQUIRE_MARKET_OPEN", True)
+    allow_ah = _env_bool("ALLOW_AH", False)
 
-    dry_run = _env_bool("DRY_RUN", False)
-    run_once_flag = _env_bool("RUN_ONCE", False)
+    symbols = [s.strip().upper() for s in (os.getenv("SYMBOLS", "") or "").split(",") if s.strip()]
+    if not symbols:
+        symbols = ["AAPL", "MSFT", "SPY"]
 
-    stale_seconds = _env_int("REPRICE_STALE_SECONDS", 45)
-    cancel_after_seconds = _env_int("REPRICE_CANCEL_AFTER_SECONDS", 300)
-    require_market_open = _env_bool("REPRICE_REQUIRE_MARKET_OPEN", True)
-    max_spread_pct = _env_float("REPRICE_MAX_SPREAD_PCT", 0.5)
+    mode = _resolve_mode()
+    paper = _resolve_paper()
 
-    loop_sleep = _env_int("REPRICE_LOOP_SLEEP_SECS", 60)
-    max_reprices = _env_int("REPRICE_MAX_REPRICES_PER_ORDER", 10)
+    logger.info("reprice_stale | trading | mode=%s paper=%s", mode, paper)
 
-    logger.info(
-        "reprice_stale | start | dry_run=%s run_once=%s stale=%ss cancel_after=%ss",
-        dry_run, run_once_flag, stale_seconds, cancel_after_seconds
-    )
-
-    trading = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=True)
+    trading = TradingClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"), paper=paper)
     data = StockHistoricalDataClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"))
 
-    reprice_counts: dict[str, int] = defaultdict(int)
+    counts: dict[str, int] = defaultdict(int)
 
     while True:
         try:
-            if require_market_open and not _market_is_open(trading):
-                logger.info("market closed -> idle (no orders) -> sleeping %ss", loop_sleep if not run_once_flag else 0)
-                if run_once_flag:
-                    return
-                time.sleep(loop_sleep)
-                continue
-
             run_once(
                 trading=trading,
                 data=data,
+                symbols=symbols,
                 stale_seconds=stale_seconds,
                 cancel_after_seconds=cancel_after_seconds,
                 max_spread_pct=max_spread_pct,
-                dry_run=dry_run,
-                reprice_counts=reprice_counts,
-                max_reprices_per_order=max_reprices,
+                require_market_open=require_market_open,
+                allow_ah=allow_ah,
+                counts=counts,
             )
-
-            if run_once_flag:
-                return
-
-        except KeyboardInterrupt:
-            raise
         except Exception as e:
             logger.exception("reprice loop error: %s", e)
 
-        time.sleep(loop_sleep)
+        time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":
