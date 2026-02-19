@@ -1,4 +1,5 @@
-﻿import os
+﻿# SPAM_GUARD_V1
+import os
 import time
 import math
 import uuid
@@ -27,11 +28,10 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 def _resolve_mode_and_paper() -> tuple[str, bool]:
-    """Resolve trading mode and whether to use Alpaca paper endpoint.
-
+    """
     Priority:
       1) TRADING_MODE=live|paper
-      2) explicit ALPACA_PAPER override (backwards compatibility)
+      2) ALPACA_PAPER override (back-compat)
       3) default -> paper (fail-safe)
     """
     mode = (os.getenv("TRADING_MODE") or "paper").strip().lower()
@@ -40,7 +40,6 @@ def _resolve_mode_and_paper() -> tuple[str, bool]:
 
     paper = (mode != "live")
 
-    # Back-compat / emergency override
     if os.getenv("ALPACA_PAPER") is not None:
         paper = _env_bool("ALPACA_PAPER", paper)
         mode = "paper" if paper else "live"
@@ -52,67 +51,102 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _round_price(p: float) -> float:
-    return round(p + 1e-9, 2)
-
-
 @dataclass
 class Cfg:
     poll_seconds: int
     min_strength: float
     symbols: list[str]
     portfolio_id: int
+
     allow_short: bool
     long_only: bool
+
     max_notional: float
     max_qty: float
     max_position_qty: float
     allow_add_to_position: bool
+
     alpaca_dedupe_minutes: int
     cancel_opposite_open_orders: bool
+
     max_open_positions: int
     max_open_orders: int
+
     daily_loss_stop_pct: float
     max_daily_loss_usd: float
     enable_daily_risk_guard: bool
+
     symbol_cooldown_seconds: int
     pick_ttl_seconds: int
+
     trade_only_when_market_open: bool
     preopen_window_seconds: int
     allow_trade_on_clock_error: bool
+
     trading_paused: bool
     dry_run: bool
 
 
 def _load_cfg() -> Cfg:
+    poll_seconds = int(os.getenv("POLL_SECONDS", "20"))
+    min_strength = float(os.getenv("MIN_STRENGTH", "0.60"))
     symbols_raw = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
     symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+    portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
+
+    allow_short = _env_bool("ALLOW_SHORT", False)
+    long_only = _env_bool("LONG_ONLY", True)
+
+    max_notional = float(os.getenv("MAX_NOTIONAL", "100"))
+    max_qty = float(os.getenv("MAX_QTY", "1"))
+    max_position_qty = float(os.getenv("MAX_POSITION_QTY", "1"))
+    allow_add_to_position = _env_bool("ALLOW_ADD_TO_POSITION", False)
+
+    alpaca_dedupe_minutes = int(os.getenv("ALPACA_DEDUPE_MINUTES", "2"))
+    cancel_opposite_open_orders = _env_bool("CANCEL_OPPOSITE_OPEN_ORDERS", True)
+
+    max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+    max_open_orders = int(os.getenv("MAX_OPEN_ORDERS", "1"))
+
+    daily_loss_stop_pct = float(os.getenv("DAILY_LOSS_STOP_PCT", "1.0"))
+    max_daily_loss_usd = float(os.getenv("MAX_DAILY_LOSS_USD", "200.0"))
+    enable_daily_risk_guard = _env_bool("ENABLE_DAILY_RISK_GUARD", True)
+
+    symbol_cooldown_seconds = int(os.getenv("SYMBOL_COOLDOWN_SECONDS", "60"))
+    pick_ttl_seconds = int(os.getenv("PICK_TTL_SECONDS", "120"))
+
+    trade_only_when_market_open = _env_bool("TRADE_ONLY_WHEN_MARKET_OPEN", True)
+    preopen_window_seconds = int(os.getenv("PREOPEN_WINDOW_SECONDS", "0"))
+    allow_trade_on_clock_error = _env_bool("ALLOW_TRADE_ON_CLOCK_ERROR", False)
+
+    trading_paused = _env_bool("TRADING_PAUSED", True)
+    dry_run = _env_bool("DRY_RUN", True)
 
     return Cfg(
-        poll_seconds=int(os.getenv("POLL_SECONDS", "20")),
-        min_strength=float(os.getenv("MIN_STRENGTH", "0.60")),
+        poll_seconds=poll_seconds,
+        min_strength=min_strength,
         symbols=symbols,
-        portfolio_id=int(os.getenv("PORTFOLIO_ID", "1")),
-        allow_short=_env_bool("ALLOW_SHORT", False),
-        long_only=_env_bool("LONG_ONLY", True),
-        max_notional=float(os.getenv("MAX_NOTIONAL", "100")),
-        max_qty=float(os.getenv("MAX_QTY", "1")),
-        max_position_qty=float(os.getenv("MAX_POSITION_QTY", "1")),
-        allow_add_to_position=_env_bool("ALLOW_ADD_TO_POSITION", False),
-        alpaca_dedupe_minutes=int(os.getenv("ALPACA_DEDUPE_MINUTES", "2")),
-        cancel_opposite_open_orders=_env_bool("CANCEL_OPPOSITE_OPEN_ORDERS", True),
-        max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
-        max_open_orders=int(os.getenv("MAX_OPEN_ORDERS", "1")),
-        daily_loss_stop_pct=float(os.getenv("DAILY_LOSS_STOP_PCT", "1.0")),
-        max_daily_loss_usd=float(os.getenv("MAX_DAILY_LOSS_USD", "200.0")),
-        enable_daily_risk_guard=_env_bool("ENABLE_DAILY_RISK_GUARD", True),
-        symbol_cooldown_seconds=int(os.getenv("SYMBOL_COOLDOWN_SECONDS", "60")),
-        pick_ttl_seconds=int(os.getenv("PICK_TTL_SECONDS", "120")),
-        trade_only_when_market_open=_env_bool("TRADE_ONLY_WHEN_MARKET_OPEN", True),
-        preopen_window_seconds=int(os.getenv("PREOPEN_WINDOW_SECONDS", "0")),
-        allow_trade_on_clock_error=_env_bool("ALLOW_TRADE_ON_CLOCK_ERROR", False),
-        trading_paused=_env_bool("TRADING_PAUSED", True),
-        dry_run=_env_bool("DRY_RUN", True),
+        portfolio_id=portfolio_id,
+        allow_short=allow_short,
+        long_only=long_only,
+        max_notional=max_notional,
+        max_qty=max_qty,
+        max_position_qty=max_position_qty,
+        allow_add_to_position=allow_add_to_position,
+        alpaca_dedupe_minutes=alpaca_dedupe_minutes,
+        cancel_opposite_open_orders=cancel_opposite_open_orders,
+        max_open_positions=max_open_positions,
+        max_open_orders=max_open_orders,
+        daily_loss_stop_pct=daily_loss_stop_pct,
+        max_daily_loss_usd=max_daily_loss_usd,
+        enable_daily_risk_guard=enable_daily_risk_guard,
+        symbol_cooldown_seconds=symbol_cooldown_seconds,
+        pick_ttl_seconds=pick_ttl_seconds,
+        trade_only_when_market_open=trade_only_when_market_open,
+        preopen_window_seconds=preopen_window_seconds,
+        allow_trade_on_clock_error=allow_trade_on_clock_error,
+        trading_paused=trading_paused,
+        dry_run=dry_run,
     )
 
 
@@ -137,10 +171,11 @@ def _get_clock_is_open(tc: TradingClient) -> bool:
 
 def _within_preopen_window(tc: TradingClient, window_seconds: int) -> bool:
     clk = tc.get_clock()
-    if not getattr(clk, "next_open", None):
+    nxt = getattr(clk, "next_open", None)
+    if not nxt:
         return False
+
     now = _now_utc()
-    nxt = getattr(clk, "next_open")
     if isinstance(nxt, str):
         try:
             nxt_dt = datetime.fromisoformat(nxt.replace("Z", "+00:00"))
@@ -148,27 +183,13 @@ def _within_preopen_window(tc: TradingClient, window_seconds: int) -> bool:
             return False
     else:
         nxt_dt = nxt
+
     delta = (nxt_dt - now).total_seconds()
     return 0 <= delta <= window_seconds
 
 
-def _get_open_orders(tc: TradingClient) -> list:
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True)
-    return list(tc.get_orders(filter=req) or [])
-
-
-def _get_positions(tc: TradingClient) -> list:
-    return list(tc.get_all_positions() or [])
-
-
-def _safe_mid_from_quotes(symbol: str) -> Optional[float]:
-    # Placeholder: your project likely has quote fetching elsewhere.
-    # Return None to fall back on price from signal if present.
-    return None
-
-
 def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
-    # returns False if same symbol+side executed within last N minutes (DB-driven dedupe)
+    # Only useful when you insert into orders table (i.e., not DRY_RUN)
     with engine.begin() as con:
         r = con.execute(
             text(
@@ -182,52 +203,66 @@ def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
             ),
             {"symbol": symbol, "side": side},
         ).fetchone()
-        if not r:
-            return True
-        ts = r[0]
-        try:
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except Exception:
-            return True
-        return (_now_utc() - ts).total_seconds() > minutes * 60
+
+    if not r:
+        return True
+
+    ts = r[0]
+    try:
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return True
+
+    return (_now_utc() - ts).total_seconds() > minutes * 60
 
 
-def _pick_signal(engine, cfg: Cfg) -> Optional[dict]:
-    # pick strongest recent signal for allowed symbols + TTL
+def _allowed_sides(cfg: Cfg) -> list[str]:
+    # For entry orders: if long_only OR allow_short is False -> only BUY
+    if cfg.long_only or not cfg.allow_short:
+        return ["buy"]
+    return ["buy", "sell"]
+
+
+def _pick_signals(engine, cfg: Cfg) -> list[dict]:
+    sides = _allowed_sides(cfg)
     with engine.begin() as con:
-        row = con.execute(
+        rows = con.execute(
             text(
                 """
                 SELECT id, created_at, symbol, side, strength, price
                 FROM signals
                 WHERE portfolio_id=:pid
                   AND symbol = ANY(CAST(:symbols AS text[]))
+                  AND side   = ANY(CAST(:sides   AS text[]))
                   AND strength >= :min_strength
                   AND created_at >= (NOW() - (:ttl * INTERVAL '1 second'))
                 ORDER BY strength DESC, created_at DESC
-                LIMIT 1
+                LIMIT 10
                 """
             ),
             {
                 "pid": cfg.portfolio_id,
                 "symbols": list(cfg.symbols),
+                "sides": sides,
                 "min_strength": cfg.min_strength,
                 "ttl": cfg.pick_ttl_seconds,
             },
-        ).fetchone()
+        ).fetchall()
 
-    if not row:
-        return None
-
-    return {
-        "id": row[0],
-        "created_at": row[1],
-        "symbol": (row[2] or "").upper(),
-        "side": (row[3] or "").lower(),
-        "strength": float(row[4]),
-        "price": float(row[5]) if row[5] is not None else None,
-    }
+    out: list[dict] = []
+    for r in rows:
+        out.append(
+            {
+                "id": int(r[0]),
+                "created_at": r[1],
+                "symbol": (r[2] or "").upper(),
+                "side": (r[3] or "").lower(),
+                "strength": float(r[4]),
+                "price": float(r[5]) if r[5] is not None else None,
+            }
+        )
+    return out
 
 
 def _calc_qty(cfg: Cfg, price: float) -> float:
@@ -236,9 +271,10 @@ def _calc_qty(cfg: Cfg, price: float) -> float:
     qty = cfg.max_notional / price
     qty = min(qty, cfg.max_qty)
     qty = max(0.0, qty)
-    # round down to 3 decimals for fractional
     qty = math.floor(qty * 1000) / 1000.0
-    return qty
+    if 0 < qty < 1.0:
+        qty = 1.0
+    return float(qty)
 
 
 def _place_limit(tc: TradingClient, symbol: str, side: str, qty: float, limit_price: float) -> str:
@@ -247,8 +283,7 @@ def _place_limit(tc: TradingClient, symbol: str, side: str, qty: float, limit_pr
         qty=qty,
         side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
-        limit_price=str(_round_price(limit_price)),
-        order_class=None,
+        limit_price=str(round(float(limit_price), 2)),
         client_order_id=f"ENTRY-{symbol}-{uuid.uuid4().hex[:10]}",
     )
     o = tc.submit_order(order_data=req)
@@ -260,19 +295,21 @@ def main() -> None:
     engine = get_engine()
     tc, mode, paper, base = make_trading_client()
 
-    # in-memory de-spam (important for DRY_RUN because orders table won't be updated)
+    # --- DRY_RUN anti-spam (in-memory) ---
     seen_signal_ids: dict[int, float] = {}
     last_action_by_symbol: dict[str, float] = {}
-    seen_keep_seconds = max(300, cfg.pick_ttl_seconds * 10)
+    seen_keep_seconds = max(600, cfg.pick_ttl_seconds * 20)
 
     LOG.info(
-        "signal_executor starting | MODE=%s | paper=%s | base=%s | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
-        "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | MAX_POSITION_QTY=%s | "
-        "ALLOW_ADD_TO_POSITION=%s | ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | "
-        "MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%s | MAX_DAILY_LOSS_USD=%s | "
-        "ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | TRADE_ONLY_WHEN_MARKET_OPEN=%s | "
-        "PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s",
-        mode, paper, base,
+        "signal_executor starting | MODE=%s | paper=%s | base=%s | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | "
+        "POLL=%ss | ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%s | MAX_POSITION_QTY=%s | "
+        "ALLOW_ADD_TO_POSITION=%s | ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | "
+        "MAX_OPEN_ORDERS=%s | DAILY_LOSS_STOP_PCT=%s | MAX_DAILY_LOSS_USD=%s | ENABLE_DAILY_RISK_GUARD=%s | "
+        "SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | "
+        "ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s",
+        mode,
+        paper,
+        base,
         cfg.min_strength,
         cfg.symbols,
         cfg.portfolio_id,
@@ -301,8 +338,9 @@ def main() -> None:
 
     while True:
         try:
-            # prune seen cache
             now_ts = time.time()
+
+            # prune seen cache
             if seen_signal_ids:
                 cutoff = now_ts - seen_keep_seconds
                 for k, v in list(seen_signal_ids.items()):
@@ -316,8 +354,7 @@ def main() -> None:
 
             if cfg.trade_only_when_market_open:
                 try:
-                    is_open = _get_clock_is_open(tc)
-                    if not is_open:
+                    if not _get_clock_is_open(tc):
                         if cfg.preopen_window_seconds > 0 and _within_preopen_window(tc, cfg.preopen_window_seconds):
                             pass
                         else:
@@ -332,51 +369,48 @@ def main() -> None:
                         time.sleep(cfg.poll_seconds)
                         continue
 
-            sig = _pick_signal(engine, cfg)
-            if not sig:
+            candidates = _pick_signals(engine, cfg)
+            if not candidates:
                 LOG.info("no_signal | sleep=%ss", cfg.poll_seconds)
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            sig_id = int(sig["id"])
-            symbol = sig["symbol"]
-            side = sig["side"]
-            strength = sig["strength"]
-            price = sig["price"] or _safe_mid_from_quotes(symbol)
+            picked: Optional[dict] = None
+            for sig in candidates:
+                sid = int(sig["id"])
+                sym = sig["symbol"]
 
-            # prevent re-processing same signal id (esp. in DRY_RUN)
-            if sig_id in seen_signal_ids:
-                LOG.info("skip already_processed_signal | id=%s %s %s | sleep=%ss", sig_id, symbol, side, cfg.poll_seconds)
+                if sid in seen_signal_ids:
+                    continue
+
+                last_ts = last_action_by_symbol.get(sym)
+                if last_ts is not None and (now_ts - last_ts) < cfg.symbol_cooldown_seconds:
+                    continue
+
+                picked = sig
+                break
+
+            if not picked:
+                LOG.info("no_eligible_signal (seen/cooldown) | sleep=%ss", cfg.poll_seconds)
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # cooldown per symbol after we "act" (DRY or real)
-            last_ts = last_action_by_symbol.get(symbol)
-            if last_ts is not None and (now_ts - last_ts) < cfg.symbol_cooldown_seconds:
-                LOG.info("cooldown_skip | %s | remaining=%ss", symbol, int(cfg.symbol_cooldown_seconds - (now_ts - last_ts)))
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            if side not in ("buy", "sell"):
-                LOG.info("skip invalid side | %s", side)
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            if cfg.long_only and side == "sell":
-                LOG.info("skip short signal (long_only) | %s", symbol)
-                time.sleep(cfg.poll_seconds)
-                continue
+            sig_id = int(picked["id"])
+            symbol = picked["symbol"]
+            side = picked["side"]
+            strength = float(picked["strength"])
+            price = float(picked["price"]) if picked["price"] is not None else None
 
             if not price or price <= 0:
                 LOG.info("skip no_price | %s", symbol)
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # DB-driven dedupe (only meaningful when orders table gets updated - i.e. not DRY_RUN)
-            if not cfg.dry_run and not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
-                LOG.info("dedupe_skip | %s %s", symbol, side)
-                time.sleep(cfg.poll_seconds)
-                continue
+            if not cfg.dry_run:
+                if not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
+                    LOG.info("dedupe_skip | %s %s", symbol, side)
+                    time.sleep(cfg.poll_seconds)
+                    continue
 
             qty = _calc_qty(cfg, price)
             if qty <= 0:
@@ -384,11 +418,11 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            limit_price = price
-
-            # mark as "processed" only when we would actually act (prevents spam)
+            # mark processed BEFORE acting (prevents spam in DRY_RUN)
             seen_signal_ids[sig_id] = now_ts
             last_action_by_symbol[symbol] = now_ts
+
+            limit_price = price
 
             if cfg.dry_run:
                 oid = f"DRY-{symbol}-{uuid.uuid4().hex[:10]}"
