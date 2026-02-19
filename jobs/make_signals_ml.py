@@ -9,15 +9,15 @@ Stable signal maker without `ml.*` dependency.
 
 Signal:
 - BUY if last_close > SMA
-- SELL if last_close < SMA  (executor may skip if LONG_ONLY=True)
+- SELL if last_close < SMA (executor may skip if LONG_ONLY=True)
 
 Strength scaling:
-- pct_diff = abs(close - sma) / sma   (e.g. 0.002 = 0.2%)
+- pct_diff = abs(close - sma) / sma
 - strength = clamp01(pct_diff / STRENGTH_PCT_FOR_1)
 
-Default:
-- STRENGTH_PCT_FOR_1=0.003 (0.3%) => 0.3% diff -> strength 1.0
-So MIN_STRENGTH=0.6 roughly means ~0.18%+ diff from SMA.
+Defaults:
+- STRENGTH_PCT_FOR_1=0.002 (0.2% diff -> strength 1.0)
+So MIN_STRENGTH=0.6 roughly means ~0.12%+ diff from SMA.
 
 Env:
 - SYMBOLS="AAPL,MSFT,SPY"
@@ -26,7 +26,7 @@ Env:
 - SIGNAL_POLL_SECONDS=60
 - BARS_LIMIT=120
 - SMA_PERIOD=50
-- STRENGTH_PCT_FOR_1=0.003
+- STRENGTH_PCT_FOR_1=0.002
 - DEBUG_SIGNALS=0|1
 - DB_URL or DATABASE_URL
 - ALPACA_API_KEY / ALPACA_API_SECRET
@@ -120,7 +120,7 @@ def main() -> None:
     portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
     bars_limit = int(os.getenv("BARS_LIMIT", "120"))
     sma_period = int(os.getenv("SMA_PERIOD", "50"))
-    strength_pct_for_1 = float(os.getenv("STRENGTH_PCT_FOR_1", "0.003"))
+    strength_pct_for_1 = float(os.getenv("STRENGTH_PCT_FOR_1", "0.002"))
     debug = _env_bool("DEBUG_SIGNALS", False)
 
     if strength_pct_for_1 <= 0:
@@ -129,7 +129,6 @@ def main() -> None:
     symbols = _split_symbols()
     engine = _get_engine()
     data_client = StockHistoricalDataClient(api_key, api_secret)
-
     tf = TimeFrame(5, TimeFrameUnit.Minute)
 
     LOG.info(
@@ -154,13 +153,19 @@ def main() -> None:
                 time.sleep(poll)
                 continue
 
+            # What symbols did Alpaca actually return?
+            try:
+                available_syms = sorted(set(df.index.get_level_values(0)))  # MultiIndex level 0 = symbol
+            except Exception:
+                available_syms = []
+
             inserted = 0
             for sym in symbols:
                 try:
-                    sym_df = df.loc[sym]  # MultiIndex: (symbol, timestamp)
+                    sym_df = df.loc[sym]
                 except Exception:
                     if debug:
-                        LOG.info("debug | %s | no_df_for_symbol", sym)
+                        LOG.info("debug | %s | no_df_for_symbol | available=%s", sym, available_syms)
                     continue
 
                 if sym_df is None or sym_df.empty:
