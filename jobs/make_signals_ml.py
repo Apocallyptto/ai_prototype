@@ -2,9 +2,10 @@
 """
 jobs/make_signals_ml.py
 
-Temporary/stable signal maker that DOES NOT depend on `ml.*`.
+Stable signal maker without `ml.*` dependency.
 
-It pulls recent 5-min bars from Alpaca Market Data and writes signals into Postgres.
+- Pulls recent 5-min bars from Alpaca Market Data
+- Writes signals into Postgres
 
 Signals:
 - BUY if last_close > SMA
@@ -20,7 +21,6 @@ Env:
 - SIGNAL_POLL_SECONDS=60
 - BARS_LIMIT=120
 - SMA_PERIOD=50
-- TRADING_MODE=live|paper (affects data endpoint only indirectly; uses keys)
 - DB_URL or DATABASE_URL
 - ALPACA_API_KEY / ALPACA_API_SECRET
 """
@@ -32,22 +32,13 @@ from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, text
 
-# Alpaca data (alpaca-py)
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 
 LOG = logging.getLogger("signal_maker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
-
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.getenv(key)
-    if v is None:
-        return default
-    v = (v or "").strip().lower()
-    return v not in ("0", "false", "no", "off")
 
 
 def _normalize_sqlalchemy_url(raw: str) -> str:
@@ -78,10 +69,6 @@ def _clamp01(x: float) -> float:
     if x > 1:
         return 1.0
     return x
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _sma(values: list[float], period: int) -> float | None:
@@ -127,6 +114,8 @@ def main() -> None:
 
     data_client = StockHistoricalDataClient(api_key, api_secret)
 
+    tf = TimeFrame(5, TimeFrameUnit.Minute)  # ✅ FIX: 5-min timeframe
+
     LOG.info(
         "signal_maker starting | symbols=%s | poll=%ss | min_strength=%.4f | bars_limit=%s | sma_period=%s | portfolio_id=%s",
         symbols, poll, min_strength, bars_limit, sma_period, portfolio_id
@@ -136,7 +125,7 @@ def main() -> None:
         try:
             req = StockBarsRequest(
                 symbol_or_symbols=symbols,
-                timeframe=TimeFrame.Minute * 5,
+                timeframe=tf,
                 limit=bars_limit,
             )
 
@@ -148,11 +137,10 @@ def main() -> None:
                 time.sleep(poll)
                 continue
 
-            # df is usually MultiIndex (symbol, timestamp)
             inserted = 0
             for sym in symbols:
                 try:
-                    sym_df = df.loc[sym]  # type: ignore[index]
+                    sym_df = df.loc[sym]  # MultiIndex: (symbol, timestamp)
                 except Exception:
                     continue
 
@@ -168,7 +156,6 @@ def main() -> None:
                 if sma is None or sma <= 0:
                     continue
 
-                # decide side + strength
                 side = "buy" if close > sma else "sell"
                 strength = _clamp01(abs(close - sma) / sma)
 
