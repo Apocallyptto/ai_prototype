@@ -1,16 +1,17 @@
-﻿# SPAM_GUARD_V1
+﻿# SPAM_GUARD_V1 + DRY_ORDERS_V1
 import os
 import time
 import math
 import uuid
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest
 from sqlalchemy import text
 
 from tools.db import get_engine
@@ -188,35 +189,6 @@ def _within_preopen_window(tc: TradingClient, window_seconds: int) -> bool:
     return 0 <= delta <= window_seconds
 
 
-def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
-    # Only useful when you insert into orders table (i.e., not DRY_RUN)
-    with engine.begin() as con:
-        r = con.execute(
-            text(
-                """
-                SELECT created_at
-                FROM orders
-                WHERE symbol=:symbol AND side=:side
-                ORDER BY created_at DESC
-                LIMIT 1
-                """
-            ),
-            {"symbol": symbol, "side": side},
-        ).fetchone()
-
-    if not r:
-        return True
-
-    ts = r[0]
-    try:
-        if isinstance(ts, str):
-            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
-        return True
-
-    return (_now_utc() - ts).total_seconds() > minutes * 60
-
-
 def _allowed_sides(cfg: Cfg) -> list[str]:
     # For entry orders: if long_only OR allow_short is False -> only BUY
     if cfg.long_only or not cfg.allow_short:
@@ -226,6 +198,7 @@ def _allowed_sides(cfg: Cfg) -> list[str]:
 
 def _pick_signals(engine, cfg: Cfg) -> list[dict]:
     sides = _allowed_sides(cfg)
+
     with engine.begin() as con:
         rows = con.execute(
             text(
@@ -244,7 +217,7 @@ def _pick_signals(engine, cfg: Cfg) -> list[dict]:
             {
                 "pid": cfg.portfolio_id,
                 "symbols": list(cfg.symbols),
-                "sides": sides,
+                "sides": list(sides),
                 "min_strength": cfg.min_strength,
                 "ttl": cfg.pick_ttl_seconds,
             },
@@ -277,17 +250,165 @@ def _calc_qty(cfg: Cfg, price: float) -> float:
     return float(qty)
 
 
-def _place_limit(tc: TradingClient, symbol: str, side: str, qty: float, limit_price: float) -> str:
+def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
+    """
+    Returns False if same symbol+side exists in orders table within last N minutes.
+    Works for both DRY_RUN (because we will write orders) and real mode.
+    """
+    with engine.begin() as con:
+        r = con.execute(
+            text(
+                """
+                SELECT created_at
+                FROM orders
+                WHERE symbol=:symbol AND side=:side
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"symbol": symbol, "side": side},
+        ).fetchone()
+
+    if not r:
+        return True
+
+    ts = r[0]
+    try:
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return True
+
+    return (_now_utc() - ts).total_seconds() > minutes * 60
+
+
+def _upsert_order_row(engine, cols: dict) -> None:
+    """
+    Upsert into orders table using the same column list as sync_orders.py.
+    raw_json is passed as JSON string and cast to jsonb.
+    """
+    with engine.begin() as con:
+        con.execute(
+            text(
+                """
+                INSERT INTO orders (
+                  id, created_at, updated_at, submitted_at, filled_at, expired_at, canceled_at, failed_at,
+                  replaced_at, replaced_by, replaces, asset_id, symbol, asset_class, qty, filled_qty,
+                  side, type, time_in_force, limit_price, stop_price, status, extended_hours,
+                  client_order_id, order_class, raw_json
+                )
+                VALUES (
+                  :id, :created_at, :updated_at, :submitted_at, :filled_at, :expired_at, :canceled_at, :failed_at,
+                  :replaced_at, :replaced_by, :replaces, :asset_id, :symbol, :asset_class, :qty, :filled_qty,
+                  :side, :type, :time_in_force, :limit_price, :stop_price, :status, :extended_hours,
+                  :client_order_id, :order_class, CAST(:raw_json AS jsonb)
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                  created_at=EXCLUDED.created_at,
+                  updated_at=EXCLUDED.updated_at,
+                  submitted_at=EXCLUDED.submitted_at,
+                  filled_at=EXCLUDED.filled_at,
+                  expired_at=EXCLUDED.expired_at,
+                  canceled_at=EXCLUDED.canceled_at,
+                  failed_at=EXCLUDED.failed_at,
+                  replaced_at=EXCLUDED.replaced_at,
+                  replaced_by=EXCLUDED.replaced_by,
+                  replaces=EXCLUDED.replaces,
+                  asset_id=EXCLUDED.asset_id,
+                  symbol=EXCLUDED.symbol,
+                  asset_class=EXCLUDED.asset_class,
+                  qty=EXCLUDED.qty,
+                  filled_qty=EXCLUDED.filled_qty,
+                  side=EXCLUDED.side,
+                  type=EXCLUDED.type,
+                  time_in_force=EXCLUDED.time_in_force,
+                  limit_price=EXCLUDED.limit_price,
+                  stop_price=EXCLUDED.stop_price,
+                  status=EXCLUDED.status,
+                  extended_hours=EXCLUDED.extended_hours,
+                  client_order_id=EXCLUDED.client_order_id,
+                  order_class=EXCLUDED.order_class,
+                  raw_json=EXCLUDED.raw_json
+                """
+            ),
+            cols,
+        )
+
+
+def _record_dry_run_order(
+    engine,
+    *,
+    order_id: str,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    limit_price: float,
+    signal_id: int,
+    strength: float,
+    portfolio_id: int,
+    mode: str,
+    paper: bool,
+) -> None:
+    now = _now_utc()
+    raw = {
+        "dry_run": True,
+        "signal_id": signal_id,
+        "strength": strength,
+        "portfolio_id": portfolio_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": float(qty),
+        "limit_price": float(limit_price),
+        "mode": mode,
+        "paper": paper,
+        "ts": now.isoformat(),
+    }
+
+    cols = {
+        "id": order_id,
+        "created_at": now,
+        "updated_at": now,
+        "submitted_at": now,
+        "filled_at": None,
+        "expired_at": None,
+        "canceled_at": None,
+        "failed_at": None,
+        "replaced_at": None,
+        "replaced_by": None,
+        "replaces": None,
+        "asset_id": None,
+        "symbol": symbol,
+        "asset_class": "us_equity",
+        "qty": str(qty),
+        "filled_qty": "0",
+        "side": side,
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": str(round(float(limit_price), 2)),
+        "stop_price": None,
+        "status": "dry_run",
+        "extended_hours": False,
+        "client_order_id": client_order_id,
+        "order_class": None,
+        "raw_json": json.dumps(raw),
+    }
+    _upsert_order_row(engine, cols)
+
+
+def _place_limit(tc: TradingClient, symbol: str, side: str, qty: float, limit_price: float) -> tuple[str, str]:
+    client_order_id = f"ENTRY-{symbol}-{uuid.uuid4().hex[:10]}"
     req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
         side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
         limit_price=str(round(float(limit_price), 2)),
-        client_order_id=f"ENTRY-{symbol}-{uuid.uuid4().hex[:10]}",
+        client_order_id=client_order_id,
     )
     o = tc.submit_order(order_data=req)
-    return str(getattr(o, "id", ""))
+    alpaca_id = str(getattr(o, "id", "")) or client_order_id
+    return alpaca_id, client_order_id
 
 
 def main() -> None:
@@ -295,7 +416,7 @@ def main() -> None:
     engine = get_engine()
     tc, mode, paper, base = make_trading_client()
 
-    # --- DRY_RUN anti-spam (in-memory) ---
+    # --- in-memory anti-spam (important even with DB dedupe, keeps logs clean) ---
     seen_signal_ids: dict[int, float] = {}
     last_action_by_symbol: dict[str, float] = {}
     seen_keep_seconds = max(600, cfg.pick_ttl_seconds * 20)
@@ -406,11 +527,11 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            if not cfg.dry_run:
-                if not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
-                    LOG.info("dedupe_skip | %s %s", symbol, side)
-                    time.sleep(cfg.poll_seconds)
-                    continue
+            # DB dedupe (now works for both DRY_RUN and real, because DRY_RUN writes to orders)
+            if not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
+                LOG.info("dedupe_skip | %s %s", symbol, side)
+                time.sleep(cfg.poll_seconds)
+                continue
 
             qty = _calc_qty(cfg, price)
             if qty <= 0:
@@ -418,7 +539,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # mark processed BEFORE acting (prevents spam in DRY_RUN)
+            # mark processed BEFORE acting (prevents spam)
             seen_signal_ids[sig_id] = now_ts
             last_action_by_symbol[symbol] = now_ts
 
@@ -430,12 +551,74 @@ def main() -> None:
                     "DRY_RUN would_submit | symbol=%s side=%s qty=%.4f limit=%.4f strength=%.4f oid=%s",
                     symbol, side, qty, float(limit_price), float(strength), oid
                 )
-            else:
-                oid = _place_limit(tc, symbol, side, qty, limit_price)
-                LOG.info(
-                    "submitted | symbol=%s side=%s qty=%.4f limit=%.4f oid=%s strength=%.4f",
-                    symbol, side, qty, float(limit_price), oid, float(strength)
+
+                # record into orders table (audit + dedupe realism)
+                _record_dry_run_order(
+                    engine,
+                    order_id=oid,
+                    client_order_id=oid,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    limit_price=limit_price,
+                    signal_id=sig_id,
+                    strength=strength,
+                    portfolio_id=cfg.portfolio_id,
+                    mode=mode,
+                    paper=paper,
                 )
+            else:
+                alpaca_id, client_oid = _place_limit(tc, symbol, side, qty, limit_price)
+                LOG.info(
+                    "submitted | symbol=%s side=%s qty=%.4f limit=%.4f oid=%s client_order_id=%s strength=%.4f",
+                    symbol, side, qty, float(limit_price), alpaca_id, client_oid, float(strength)
+                )
+
+                # optional: write "submitted" immediately (sync_orders will fill details later)
+                now = _now_utc()
+                raw = {
+                    "dry_run": False,
+                    "submitted_by": "signal_executor",
+                    "signal_id": sig_id,
+                    "strength": strength,
+                    "portfolio_id": cfg.portfolio_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": float(qty),
+                    "limit_price": float(limit_price),
+                    "mode": mode,
+                    "paper": paper,
+                    "ts": now.isoformat(),
+                }
+                cols = {
+                    "id": alpaca_id,
+                    "created_at": now,
+                    "updated_at": now,
+                    "submitted_at": now,
+                    "filled_at": None,
+                    "expired_at": None,
+                    "canceled_at": None,
+                    "failed_at": None,
+                    "replaced_at": None,
+                    "replaced_by": None,
+                    "replaces": None,
+                    "asset_id": None,
+                    "symbol": symbol,
+                    "asset_class": "us_equity",
+                    "qty": str(qty),
+                    "filled_qty": "0",
+                    "side": side,
+                    "type": "limit",
+                    "time_in_force": "day",
+                    "limit_price": str(round(float(limit_price), 2)),
+                    "stop_price": None,
+                    "status": "submitted",
+                    "extended_hours": False,
+                    "client_order_id": client_oid,
+                    "order_class": None,
+                    "raw_json": json.dumps(raw),
+                }
+                _upsert_order_row(engine, cols)
 
         except Exception as e:
             LOG.exception("loop_error: %r", e)
