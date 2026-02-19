@@ -95,6 +95,34 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _to_utc_aware(dt: Any) -> Optional[datetime]:
+    """
+    Normalizuj datetime na UTC-aware:
+    - ak je string ISO -> parse
+    - ak je naive (bez tzinfo) -> predpokladaj UTC
+    - ak je aware -> prehoď do UTC
+    """
+    if dt is None:
+        return None
+
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    if not isinstance(dt, datetime):
+        return None
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+
+    try:
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return dt
+
+
 def _round_price(p: float) -> float:
     # bezpečne na 2 desatinné pre US equities (môžeš upraviť podľa potreby)
     return float(f"{p:.2f}")
@@ -167,13 +195,11 @@ def _within_preopen_window(tc: TradingClient, window_seconds: int) -> bool:
     if not nxt:
         return False
     now = _now_utc()
-    if isinstance(nxt, str):
-        try:
-            nxt_dt = datetime.fromisoformat(nxt.replace("Z", "+00:00"))
-        except Exception:
-            return False
-    else:
-        nxt_dt = nxt
+
+    nxt_dt = _to_utc_aware(nxt)
+    if not nxt_dt:
+        return False
+
     delta = (nxt_dt - now).total_seconds()
     return 0 <= delta <= window_seconds
 
@@ -221,13 +247,7 @@ def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
         if not r:
             return True
 
-        ts = r[0]
-        if isinstance(ts, str):
-            try:
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except Exception:
-                return True
-
+        ts = _to_utc_aware(r[0])
         if not ts:
             return True
 
@@ -269,12 +289,7 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
         if sid in seen_ids:
             continue
 
-        created_at = r.get("created_at")
-        if isinstance(created_at, str):
-            try:
-                created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            except Exception:
-                created_at = None
+        created_at = _to_utc_aware(r.get("created_at"))
 
         if created_at and cfg.pick_ttl_seconds > 0:
             age = (now - created_at).total_seconds()
