@@ -7,12 +7,17 @@ Stable signal maker without `ml.*` dependency.
 - Pulls recent 5-min bars from Alpaca Market Data
 - Writes signals into Postgres
 
-Signals:
+Signal:
 - BUY if last_close > SMA
 - SELL if last_close < SMA  (executor may skip if LONG_ONLY=True)
 
-Strength:
-- abs(close - sma) / sma  (clamped 0..1)
+Strength scaling:
+- pct_diff = abs(close - sma) / sma   (e.g. 0.002 = 0.2%)
+- strength = clamp01(pct_diff / STRENGTH_PCT_FOR_1)
+
+Default:
+- STRENGTH_PCT_FOR_1=0.003 (0.3%) => 0.3% diff -> strength 1.0
+So MIN_STRENGTH=0.6 roughly means ~0.18%+ diff from SMA.
 
 Env:
 - SYMBOLS="AAPL,MSFT,SPY"
@@ -21,6 +26,8 @@ Env:
 - SIGNAL_POLL_SECONDS=60
 - BARS_LIMIT=120
 - SMA_PERIOD=50
+- STRENGTH_PCT_FOR_1=0.003
+- DEBUG_SIGNALS=0|1
 - DB_URL or DATABASE_URL
 - ALPACA_API_KEY / ALPACA_API_SECRET
 """
@@ -28,7 +35,6 @@ Env:
 import os
 import time
 import logging
-from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, text
 
@@ -45,8 +51,6 @@ def _normalize_sqlalchemy_url(raw: str) -> str:
     url = (raw or "").strip()
     if not url:
         raise RuntimeError("DB_URL / DATABASE_URL not set")
-
-    # if plain postgresql://, force psycopg (v3) driver
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
     return url
@@ -61,6 +65,14 @@ def _get_engine():
 def _split_symbols() -> list[str]:
     s = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
     return [x.strip().upper() for x in s.split(",") if x.strip()]
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    v = (v or "").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 
 def _clamp01(x: float) -> float:
@@ -108,17 +120,22 @@ def main() -> None:
     portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
     bars_limit = int(os.getenv("BARS_LIMIT", "120"))
     sma_period = int(os.getenv("SMA_PERIOD", "50"))
+    strength_pct_for_1 = float(os.getenv("STRENGTH_PCT_FOR_1", "0.003"))
+    debug = _env_bool("DEBUG_SIGNALS", False)
+
+    if strength_pct_for_1 <= 0:
+        raise RuntimeError("STRENGTH_PCT_FOR_1 must be > 0")
 
     symbols = _split_symbols()
     engine = _get_engine()
-
     data_client = StockHistoricalDataClient(api_key, api_secret)
 
-    tf = TimeFrame(5, TimeFrameUnit.Minute)  # ✅ FIX: 5-min timeframe
+    tf = TimeFrame(5, TimeFrameUnit.Minute)
 
     LOG.info(
-        "signal_maker starting | symbols=%s | poll=%ss | min_strength=%.4f | bars_limit=%s | sma_period=%s | portfolio_id=%s",
-        symbols, poll, min_strength, bars_limit, sma_period, portfolio_id
+        "signal_maker starting | symbols=%s | poll=%ss | min_strength=%.4f | bars_limit=%s | sma_period=%s | "
+        "portfolio_id=%s | strength_pct_for_1=%s | debug=%s",
+        symbols, poll, min_strength, bars_limit, sma_period, portfolio_id, strength_pct_for_1, debug
     )
 
     while True:
@@ -142,22 +159,37 @@ def main() -> None:
                 try:
                     sym_df = df.loc[sym]  # MultiIndex: (symbol, timestamp)
                 except Exception:
+                    if debug:
+                        LOG.info("debug | %s | no_df_for_symbol", sym)
                     continue
 
                 if sym_df is None or sym_df.empty:
+                    if debug:
+                        LOG.info("debug | %s | empty_df", sym)
                     continue
 
                 closes = [float(x) for x in sym_df["close"].tolist() if x is not None]
                 if len(closes) < max(10, sma_period):
+                    if debug:
+                        LOG.info("debug | %s | not_enough_closes=%s need=%s", sym, len(closes), sma_period)
                     continue
 
                 close = float(closes[-1])
                 sma = _sma(closes, sma_period)
                 if sma is None or sma <= 0:
+                    if debug:
+                        LOG.info("debug | %s | bad_sma=%s", sym, sma)
                     continue
 
                 side = "buy" if close > sma else "sell"
-                strength = _clamp01(abs(close - sma) / sma)
+                pct_diff = abs(close - sma) / sma
+                strength = _clamp01(pct_diff / strength_pct_for_1)
+
+                if debug:
+                    LOG.info(
+                        "debug | %s | close=%.4f sma=%.4f pct_diff=%.6f strength=%.4f side=%s",
+                        sym, close, sma, pct_diff, strength, side
+                    )
 
                 if strength < min_strength:
                     continue
