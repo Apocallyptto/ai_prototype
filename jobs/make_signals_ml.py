@@ -1,270 +1,190 @@
+#!/usr/bin/env python3
+"""
+jobs/make_signals_ml.py
+
+Temporary/stable signal maker that DOES NOT depend on `ml.*`.
+
+It pulls recent 5-min bars from Alpaca Market Data and writes signals into Postgres.
+
+Signals:
+- BUY if last_close > SMA
+- SELL if last_close < SMA  (executor may skip if LONG_ONLY=True)
+
+Strength:
+- abs(close - sma) / sma  (clamped 0..1)
+
+Env:
+- SYMBOLS="AAPL,MSFT,SPY"
+- PORTFOLIO_ID=1
+- MIN_STRENGTH=0.60
+- SIGNAL_POLL_SECONDS=60
+- BARS_LIMIT=120
+- SMA_PERIOD=50
+- TRADING_MODE=live|paper (affects data endpoint only indirectly; uses keys)
+- DB_URL or DATABASE_URL
+- ALPACA_API_KEY / ALPACA_API_SECRET
+"""
+
 import os
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
-import numpy as np
-import pandas as pd
-import joblib
-import yfinance as yf
 from sqlalchemy import create_engine, text
 
-from ml.nn_train import make_features
+# Alpaca data (alpaca-py)
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 
-# -----------------------------------------------------------------------------
-# Logging setup
-# -----------------------------------------------------------------------------
-logger = logging.getLogger("make_signals_ml")
-if not logger.handlers:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+LOG = logging.getLogger("signal_maker")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-MODEL_DIR = os.getenv("MODEL_DIR", "models")
-MODEL_PATH = os.path.join(MODEL_DIR, "gbc_5m.pkl")
-SCALER_PATH = os.path.join(MODEL_DIR, "gbc_5m_scaler.pkl")
-
-# Features we trained on in ml.train_gbc_5m
-FEATURE_COLS = [
-    "return_1",
-    "return_5",
-    "return_10",
-    "ma_10",
-    "ma_20",
-    "std_10",
-    "std_20",
-    "hl_range",
-    "oc_range",
-    "vol_zscore_20",
-    "rsi_14",
-]
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    v = (v or "").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 
-# -----------------------------------------------------------------------------
-# Model / scaler loading
-# -----------------------------------------------------------------------------
-def load_model_and_scaler():
-    logger.info("Loading model from %s", MODEL_PATH)
-    model = joblib.load(MODEL_PATH)
+def _normalize_sqlalchemy_url(raw: str) -> str:
+    url = (raw or "").strip()
+    if not url:
+        raise RuntimeError("DB_URL / DATABASE_URL not set")
 
-    logger.info("Loading scaler from %s", SCALER_PATH)
-    scaler = joblib.load(SCALER_PATH)
-
-    return model, scaler
+    # if plain postgresql://, force psycopg (v3) driver
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
 
 
-# -----------------------------------------------------------------------------
-# Data loading (runtime) – now using yfinance instead of Alpaca
-# -----------------------------------------------------------------------------
-def load_recent_bars(
-    symbol: str,
-    lookback_days: int = 30,
-    interval: str = "5m",
-) -> pd.DataFrame:
-    """
-    Fetch recent OHLCV bars for one symbol using yfinance.
-
-    This avoids Alpaca SIP subscription limits and uses the same
-    data source as ml.train_gbc_5m used for training.
-    """
-    end = datetime.utcnow()
-    start = end - timedelta(days=lookback_days)
-
-    df = yf.download(
-        symbol,
-        start=start,
-        end=end,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-    )
-
-    if df is None or df.empty:
-        raise RuntimeError(f"yfinance returned no data for {symbol}")
-
-    df = df.copy()
-    if df.index.name is None:
-        df.index.name = "timestamp"
-
-    return df
+def _get_engine():
+    raw = os.getenv("DB_URL") or os.getenv("DATABASE_URL") or ""
+    url = _normalize_sqlalchemy_url(raw)
+    return create_engine(url, pool_pre_ping=True, future=True)
 
 
-def _latest_features(symbol: str) -> np.ndarray:
-    """
-    Load recent bars for a symbol, build features, and return
-    a 2D numpy array with exactly FEATURE_COLS in the right order
-    (shape: (1, len(FEATURE_COLS))).
-    """
-    df = load_recent_bars(symbol)
-    feats = make_features(df)
+def _split_symbols() -> list[str]:
+    s = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
+    return [x.strip().upper() for x in s.split(",") if x.strip()]
 
-    missing = [c for c in FEATURE_COLS if c not in feats.columns]
-    if missing:
-        raise RuntimeError(
-            f"Missing feature columns {missing} for symbol {symbol}. "
-            f"Got columns: {list(feats.columns)}"
+
+def _clamp01(x: float) -> float:
+    if x < 0:
+        return 0.0
+    if x > 1:
+        return 1.0
+    return x
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _sma(values: list[float], period: int) -> float | None:
+    if period <= 1 or len(values) < period:
+        return None
+    window = values[-period:]
+    return sum(window) / float(period)
+
+
+def _insert_signal(engine, symbol: str, side: str, strength: float, price: float, portfolio_id: int) -> None:
+    with engine.begin() as con:
+        con.execute(
+            text(
+                """
+                INSERT INTO signals (symbol, side, strength, price, portfolio_id)
+                VALUES (:symbol, :side, :strength, :price, :portfolio_id)
+                """
+            ),
+            {
+                "symbol": symbol,
+                "side": side,
+                "strength": float(strength),
+                "price": float(price),
+                "portfolio_id": int(portfolio_id),
+            },
         )
 
-    latest = feats[FEATURE_COLS].iloc[-1:]
-    return latest.values.astype("float32")
 
+def main() -> None:
+    api_key = os.getenv("ALPACA_API_KEY")
+    api_secret = os.getenv("ALPACA_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
 
-# -----------------------------------------------------------------------------
-# Prediction
-# -----------------------------------------------------------------------------
-def predict_for_symbols(symbols):
-    """
-    Returns a dict: {symbol: proba_array}, where proba_array is model.predict_proba(x)[0]
-    """
-    model, scaler = load_model_and_scaler()
-    preds = {}
+    poll = int(os.getenv("SIGNAL_POLL_SECONDS", "60"))
+    min_strength = float(os.getenv("MIN_STRENGTH", "0.60"))
+    portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
+    bars_limit = int(os.getenv("BARS_LIMIT", "120"))
+    sma_period = int(os.getenv("SMA_PERIOD", "50"))
 
-    for sym in symbols:
+    symbols = _split_symbols()
+    engine = _get_engine()
+
+    data_client = StockHistoricalDataClient(api_key, api_secret)
+
+    LOG.info(
+        "signal_maker starting | symbols=%s | poll=%ss | min_strength=%.4f | bars_limit=%s | sma_period=%s | portfolio_id=%s",
+        symbols, poll, min_strength, bars_limit, sma_period, portfolio_id
+    )
+
+    while True:
         try:
-            x = _latest_features(sym)  # shape (1, len(FEATURE_COLS))
-            xs = scaler.transform(x).astype("float32")
-            proba = model.predict_proba(xs)[0]
-            preds[sym] = proba
-        except Exception as e:
-            logger.error(
-                "Failed to build features/predict for %s: %s", sym, e, exc_info=False
+            req = StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=TimeFrame.Minute * 5,
+                limit=bars_limit,
             )
 
-    if not preds:
-        logger.warning("No predictions produced.")
+            bars = data_client.get_stock_bars(req)
+            df = getattr(bars, "df", None)
 
-    return preds
-
-
-# -----------------------------------------------------------------------------
-# DB insert
-# -----------------------------------------------------------------------------
-def get_engine():
-    # Try both DB_URL and DATABASE_URL to be compatible with your env/docker
-    db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
-    if not db_url:
-        raise RuntimeError("DB_URL or DATABASE_URL env var is not set.")
-    return create_engine(db_url)
-
-
-def insert_signals(preds, min_strength: float) -> int:
-    """
-    Insert ML signals into the `signals` table.
-
-    Assumes schema:
-      signals(symbol, side, strength, source, created_at, portfolio_id)
-    """
-    if not preds:
-        return 0
-
-    engine = get_engine()
-    now = datetime.utcnow()
-    source = "ml_gbc_5m"
-    portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
-
-    inserted = 0
-
-    with engine.begin() as conn:
-        for symbol, proba in preds.items():
-            # assuming binary classification: proba[0] = DOWN, proba[1] = UP
-            if len(proba) < 2:
-                logger.warning(
-                    "Unexpected proba shape for %s: %s", symbol, proba
-                )
+            if df is None or df.empty:
+                LOG.info("no_bars | sleep=%ss", poll)
+                time.sleep(poll)
                 continue
 
-            p_down = float(proba[0])
-            p_up = float(proba[1])
+            # df is usually MultiIndex (symbol, timestamp)
+            inserted = 0
+            for sym in symbols:
+                try:
+                    sym_df = df.loc[sym]  # type: ignore[index]
+                except Exception:
+                    continue
 
-            # BUY signal if model thinks "up" with sufficient confidence
-            if p_up >= min_strength:
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id)
-                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id)
-                        """
-                    ),
-                    {
-                        "symbol": symbol,
-                        "side": "buy",   # <<< dôležité: malé písmená
-                        "strength": p_up,
-                        "source": source,
-                        "created_at": now,
-                        "portfolio_id": portfolio_id,
-                    },
-                )
+                if sym_df is None or sym_df.empty:
+                    continue
+
+                closes = [float(x) for x in sym_df["close"].tolist() if x is not None]
+                if len(closes) < max(10, sma_period):
+                    continue
+
+                close = float(closes[-1])
+                sma = _sma(closes, sma_period)
+                if sma is None or sma <= 0:
+                    continue
+
+                # decide side + strength
+                side = "buy" if close > sma else "sell"
+                strength = _clamp01(abs(close - sma) / sma)
+
+                if strength < min_strength:
+                    continue
+
+                _insert_signal(engine, sym, side, strength, close, portfolio_id)
                 inserted += 1
 
-            # SELL signal if model thinks "down" with sufficient confidence
-            if p_down >= min_strength:
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO signals (symbol, side, strength, source, created_at, portfolio_id)
-                        VALUES (:symbol, :side, :strength, :source, :created_at, :portfolio_id)
-                        """
-                    ),
-                    {
-                        "symbol": symbol,
-                        "side": "sell",  # <<< tiež malé
-                        "strength": p_down,
-                        "source": source,
-                        "created_at": now,
-                        "portfolio_id": portfolio_id,
-                    },
-                )
-                inserted += 1
+            LOG.info("cycle_done | inserted=%s | sleep=%ss", inserted, poll)
 
-    return inserted
+        except Exception as e:
+            LOG.exception("signal_maker_error: %r", e)
 
-
-
-
-
-# -----------------------------------------------------------------------------
-# Main loop
-# -----------------------------------------------------------------------------
-def main():
-    symbols_env = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
-    symbols = [s.strip().upper() for s in symbols_env.split(",") if s.strip()]
-
-    min_strength_str = os.getenv("MIN_STRENGTH", "0.20")
-    try:
-        min_strength = float(min_strength_str)
-    except ValueError:
-        logger.warning(
-            "Invalid MIN_STRENGTH=%s, falling back to 0.20", min_strength_str
-        )
-        min_strength = 0.20
-
-    logger.info(
-        "make_signals_ml starting | SYMBOLS=%s | MIN_STRENGTH=%.2f",
-        symbols,
-        min_strength,
-    )
-
-    preds = predict_for_symbols(symbols)
-    if not preds:
-        return
-
-    inserted = insert_signals(preds, min_strength)
-    logger.info("Inserted %d ML signals", inserted)
+        time.sleep(poll)
 
 
 if __name__ == "__main__":
-    sleep_default = int(os.getenv("CRON_SLEEP_SECONDS", "180"))
-    while True:
-        try:
-            main()
-        except Exception as e:
-            logger.error("make_signals_ml iteration failed: %s", e, exc_info=True)
-
-        logger.info("Sleeping %d seconds before next run...", sleep_default)
-        time.sleep(sleep_default)
+    main()
