@@ -9,24 +9,28 @@ Stable signal maker without `ml.*` dependency.
 
 Signal:
 - BUY if last_close > SMA
-- SELL if last_close < SMA (executor may skip if LONG_ONLY=True)
+- SELL if last_close < SMA
 
 Strength scaling:
 - pct_diff = abs(close - sma) / sma
 - strength = clamp01(pct_diff / STRENGTH_PCT_FOR_1)
 
-Defaults:
-- STRENGTH_PCT_FOR_1=0.002 (0.2% diff -> strength 1.0)
-So MIN_STRENGTH=0.6 roughly means ~0.12%+ diff from SMA.
+Anti-spam / stability:
+- SIGNAL_DEDUPE_SECONDS: do not insert same (symbol, side, portfolio_id) too often
+- INSERT_TOP_IF_NONE: if no candidate passes MIN_STRENGTH, insert best candidate anyway (testing)
+- SIGNAL_SIDE_OVERRIDE=buy|sell: force side (testing)
 
 Env:
-- SYMBOLS="AAPL,MSFT,SPY"
+- SYMBOLS="AAPL,MSFT"
 - PORTFOLIO_ID=1
-- MIN_STRENGTH=0.60
+- MIN_STRENGTH=0.35
 - SIGNAL_POLL_SECONDS=60
 - BARS_LIMIT=120
 - SMA_PERIOD=50
 - STRENGTH_PCT_FOR_1=0.002
+- SIGNAL_DEDUPE_SECONDS=300
+- INSERT_TOP_IF_NONE=0|1
+- SIGNAL_SIDE_OVERRIDE=buy|sell|""
 - DEBUG_SIGNALS=0|1
 - DB_URL or DATABASE_URL
 - ALPACA_API_KEY / ALPACA_API_SECRET
@@ -35,6 +39,8 @@ Env:
 import os
 import time
 import logging
+from dataclasses import dataclass
+from typing import Optional
 
 from sqlalchemy import create_engine, text
 
@@ -45,6 +51,14 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 LOG = logging.getLogger("signal_maker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    v = (v or "").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 
 def _normalize_sqlalchemy_url(raw: str) -> str:
@@ -63,16 +77,8 @@ def _get_engine():
 
 
 def _split_symbols() -> list[str]:
-    s = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
+    s = os.getenv("SYMBOLS", "AAPL,MSFT")
     return [x.strip().upper() for x in s.split(",") if x.strip()]
-
-
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.getenv(key)
-    if v is None:
-        return default
-    v = (v or "").strip().lower()
-    return v not in ("0", "false", "no", "off")
 
 
 def _clamp01(x: float) -> float:
@@ -83,11 +89,32 @@ def _clamp01(x: float) -> float:
     return x
 
 
-def _sma(values: list[float], period: int) -> float | None:
+def _sma(values: list[float], period: int) -> Optional[float]:
     if period <= 1 or len(values) < period:
         return None
     window = values[-period:]
     return sum(window) / float(period)
+
+
+def _recent_signal_exists(engine, symbol: str, side: str, portfolio_id: int, dedupe_seconds: int) -> bool:
+    if dedupe_seconds <= 0:
+        return False
+    with engine.begin() as con:
+        r = con.execute(
+            text(
+                """
+                SELECT 1
+                FROM signals
+                WHERE symbol=:symbol
+                  AND side=:side
+                  AND portfolio_id=:pid
+                  AND created_at > (NOW() - (:sec || ' seconds')::interval)
+                LIMIT 1
+                """
+            ),
+            {"symbol": symbol, "side": side, "pid": int(portfolio_id), "sec": int(dedupe_seconds)},
+        ).fetchone()
+        return bool(r)
 
 
 def _insert_signal(engine, symbol: str, side: str, strength: float, price: float, portfolio_id: int) -> None:
@@ -109,6 +136,16 @@ def _insert_signal(engine, symbol: str, side: str, strength: float, price: float
         )
 
 
+@dataclass
+class Candidate:
+    symbol: str
+    side: str
+    strength: float
+    price: float
+    sma: float
+    pct_diff: float
+
+
 def main() -> None:
     api_key = os.getenv("ALPACA_API_KEY")
     api_secret = os.getenv("ALPACA_API_SECRET")
@@ -116,12 +153,18 @@ def main() -> None:
         raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
 
     poll = int(os.getenv("SIGNAL_POLL_SECONDS", "60"))
-    min_strength = float(os.getenv("MIN_STRENGTH", "0.60"))
+    min_strength = float(os.getenv("MIN_STRENGTH", "0.35"))
     portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
     bars_limit = int(os.getenv("BARS_LIMIT", "120"))
     sma_period = int(os.getenv("SMA_PERIOD", "50"))
     strength_pct_for_1 = float(os.getenv("STRENGTH_PCT_FOR_1", "0.002"))
+    dedupe_seconds = int(os.getenv("SIGNAL_DEDUPE_SECONDS", "300"))
+    insert_top_if_none = _env_bool("INSERT_TOP_IF_NONE", False)
     debug = _env_bool("DEBUG_SIGNALS", False)
+
+    side_override = (os.getenv("SIGNAL_SIDE_OVERRIDE") or "").strip().lower()
+    if side_override not in ("", "buy", "sell"):
+        raise RuntimeError("SIGNAL_SIDE_OVERRIDE must be '', 'buy', or 'sell'")
 
     if strength_pct_for_1 <= 0:
         raise RuntimeError("STRENGTH_PCT_FOR_1 must be > 0")
@@ -133,8 +176,9 @@ def main() -> None:
 
     LOG.info(
         "signal_maker starting | symbols=%s | poll=%ss | min_strength=%.4f | bars_limit=%s | sma_period=%s | "
-        "portfolio_id=%s | strength_pct_for_1=%s | debug=%s",
-        symbols, poll, min_strength, bars_limit, sma_period, portfolio_id, strength_pct_for_1, debug
+        "portfolio_id=%s | strength_pct_for_1=%s | dedupe_seconds=%s | insert_top_if_none=%s | side_override=%s | debug=%s",
+        symbols, poll, min_strength, bars_limit, sma_period, portfolio_id,
+        strength_pct_for_1, dedupe_seconds, insert_top_if_none, side_override or "none", debug
     )
 
     while True:
@@ -144,7 +188,6 @@ def main() -> None:
                 timeframe=tf,
                 limit=bars_limit,
             )
-
             bars = data_client.get_stock_bars(req)
             df = getattr(bars, "df", None)
 
@@ -153,13 +196,15 @@ def main() -> None:
                 time.sleep(poll)
                 continue
 
-            # What symbols did Alpaca actually return?
+            # For debug: what did Alpaca actually return?
             try:
-                available_syms = sorted(set(df.index.get_level_values(0)))  # MultiIndex level 0 = symbol
+                available_syms = sorted(set(df.index.get_level_values(0)))
             except Exception:
                 available_syms = []
 
             inserted = 0
+            best: Optional[Candidate] = None
+
             for sym in symbols:
                 try:
                     sym_df = df.loc[sym]
@@ -186,7 +231,7 @@ def main() -> None:
                         LOG.info("debug | %s | bad_sma=%s", sym, sma)
                     continue
 
-                side = "buy" if close > sma else "sell"
+                side = side_override if side_override else ("buy" if close > sma else "sell")
                 pct_diff = abs(close - sma) / sma
                 strength = _clamp01(pct_diff / strength_pct_for_1)
 
@@ -196,11 +241,31 @@ def main() -> None:
                         sym, close, sma, pct_diff, strength, side
                     )
 
+                cand = Candidate(sym, side, strength, close, sma, pct_diff)
+                if best is None or cand.strength > best.strength:
+                    best = cand
+
+                # main threshold path
                 if strength < min_strength:
+                    continue
+
+                if _recent_signal_exists(engine, sym, side, portfolio_id, dedupe_seconds):
+                    if debug:
+                        LOG.info("debug | %s | %s | skipped_by_dedupe=%ss", sym, side, dedupe_seconds)
                     continue
 
                 _insert_signal(engine, sym, side, strength, close, portfolio_id)
                 inserted += 1
+
+            # fallback for testing
+            if inserted == 0 and insert_top_if_none and best is not None:
+                if not _recent_signal_exists(engine, best.symbol, best.side, portfolio_id, dedupe_seconds):
+                    _insert_signal(engine, best.symbol, best.side, best.strength, best.price, portfolio_id)
+                    inserted += 1
+                    LOG.info(
+                        "fallback_insert | symbol=%s side=%s strength=%.4f pct_diff=%.6f (no candidate met min_strength=%.4f)",
+                        best.symbol, best.side, best.strength, best.pct_diff, min_strength
+                    )
 
             LOG.info("cycle_done | inserted=%s | sleep=%ss", inserted, poll)
 
