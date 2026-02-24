@@ -3,19 +3,14 @@ import time
 import logging
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.trading.requests import (
     GetOrdersRequest,
-    GetOrderByIdRequest,
-    MarketOrderRequest,
     LimitOrderRequest,
     StopOrderRequest,
-    TakeProfitRequest,
-    StopLossRequest,
-    ReplaceOrderRequest,
 )
 
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -68,7 +63,6 @@ def get_trading_client() -> TradingClient:
     secret = os.getenv("ALPACA_API_SECRET")
     if not key or not secret:
         raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
-
     paper = _resolve_paper()
     return TradingClient(key, secret, paper=paper)
 
@@ -81,10 +75,9 @@ def get_data_client() -> StockHistoricalDataClient:
     return StockHistoricalDataClient(key, secret)
 
 
-def _tp_sl_from_pct(ref_price: float, position_qty: float) -> tuple[float, float]:
+def _tp_sl_from_pct(ref_price: float) -> tuple[float, float]:
     tp_pct = _env_float("TP_PCT", 1.0)
     sl_pct = _env_float("SL_PCT", 0.75)
-    # For long positions, tp above and sl below; for shorts we invert later by side.
     tp = ref_price * (1.0 + tp_pct / 100.0)
     sl = ref_price * (1.0 - sl_pct / 100.0)
     return tp, sl
@@ -102,6 +95,7 @@ def _atr_pct(dc: StockHistoricalDataClient, sym: str, lookback: int = 50) -> Opt
         bars = dc.get_stock_bars(req).data.get(sym, [])
         if not bars or len(bars) < 2:
             return None
+
         trs = []
         prev_close = float(bars[0].close)
         for b in bars[1:]:
@@ -111,6 +105,7 @@ def _atr_pct(dc: StockHistoricalDataClient, sym: str, lookback: int = 50) -> Opt
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
             trs.append(tr)
             prev_close = close
+
         if not trs:
             return None
         atr = sum(trs) / float(len(trs))
@@ -128,62 +123,142 @@ def _get_open_orders(tc: TradingClient, symbols: Optional[list[str]] = None):
     return tc.get_orders(req) or []
 
 
+def _cid(o) -> str:
+    return (getattr(o, "client_order_id", "") or "")
+
+
 def _is_exit_order(o, prefix: str) -> bool:
-    cid = (getattr(o, "client_order_id", "") or "")
-    return cid.startswith(prefix)
+    return _cid(o).startswith(prefix)
 
 
-def _place_exit_oco(
+def _exit_leg_state(open_orders, sym: str, prefix: str) -> tuple[bool, bool]:
+    """Return (has_tp, has_sl) for given symbol."""
+    has_tp = False
+    has_sl = False
+    symu = sym.upper()
+
+    for o in open_orders:
+        if (getattr(o, "symbol", "") or "").upper() != symu:
+            continue
+        cid = _cid(o)
+        if not cid.startswith(prefix):
+            continue
+        lc = cid.lower()
+        if "-tp" in lc:
+            has_tp = True
+        if "-sl" in lc:
+            has_sl = True
+
+    return has_tp, has_sl
+
+
+def _round2(x: float) -> str:
+    return str(round(float(x), 2))
+
+
+def _ensure_tp_sl_order(exit_side: OrderSide, tp: float, sl: float) -> tuple[float, float]:
+    """
+    Pre LONG exit (SELL): chceme TP > SL
+    Pre SHORT exit (BUY): chceme TP < SL
+    """
+    tp = float(tp)
+    sl = float(sl)
+
+    if exit_side == OrderSide.SELL:
+        if tp <= sl:
+            # swap to be safe
+            tp, sl = max(tp, sl), min(tp, sl)
+    else:
+        # BUY exit for short
+        if tp >= sl:
+            tp, sl = min(tp, sl), max(tp, sl)
+
+    return tp, sl
+
+
+def _submit_tp_sl(
     tc: TradingClient,
     sym: str,
     qty: float,
-    side: OrderSide,
+    exit_side: OrderSide,
     tp: float,
     sl: float,
     tif: TimeInForce,
     allow_ah: bool,
-    prefix: str,
+    cid_base: str,
+    need_tp: bool,
+    need_sl: bool,
     dry_run: bool,
 ) -> bool:
-    # For long (BUY entry), exits are SELL; for short, exits are BUY.
-    exit_side = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
+    """
+    Synthetic OCO:
+    - TP: LimitOrder
+    - SL: StopOrder
+    """
+    tp, sl = _ensure_tp_sl_order(exit_side, tp, sl)
 
-    client_oid_parent = f"{prefix}{sym}-{int(time.time())}"
+    cid_tp = f"{cid_base}-TP"
+    cid_sl = f"{cid_base}-SL"
+
     if dry_run:
-        log.info("DRY_RUN place_exit_oco | sym=%s qty=%s exit_side=%s tp=%.4f sl=%.4f tif=%s allow_ah=%s cid=%s",
-                 sym, qty, exit_side.value, tp, sl, tif.value, allow_ah, client_oid_parent)
-        return True
-
-    # Bracket class with take profit & stop loss legs
-    try:
-        req = MarketOrderRequest(
-            symbol=sym,
-            qty=qty,
-            side=exit_side,
-            time_in_force=tif,
-            order_class="bracket",
-            take_profit=TakeProfitRequest(limit_price=str(round(tp, 2))),
-            stop_loss=StopLossRequest(stop_price=str(round(sl, 2))),
-            client_order_id=client_oid_parent,
-            extended_hours=allow_ah,
+        log.info(
+            "DRY_RUN place_exit_tp_sl | sym=%s qty=%s side=%s tp=%s sl=%s tif=%s allow_ah=%s need_tp=%s need_sl=%s cid_tp=%s cid_sl=%s",
+            sym, qty, exit_side.value, _round2(tp), _round2(sl), tif.value, allow_ah, need_tp, need_sl, cid_tp, cid_sl
         )
-        tc.submit_order(req)
         return True
+
+    # Pozn.: extended_hours je podporené typicky len pre LIMIT (a len day). Pre STOP to radšej nedávame.
+    ok = True
+
+    tp_order_id = None
+    sl_order_id = None
+
+    try:
+        if need_tp:
+            tp_req = LimitOrderRequest(
+                symbol=sym,
+                qty=float(qty),
+                side=exit_side,
+                time_in_force=tif,
+                limit_price=_round2(tp),
+                client_order_id=cid_tp,
+                extended_hours=bool(allow_ah) and tif == TimeInForce.DAY,
+            )
+            o = tc.submit_order(tp_req)
+            tp_order_id = str(getattr(o, "id", "") or "")
+            log.info("placed_exit_tp | sym=%s qty=%s side=%s tp=%s oid=%s cid=%s", sym, qty, exit_side.value, _round2(tp), tp_order_id, cid_tp)
+
+        if need_sl:
+            sl_req = StopOrderRequest(
+                symbol=sym,
+                qty=float(qty),
+                side=exit_side,
+                time_in_force=tif,
+                stop_price=_round2(sl),
+                client_order_id=cid_sl,
+            )
+            o = tc.submit_order(sl_req)
+            sl_order_id = str(getattr(o, "id", "") or "")
+            log.info("placed_exit_sl | sym=%s qty=%s side=%s sl=%s oid=%s cid=%s", sym, qty, exit_side.value, _round2(sl), sl_order_id, cid_sl)
+
+        return True
+
     except Exception as e:
-        log.error("place_exit_oco failed sym=%s: %s", sym, e, exc_info=True)
-        return False
+        ok = False
+        log.error("place_exit_tp_sl failed sym=%s: %s", sym, e, exc_info=True)
 
+        # rollback: ak sa podaril TP ale SL zlyhal (alebo naopak), pokús sa zrušiť ten, čo prešiel
+        try:
+            if tp_order_id and not sl_order_id:
+                tc.cancel_order_by_id(tp_order_id)
+                log.warning("rollback_canceled_tp | sym=%s oid=%s", sym, tp_order_id)
+            if sl_order_id and not tp_order_id:
+                tc.cancel_order_by_id(sl_order_id)
+                log.warning("rollback_canceled_sl | sym=%s oid=%s", sym, sl_order_id)
+        except Exception:
+            log.warning("rollback_cancel_failed | sym=%s", sym, exc_info=True)
 
-def _needs_protection(open_orders, sym: str, prefix: str) -> bool:
-    for o in open_orders:
-        if (getattr(o, "symbol", "") or "").upper() != sym.upper():
-            continue
-        if _is_exit_order(o, prefix=prefix):
-            return False
-        # also treat bracket legs as protected (some APIs don't propagate CID)
-        if (getattr(o, "order_class", "") or "") in ("bracket", "oco", "oto"):
-            return False
-    return True
+    return ok
 
 
 def main():
@@ -202,12 +277,12 @@ def main():
     sl_pct = _env_float("SL_PCT", 0.75)
 
     allow_ah = _env_bool("ALLOW_AH", False)
-    tif = TimeInForce(os.getenv("TIF", "day").strip().lower())
+    tif = TimeInForce((os.getenv("TIF", "day") or "day").strip().lower())
 
     enable_repair = _env_bool("ENABLE_REPAIR", True)
     dry_run = _env_bool("DRY_RUN", False)
 
-    prefix = os.getenv("EXIT_PREFIX", "EXIT-OCO-").strip()
+    prefix = (os.getenv("EXIT_PREFIX", "EXIT-OCO-") or "EXIT-OCO-").strip()
 
     mode = _resolve_mode()
     paper = _resolve_paper()
@@ -222,7 +297,6 @@ def main():
     dc = get_data_client()
 
     last_heartbeat = 0.0
-    counts = defaultdict(int)
     errors = 0
 
     while True:
@@ -233,7 +307,6 @@ def main():
             protected = 0
             placed = 0
             repaired = 0
-            skipped_closing = 0
             unprotected = []
 
             for p in positions:
@@ -247,18 +320,23 @@ def main():
                 if qty_abs < min_qty:
                     continue
 
-                # buffer qty down a bit if desired
                 qty_eff = qty_abs * (1.0 - qty_buffer_pct / 100.0)
                 if qty_eff <= 0:
                     continue
 
-                if not _needs_protection(open_orders, sym, prefix=prefix):
+                has_tp, has_sl = _exit_leg_state(open_orders, sym, prefix=prefix)
+
+                if has_tp and has_sl:
+                    protected += 1
+                    continue
+
+                # ak máme aspoň jeden leg a repair je vypnutý, považuj za "ok" (ne-spamuj)
+                if (has_tp or has_sl) and not enable_repair:
                     protected += 1
                     continue
 
                 unprotected.append(sym)
 
-                # reference price = avg entry price (fallback to current price if missing)
                 avg_entry = float(getattr(p, "avg_entry_price", 0) or 0)
                 ref_price = avg_entry if avg_entry > 0 else float(getattr(p, "current_price", 0) or 0)
                 if ref_price <= 0:
@@ -268,7 +346,7 @@ def main():
                 if use_atr:
                     atrp = _atr_pct(dc, sym, lookback=atr_lookback)
                     if atrp is None:
-                        tp, sl = _tp_sl_from_pct(ref_price, qty_eff)
+                        tp, sl = _tp_sl_from_pct(ref_price)
                     else:
                         if side == OrderSide.BUY:
                             tp = ref_price * (1.0 + atrp * atr_mult_tp)
@@ -284,30 +362,40 @@ def main():
                         tp = ref_price * (1.0 - tp_pct / 100.0)
                         sl = ref_price * (1.0 + sl_pct / 100.0)
 
-                ok = _place_exit_oco(
+                # exits: long -> SELL, short -> BUY
+                exit_side = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
+
+                cid_base = f"{prefix}{sym}-{int(time.time())}"
+
+                ok = _submit_tp_sl(
                     tc=tc,
                     sym=sym,
                     qty=qty_eff,
-                    side=side,
+                    exit_side=exit_side,
                     tp=tp,
                     sl=sl,
                     tif=tif,
                     allow_ah=allow_ah,
-                    prefix=prefix,
+                    cid_base=cid_base,
+                    need_tp=(not has_tp),
+                    need_sl=(not has_sl),
                     dry_run=dry_run,
                 )
+
                 if ok:
-                    placed += 1
+                    if has_tp or has_sl:
+                        repaired += 1
+                    else:
+                        placed += 1
                 else:
                     errors += 1
 
-            # heartbeat
             now = time.time()
             if now - last_heartbeat >= heartbeat_seconds:
                 last_heartbeat = now
                 log.info(
-                    "Heartbeat | positions=%s protected=%s placed=%s repaired=%s skipped_closing=%s open_orders=%s errors=%s | unprotected=%s",
-                    len(positions), protected, placed, repaired, skipped_closing, len(open_orders), errors, unprotected
+                    "Heartbeat | positions=%s protected=%s placed=%s repaired=%s open_orders=%s errors=%s | unprotected=%s",
+                    len(positions), protected, placed, repaired, len(open_orders), errors, unprotected
                 )
 
         except Exception:
