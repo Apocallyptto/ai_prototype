@@ -450,9 +450,22 @@ def main() -> None:
 
             # max open positions gate
             if cfg.max_open_positions > 0:
-                live_pos = [p for p in positions if float(getattr(p, "qty", 0) or 0) != 0]
+                live_pos = []
+                for p in positions:
+                    qty = float(getattr(p, "qty", 0) or 0)
+                    if qty == 0:
+                        continue
+                    sym = str(getattr(p, "symbol", "") or "").upper()
+                    live_pos.append((sym, qty))
+
                 if len(live_pos) >= cfg.max_open_positions:
-                    LOG.info("gate_max_open_positions | have=%s limit=%s | sleep=%ss", len(live_pos), cfg.max_open_positions, cfg.poll_seconds)
+                    LOG.info(
+                        "gate_max_open_positions | have=%s limit=%s | positions=%s | sleep=%ss",
+                        len(live_pos),
+                        cfg.max_open_positions,
+                        live_pos,
+                        cfg.poll_seconds,
+                    )
                     time.sleep(cfg.poll_seconds)
                     continue
 
@@ -503,14 +516,19 @@ def main() -> None:
 
             # do not add to position gate
             if not cfg.allow_add_to_position:
+                cur_qty = 0.0
                 for p in positions:
                     psym = str(getattr(p, "symbol", "") or "").upper()
                     if psym == symbol:
-                        q = float(getattr(p, "qty", 0) or 0)
-                        if q != 0:
-                            LOG.info("skip_add_to_position | %s qty=%s", symbol, q)
-                            time.sleep(cfg.poll_seconds)
-                            continue
+                        cur_qty = float(getattr(p, "qty", 0) or 0)
+                        break
+
+                if cur_qty != 0:
+                    LOG.info("skip_add_to_position | %s qty=%s", symbol, cur_qty)
+                    seen_signal_ids.add(sig_id)
+                    last_submit_ts_by_symbol[symbol] = now_ts
+                    time.sleep(cfg.poll_seconds)
+                    continue
 
             # DB dedupe gate
             if not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
