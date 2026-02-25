@@ -4,21 +4,13 @@ jobs/make_signals_ml.py
 
 Stable signal maker without `ml.*` dependency.
 
-- Pulls recent 5-min bars from Alpaca Market Data
-- Writes signals into Postgres
-
 Signal:
 - BUY if last_close > SMA
 - SELL if last_close < SMA
 
-Strength scaling:
-- pct_diff = abs(close - sma) / sma
-- strength = clamp01(pct_diff / STRENGTH_PCT_FOR_1)
-
-Anti-spam / stability:
-- SIGNAL_DEDUPE_SECONDS: do not insert same (symbol, side, portfolio_id) too often
-- INSERT_TOP_IF_NONE: if no candidate passes MIN_STRENGTH, insert best candidate anyway (testing)
-- SIGNAL_SIDE_OVERRIDE=buy|sell: force side (testing)
+Improvements:
+- SIGNAL_ON_CROSSOVER=1 (default): only insert when side flips vs last DB signal (reduces spam)
+- SMA_SLOPE_BARS=N (optional): require SMA slope > 0 for BUY and < 0 for SELL
 
 Env:
 - SYMBOLS="AAPL,MSFT"
@@ -31,6 +23,8 @@ Env:
 - SIGNAL_DEDUPE_SECONDS=300
 - INSERT_TOP_IF_NONE=0|1
 - SIGNAL_SIDE_OVERRIDE=buy|sell|""
+- SIGNAL_ON_CROSSOVER=0|1
+- SMA_SLOPE_BARS=0|12|24... (0 disables)
 - DEBUG_SIGNALS=0|1
 - DB_URL or DATABASE_URL
 - ALPACA_API_KEY / ALPACA_API_SECRET
@@ -117,6 +111,24 @@ def _recent_signal_exists(engine, symbol: str, side: str, portfolio_id: int, ded
         return bool(r)
 
 
+def _last_signal_side(engine, symbol: str, portfolio_id: int) -> Optional[str]:
+    """Return last inserted side for symbol+portfolio_id, or None."""
+    with engine.begin() as con:
+        r = con.execute(
+            text(
+                """
+                SELECT side
+                FROM signals
+                WHERE symbol=:symbol AND portfolio_id=:pid
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"symbol": symbol, "pid": int(portfolio_id)},
+        ).fetchone()
+        return (str(r[0]).strip().lower() if r else None)
+
+
 def _insert_signal(engine, symbol: str, side: str, strength: float, price: float, portfolio_id: int) -> None:
     with engine.begin() as con:
         con.execute(
@@ -161,6 +173,8 @@ def main() -> None:
     dedupe_seconds = int(os.getenv("SIGNAL_DEDUPE_SECONDS", "300"))
     insert_top_if_none = _env_bool("INSERT_TOP_IF_NONE", False)
     debug = _env_bool("DEBUG_SIGNALS", False)
+    signal_on_crossover = _env_bool("SIGNAL_ON_CROSSOVER", True)
+    sma_slope_bars = int(os.getenv("SMA_SLOPE_BARS", "0"))
 
     side_override = (os.getenv("SIGNAL_SIDE_OVERRIDE") or "").strip().lower()
     if side_override not in ("", "buy", "sell"):
@@ -176,9 +190,11 @@ def main() -> None:
 
     LOG.info(
         "signal_maker starting | symbols=%s | poll=%ss | min_strength=%.4f | bars_limit=%s | sma_period=%s | "
-        "portfolio_id=%s | strength_pct_for_1=%s | dedupe_seconds=%s | insert_top_if_none=%s | side_override=%s | debug=%s",
+        "portfolio_id=%s | strength_pct_for_1=%s | dedupe_seconds=%s | insert_top_if_none=%s | side_override=%s | "
+        "signal_on_crossover=%s | sma_slope_bars=%s | debug=%s",
         symbols, poll, min_strength, bars_limit, sma_period, portfolio_id,
-        strength_pct_for_1, dedupe_seconds, insert_top_if_none, side_override or "none", debug
+        strength_pct_for_1, dedupe_seconds, insert_top_if_none, side_override or "none",
+        signal_on_crossover, sma_slope_bars, debug
     )
 
     while True:
@@ -196,12 +212,6 @@ def main() -> None:
                 time.sleep(poll)
                 continue
 
-            # For debug: what did Alpaca actually return?
-            try:
-                available_syms = sorted(set(df.index.get_level_values(0)))
-            except Exception:
-                available_syms = []
-
             inserted = 0
             best: Optional[Candidate] = None
 
@@ -210,7 +220,11 @@ def main() -> None:
                     sym_df = df.loc[sym]
                 except Exception:
                     if debug:
-                        LOG.info("debug | %s | no_df_for_symbol | available=%s", sym, available_syms)
+                        try:
+                            available = sorted(set(df.index.get_level_values(0)))
+                        except Exception:
+                            available = []
+                        LOG.info("debug | %s | no_df_for_symbol | available=%s", sym, available)
                     continue
 
                 if sym_df is None or sym_df.empty:
@@ -235,6 +249,32 @@ def main() -> None:
                 pct_diff = abs(close - sma) / sma
                 strength = _clamp01(pct_diff / strength_pct_for_1)
 
+                # Optional SMA slope filter
+                if sma_slope_bars > 0:
+                    try:
+                        prev_closes = closes[:-sma_slope_bars]
+                        sma_prev = _sma(prev_closes, sma_period) if prev_closes else None
+                    except Exception:
+                        sma_prev = None
+                    if sma_prev is not None:
+                        slope = sma - float(sma_prev)
+                        if side == "buy" and slope <= 0:
+                            if debug:
+                                LOG.info("debug | %s | buy_blocked_by_sma_slope slope=%.6f", sym, slope)
+                            continue
+                        if side == "sell" and slope >= 0:
+                            if debug:
+                                LOG.info("debug | %s | sell_blocked_by_sma_slope slope=%.6f", sym, slope)
+                            continue
+
+                # Optional crossover filter
+                if signal_on_crossover and not side_override:
+                    last_side = _last_signal_side(engine, sym, portfolio_id)
+                    if last_side == side:
+                        if debug:
+                            LOG.info("debug | %s | %s | skipped_by_crossover (last_side=%s)", sym, side, last_side)
+                        continue
+
                 if debug:
                     LOG.info(
                         "debug | %s | close=%.4f sma=%.4f pct_diff=%.6f strength=%.4f side=%s",
@@ -245,7 +285,6 @@ def main() -> None:
                 if best is None or cand.strength > best.strength:
                     best = cand
 
-                # main threshold path
                 if strength < min_strength:
                     continue
 
@@ -257,7 +296,6 @@ def main() -> None:
                 _insert_signal(engine, sym, side, strength, close, portfolio_id)
                 inserted += 1
 
-            # fallback for testing
             if inserted == 0 and insert_top_if_none and best is not None:
                 if not _recent_signal_exists(engine, best.symbol, best.side, portfolio_id, dedupe_seconds):
                     _insert_signal(engine, best.symbol, best.side, best.strength, best.price, portfolio_id)
