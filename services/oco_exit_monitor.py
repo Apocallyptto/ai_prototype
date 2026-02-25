@@ -17,16 +17,6 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
 )
 
-# Optional (native OCO for non-fractional qty). Safe to skip if SDK lacks these symbols.
-try:
-    from alpaca.trading.enums import OrderClass
-    from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
-except Exception:  # pragma: no cover
-    OrderClass = None
-    LimitOrderRequest = None
-    TakeProfitRequest = None
-    StopLossRequest = None
-
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -122,9 +112,9 @@ def _atr_pct(dc: StockHistoricalDataClient, sym: str, lookback: int = 50) -> Opt
         return None
 
 
-def _get_open_orders(tc: TradingClient, symbols: Optional[List[str]] = None):
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500, nested=True, symbols=symbols)
-    return tc.get_orders(req) or []
+def _get_orders(tc: TradingClient, status: QueryOrderStatus, symbols: Optional[List[str]] = None):
+    req = GetOrdersRequest(status=status, limit=500, nested=True, symbols=symbols)
+    return tc.get_orders(filter=req) or []
 
 
 def _cid(o) -> str:
@@ -132,7 +122,7 @@ def _cid(o) -> str:
 
 
 def _pos_info(tc: TradingClient, sym: str) -> tuple[float, float, float]:
-    """(qty, avg_entry, current_price) for symbol; 0s if not found."""
+    """(qty, avg_entry, current_price)."""
     symu = sym.upper()
     for p in (tc.get_all_positions() or []):
         if (getattr(p, "symbol", "") or "").upper() == symu:
@@ -151,12 +141,11 @@ def _cancel_order_safely(tc: TradingClient, oid: str, sym: str, why: str) -> Non
         LOG.warning("cancel_failed | sym=%s oid=%s why=%s err=%s", sym, oid, why, e)
 
 
-def _cleanup_orphan_exit_orders(tc: TradingClient, open_orders, active_symbols: Set[str], prefix: str) -> int:
+def _cleanup_orphan_exit_orders(tc: TradingClient, orders, active_symbols: Set[str], prefix: str) -> int:
     canceled = 0
-    for o in open_orders:
+    for o in orders:
         sym = (getattr(o, "symbol", "") or "").upper()
-        cid = _cid(o)
-        if not cid.startswith(prefix):
+        if not _cid(o).startswith(prefix):
             continue
         if sym not in active_symbols:
             oid = str(getattr(o, "id", "") or "")
@@ -182,46 +171,55 @@ def _ensure_tp_sl(exit_side: OrderSide, tp: float, sl: float) -> tuple[float, fl
     return tp, sl
 
 
-def _tp_hit(exit_side: OrderSide, current_price: float, tp: float) -> bool:
-    if current_price <= 0:
+def _clamp_sl_away_from_market(exit_side: OrderSide, sl: float, cur: float, min_gap_pct: float) -> float:
+    """
+    Prevent instant-trigger STOP:
+    - For SELL stop (long protection), ensure sl < cur*(1 - gap)
+    - For BUY stop (short protection), ensure sl > cur*(1 + gap)
+    """
+    if cur <= 0:
+        return sl
+    gap = max(0.0, float(min_gap_pct)) / 100.0
+    if exit_side == OrderSide.SELL:
+        max_sl = cur * (1.0 - gap)
+        if sl >= max_sl:
+            sl = max_sl
+    else:
+        min_sl = cur * (1.0 + gap)
+        if sl <= min_sl:
+            sl = min_sl
+    return sl
+
+
+def _tp_hit(exit_side: OrderSide, cur: float, tp: float) -> bool:
+    if cur <= 0:
         return False
     if exit_side == OrderSide.SELL:
-        return current_price >= tp
-    return current_price <= tp
+        return cur >= tp
+    return cur <= tp
 
 
-def _sl_cid_prefix(prefix: str, sym: str) -> str:
-    return f"{prefix}{sym}-SL-"
-
-
-def _find_exit_sl_orders(open_orders, sym: str, prefix: str) -> list:
+def _find_sl_orders(open_orders, sym: str, prefix: str) -> list:
     symu = sym.upper()
-    pref = _sl_cid_prefix(prefix, symu)
-    out = []
-    for o in open_orders:
-        if (getattr(o, "symbol", "") or "").upper() != symu:
-            continue
-        if not _cid(o).startswith(pref):
-            continue
-        out.append(o)
-    return out
+    pref = f"{prefix}{symu}-SL-"
+    return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
 
 
-def _place_sl_simple(
+def _place_sl(
     tc: TradingClient,
     sym: str,
     qty_abs: float,
     exit_side: OrderSide,
     intent: PositionIntent,
-    sl_price: float,
+    sl: float,
     tif: TimeInForce,
     cid: str,
     dry_run: bool,
 ) -> bool:
-    sl_price = _round2(sl_price)
+    sl = _round2(sl)
     if dry_run:
         LOG.info("DRY_RUN place_sl | sym=%s qty=%s side=%s intent=%s sl=%s tif=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, sl_price, tif.value, cid)
+                 sym, qty_abs, exit_side.value, intent.value, sl, tif.value, cid)
         return True
     try:
         req = StopOrderRequest(
@@ -229,14 +227,14 @@ def _place_sl_simple(
             qty=float(qty_abs),
             side=exit_side,
             time_in_force=tif,
-            stop_price=str(sl_price),
+            stop_price=str(sl),
             position_intent=intent,
             client_order_id=cid,
         )
-        o = tc.submit_order(req)
+        o = tc.submit_order(order_data=req)
         oid = str(getattr(o, "id", "") or "")
         LOG.info("placed_sl | sym=%s qty=%s side=%s intent=%s sl=%s oid=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, sl_price, oid, cid)
+                 sym, qty_abs, exit_side.value, intent.value, sl, oid, cid)
         return True
     except Exception as e:
         LOG.error("place_sl failed sym=%s: %s", sym, e, exc_info=True)
@@ -254,8 +252,8 @@ def _close_market(
     dry_run: bool,
 ) -> bool:
     if dry_run:
-        LOG.info("DRY_RUN close_market | sym=%s qty=%s side=%s intent=%s tif=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, tif.value, cid)
+        LOG.info("DRY_RUN close_market | sym=%s qty=%s side=%s intent=%s cid=%s",
+                 sym, qty_abs, exit_side.value, intent.value, cid)
         return True
     try:
         req = MarketOrderRequest(
@@ -267,68 +265,13 @@ def _close_market(
             position_intent=intent,
             client_order_id=cid,
         )
-        o = tc.submit_order(req)
+        o = tc.submit_order(order_data=req)
         oid = str(getattr(o, "id", "") or "")
         LOG.info("submitted_close_market | sym=%s qty=%s side=%s intent=%s oid=%s cid=%s",
                  sym, qty_abs, exit_side.value, intent.value, oid, cid)
         return True
     except Exception as e:
         LOG.error("close_market failed sym=%s: %s", sym, e, exc_info=True)
-        return False
-
-
-def _place_exit_oco_non_fractional(
-    tc: TradingClient,
-    sym: str,
-    qty_abs: float,
-    exit_side: OrderSide,
-    intent: PositionIntent,
-    tp_price: float,
-    sl_price: float,
-    tif: TimeInForce,
-    allow_ah: bool,
-    cid: str,
-    dry_run: bool,
-) -> bool:
-    """Native OCO (non-fractional only). Fractional qty cannot use OCO: 422."""
-    if OrderClass is None or LimitOrderRequest is None or TakeProfitRequest is None or StopLossRequest is None:
-        LOG.warning("native_oco_not_available_in_sdk | sym=%s", sym)
-        return False
-
-    tp_price, sl_price = _ensure_tp_sl(exit_side, tp_price, sl_price)
-    tp_price = _round2(tp_price)
-    sl_price = _round2(sl_price)
-
-    if dry_run:
-        LOG.info(
-            "DRY_RUN place_exit_oco | sym=%s qty=%s side=%s intent=%s tp=%s sl=%s tif=%s allow_ah=%s cid=%s",
-            sym, qty_abs, exit_side.value, intent.value, tp_price, sl_price, tif.value, allow_ah, cid
-        )
-        return True
-
-    try:
-        req = LimitOrderRequest(
-            symbol=sym,
-            qty=float(qty_abs),
-            side=exit_side,
-            time_in_force=tif,
-            limit_price=tp_price,
-            order_class=OrderClass.OCO,
-            take_profit=TakeProfitRequest(limit_price=tp_price),
-            stop_loss=StopLossRequest(stop_price=sl_price),
-            position_intent=intent,
-            client_order_id=cid,
-            extended_hours=bool(allow_ah) and tif == TimeInForce.DAY,
-        )
-        o = tc.submit_order(req)
-        oid = str(getattr(o, "id", "") or "")
-        LOG.info(
-            "placed_exit_oco | sym=%s qty=%s side=%s intent=%s tp=%s sl=%s oid=%s cid=%s",
-            sym, qty_abs, exit_side.value, intent.value, tp_price, sl_price, oid, cid
-        )
-        return True
-    except Exception as e:
-        LOG.error("place_exit_oco failed sym=%s: %s", sym, e, exc_info=True)
         return False
 
 
@@ -348,7 +291,7 @@ def main():
     tp_pct = _env_float("TP_PCT", 1.0)
     sl_pct = _env_float("SL_PCT", 0.75)
 
-    allow_ah = _env_bool("ALLOW_AH", False)
+    min_sl_gap_pct = _env_float("MIN_SL_GAP_PCT", 0.20)
 
     tif_raw = (os.getenv("TIF", "day") or "day").strip().lower()
     try:
@@ -368,11 +311,11 @@ def main():
 
     LOG.info(
         "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | min_qty=%s | qty_buffer_pct=%s | "
-        "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | allow_ah=%s | tif=%s | "
-        "enable_repair=%s | dry_run=%s | cleanup_orphans=%s | prefix=%s | error_backoff=%ss",
+        "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | min_sl_gap_pct=%s | "
+        "tif=%s | enable_repair=%s | dry_run=%s | cleanup_orphans=%s | prefix=%s | error_backoff=%ss",
         mode, paper, base, poll_seconds, heartbeat_seconds, min_qty, qty_buffer_pct,
-        use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct, allow_ah, tif.value,
-        enable_repair, dry_run, cleanup_orphans, prefix, error_backoff_seconds
+        use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct, min_sl_gap_pct,
+        tif.value, enable_repair, dry_run, cleanup_orphans, prefix, error_backoff_seconds
     )
 
     tc = get_trading_client()
@@ -385,11 +328,7 @@ def main():
     while True:
         try:
             positions = tc.get_all_positions() or []
-            open_orders = _get_open_orders(tc)
-
-            protected = 0
-            placed = 0
-            unprotected = []
+            open_orders = _get_orders(tc, QueryOrderStatus.OPEN)
 
             active_syms: Set[str] = set()
             for p in positions:
@@ -400,7 +339,11 @@ def main():
 
             if cleanup_orphans:
                 _cleanup_orphan_exit_orders(tc, open_orders, active_syms, prefix)
-                open_orders = _get_open_orders(tc)
+                open_orders = _get_orders(tc, QueryOrderStatus.OPEN)
+
+            protected = 0
+            placed = 0
+            unprotected = []
 
             for sym in sorted(active_syms):
                 now = time.time()
@@ -453,61 +396,30 @@ def main():
                         sl = ref_price * (1.0 + sl_pct / 100.0)
 
                 tp, sl = _ensure_tp_sl(exit_side, tp, sl)
+                sl = _clamp_sl_away_from_market(exit_side, sl, cur_price, min_sl_gap_pct)
 
-                # Key rule: your current trades are fractional -> only simple orders.
-                is_fractional = qty_abs < 1.0
+                # TP trigger: cancel SL -> market close
+                if _tp_hit(exit_side, cur_price, tp):
+                    sl_orders = _find_sl_orders(open_orders, sym, prefix)
+                    for o in sl_orders:
+                        oid = str(getattr(o, "id", "") or "")
+                        if oid:
+                            _cancel_order_safely(tc, oid, sym, "tp_trigger_cancel_sl")
+                    time.sleep(0.4)
 
-                if is_fractional:
-                    # If TP hit: cancel SL then market-close (simple orders only).
-                    if _tp_hit(exit_side, cur_price, tp):
-                        sl_orders = _find_exit_sl_orders(open_orders, sym, prefix)
-                        for o in sl_orders:
-                            oid = str(getattr(o, "id", "") or "")
-                            if oid:
-                                _cancel_order_safely(tc, oid, sym, "tp_trigger_cancel_sl")
-                        time.sleep(0.4)
-
-                        qty2, _, _ = _pos_info(tc, sym)
-                        if abs(qty2) < 1e-9:
-                            protected += 1
-                            continue
-
-                        ok = _close_market(
-                            tc=tc,
-                            sym=sym,
-                            qty_abs=abs(qty2),
-                            exit_side=exit_side,
-                            intent=intent,
-                            tif=tif,
-                            cid=f"{prefix}{sym}-TPMKT-{int(time.time())}",
-                            dry_run=dry_run,
-                        )
-                        if ok:
-                            placed += 1
-                        else:
-                            errors += 1
-                            last_fail_ts[sym] = time.time()
-                        continue
-
-                    # Otherwise ensure protective SL exists.
-                    sl_orders = _find_exit_sl_orders(open_orders, sym, prefix)
-                    if sl_orders:
+                    qty2, _, _ = _pos_info(tc, sym)
+                    if abs(qty2) < 1e-9:
                         protected += 1
                         continue
 
-                    if not enable_repair:
-                        unprotected.append(sym)
-                        continue
-
-                    ok = _place_sl_simple(
+                    ok = _close_market(
                         tc=tc,
                         sym=sym,
-                        qty_abs=qty_eff,
+                        qty_abs=abs(qty2),
                         exit_side=exit_side,
                         intent=intent,
-                        sl_price=sl,
                         tif=tif,
-                        cid=f"{prefix}{sym}-SL-{int(time.time())}",
+                        cid=f"{prefix}{sym}-TPMKT-{int(time.time())}",
                         dry_run=dry_run,
                     )
                     if ok:
@@ -517,21 +429,9 @@ def main():
                         last_fail_ts[sym] = time.time()
                     continue
 
-                # Non-fractional: native OCO (rare in your setup)
-                # If you ever trade whole shares, this path will protect with OCO.
-                has_exit = False
-                oco_pref = f"{prefix}{sym}-OCO-"
-                for o in open_orders:
-                    if (getattr(o, "symbol", "") or "").upper() != sym:
-                        continue
-                    if _cid(o).startswith(oco_pref):
-                        has_exit = True
-                        break
-                    if str(getattr(o, "order_class", "") or "").lower() == "oco":
-                        has_exit = True
-                        break
-
-                if has_exit:
+                # ensure SL exists
+                sl_orders = _find_sl_orders(open_orders, sym, prefix)
+                if sl_orders:
                     protected += 1
                     continue
 
@@ -539,17 +439,15 @@ def main():
                     unprotected.append(sym)
                     continue
 
-                ok = _place_exit_oco_non_fractional(
+                ok = _place_sl(
                     tc=tc,
                     sym=sym,
                     qty_abs=qty_eff,
                     exit_side=exit_side,
                     intent=intent,
-                    tp_price=tp,
-                    sl_price=sl,
+                    sl=sl,
                     tif=tif,
-                    allow_ah=allow_ah,
-                    cid=f"{prefix}{sym}-OCO-{int(time.time())}",
+                    cid=f"{prefix}{sym}-SL-{int(time.time())}",
                     dry_run=dry_run,
                 )
                 if ok:
@@ -561,7 +459,7 @@ def main():
             now = time.time()
             if now - last_heartbeat >= heartbeat_seconds:
                 last_heartbeat = now
-                open_orders = _get_open_orders(tc)
+                open_orders = _get_orders(tc, QueryOrderStatus.OPEN)
                 LOG.info(
                     "Heartbeat | positions=%s protected=%s placed=%s open_orders=%s errors=%s | unprotected=%s",
                     len(positions), protected, placed, len(open_orders), errors, unprotected
