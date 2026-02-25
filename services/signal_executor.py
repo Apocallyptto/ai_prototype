@@ -1,8 +1,6 @@
 ﻿# SPAM_GUARD_V2
 import os
 import time
-import uuid
-import math
 import hashlib
 import logging
 from datetime import datetime, timezone
@@ -49,7 +47,6 @@ class Cfg:
     max_open_positions: int
     max_open_orders: int
 
-    # optional risk guard knobs (kept for logging/compat)
     daily_loss_stop_pct: float
     max_daily_loss_usd: float
     enable_daily_risk_guard: bool
@@ -64,7 +61,6 @@ class Cfg:
     trading_paused: bool
     dry_run: bool
 
-    # NEW
     allow_fractional_market: bool
 
 
@@ -76,10 +72,6 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 def _resolve_mode_and_paper() -> tuple[str, bool, str]:
-    """
-    TRADING_MODE=live|paper
-    ALPACA_PAPER=1|0 (fallback)
-    """
     mode = (os.getenv("TRADING_MODE") or "").strip().lower()
     if mode in {"paper", "live"}:
         paper = (mode == "paper")
@@ -96,12 +88,6 @@ def _now_utc() -> datetime:
 
 
 def _to_utc_aware(dt: Any) -> Optional[datetime]:
-    """
-    Normalizuj datetime na UTC-aware:
-    - ak je string ISO -> parse
-    - ak je naive (bez tzinfo) -> predpokladaj UTC
-    - ak je aware -> prehoď do UTC
-    """
     if dt is None:
         return None
 
@@ -124,7 +110,6 @@ def _to_utc_aware(dt: Any) -> Optional[datetime]:
 
 
 def _round_price(p: float) -> float:
-    # bezpečne na 2 desatinné pre US equities (môžeš upraviť podľa potreby)
     return float(f"{p:.2f}")
 
 
@@ -165,7 +150,6 @@ def _load_cfg() -> Cfg:
     cfg.trading_paused = _env_bool("TRADING_PAUSED", True)
     cfg.dry_run = _env_bool("DRY_RUN", True)
 
-    # NEW
     cfg.allow_fractional_market = _env_bool("ALLOW_FRACTIONAL_MARKET", True)
 
     return cfg
@@ -178,8 +162,6 @@ def make_trading_client() -> tuple[TradingClient, str, bool, str]:
         raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET")
 
     mode, paper, base = _resolve_mode_and_paper()
-
-    # alpaca-py vyberá endpoint cez paper flag
     tc = TradingClient(key, sec, paper=paper)
     return tc, mode, paper, base
 
@@ -214,23 +196,20 @@ def _get_positions(tc: TradingClient) -> list:
 
 
 def _count_open_entry_orders(open_orders: list) -> int:
-    # ignoruj exit/oco ordery, aby entry limit neblokovala ochranu
     n = 0
     for o in open_orders:
         cid = str(getattr(o, "client_order_id", "") or "").lower()
-        if "exit-oco" in cid or cid.startswith("exit-") or cid.startswith("oco-"):
+        if cid.startswith("exit-") or "exit-oco" in cid or cid.startswith("oco-"):
             continue
         n += 1
     return n
 
 
 def _safe_mid_from_quotes(symbol: str) -> Optional[float]:
-    # Placeholder: ak máš inde quote fetch, napoj to sem.
     return None
 
 
 def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
-    # DB-driven dedupe podľa orders table
     with engine.begin() as con:
         r = con.execute(
             text(
@@ -257,7 +236,6 @@ def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
 
 
 def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any]]:
-    # vezmi viac kandidátov a vyber prvý, ktorý nie je seen a nie je expirovaný
     q = (
         text(
             """
@@ -294,7 +272,6 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
         if created_at and cfg.pick_ttl_seconds > 0:
             age = (now - created_at).total_seconds()
             if age > cfg.pick_ttl_seconds:
-                # príliš staré, preskoč
                 continue
 
         return dict(r)
@@ -303,14 +280,12 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
 
 
 def _calc_qty(cfg: Cfg, price: float) -> float:
-    # qty cap: max_qty, max_position_qty, max_notional/price
     if price <= 0:
         return 0.0
     q_notional = cfg.max_notional / price
     qty = min(cfg.max_qty, cfg.max_position_qty, q_notional)
     if qty <= 0:
         return 0.0
-    # jemné zaokrúhlenie (fractional support)
     qty = float(f"{qty:.6f}")
     return qty
 
@@ -322,7 +297,6 @@ def _mk_dry_oid(symbol: str, side: str, sig_id: int, kind: str) -> str:
 
 
 def _mk_client_order_id(symbol: str, side: str, sig_id: int, kind: str) -> str:
-    # krátke a deterministické (pomáha proti duplicite pri reštarte)
     s = "B" if side == "buy" else "S"
     k = "N" if kind == "MARKET_NOTIONAL" else "L"
     return f"E-{symbol}-{s}-{k}-{sig_id}"
@@ -362,7 +336,6 @@ def _place_limit(tc: TradingClient, symbol: str, side: str, qty: float, limit_pr
 
 
 def _place_market_notional(tc: TradingClient, symbol: str, side: str, notional: float, client_order_id: str) -> str:
-    # Alpaca notional order je relevantný hlavne pre BUY (SELL notional sa typicky nepoužíva)
     req = MarketOrderRequest(
         symbol=symbol,
         notional=float(f"{notional:.2f}"),
@@ -489,11 +462,10 @@ def main() -> None:
             strength = float(sig["strength"])
             price = float(sig["price"] or 0.0) or (_safe_mid_from_quotes(symbol) or 0.0)
 
-            # spam guard: symbol cooldown
             now_ts = time.time()
             last_ts = last_submit_ts_by_symbol.get(symbol, 0.0)
             if cfg.symbol_cooldown_seconds > 0 and (now_ts - last_ts) < cfg.symbol_cooldown_seconds:
-                LOG.info("no_eligible_signal (seen/cooldown) | symbol=%s cooldown=%ss", symbol, cfg.symbol_cooldown_seconds)
+                LOG.info("no_eligible_signal (cooldown) | symbol=%s cooldown=%ss", symbol, cfg.symbol_cooldown_seconds)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -503,8 +475,40 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
+            # LONG_ONLY: interpret SELL signal as "exit long" (sell_to_close) instead of short entry
             if cfg.long_only and side == "sell":
-                LOG.info("skip_signal_long_only | symbol=%s side=%s", symbol, side)
+                pos_qty = 0.0
+                for p in positions:
+                    psym = str(getattr(p, "symbol", "") or "").upper()
+                    if psym == symbol:
+                        pos_qty = float(getattr(p, "qty", 0) or 0)
+                        break
+
+                if pos_qty > 0:
+                    cid = f"X-{symbol}-STC-{sig_id}"
+                    if cfg.dry_run:
+                        LOG.info("DRY_RUN exit_long | symbol=%s qty=%s cid=%s", symbol, pos_qty, cid)
+                    else:
+                        from alpaca.trading.enums import PositionIntent
+                        req = MarketOrderRequest(
+                            symbol=symbol,
+                            qty=float(pos_qty),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.DAY,
+                            type=OrderType.MARKET,
+                            client_order_id=cid,
+                            position_intent=PositionIntent.SELL_TO_CLOSE,
+                        )
+                        o = tc.submit_order(order_data=req)
+                        oid = str(getattr(o, "id", "") or "")
+                        LOG.info("exit_long_submitted | symbol=%s qty=%s oid=%s cid=%s", symbol, pos_qty, oid, cid)
+
+                    seen_signal_ids.add(sig_id)
+                    last_submit_ts_by_symbol[symbol] = now_ts
+                    time.sleep(cfg.poll_seconds)
+                    continue
+
+                LOG.info("skip_signal_long_only (no long to close) | symbol=%s side=%s", symbol, side)
                 seen_signal_ids.add(sig_id)
                 time.sleep(cfg.poll_seconds)
                 continue
@@ -530,7 +534,6 @@ def main() -> None:
                     time.sleep(cfg.poll_seconds)
                     continue
 
-            # DB dedupe gate
             if not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
                 LOG.info("dedupe_skip | %s %s", symbol, side)
                 time.sleep(cfg.poll_seconds)
@@ -542,13 +545,11 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # Decide order kind:
             kind = "LIMIT"
             notional = 0.0
             limit_price = price
 
             if cfg.allow_fractional_market and side == "buy" and qty < 1.0:
-                # Market notional, cap by qty*price (<= max_notional)
                 kind = "MARKET_NOTIONAL"
                 notional = float(f"{min(cfg.max_notional, qty * price):.2f}")
                 if notional <= 0:
@@ -573,7 +574,6 @@ def main() -> None:
                         "DRY_RUN would_submit | symbol=%s side=%s kind=%s qty=%.6f limit=%.4f strength=%.4f oid=%s cid=%s",
                         symbol, side, kind, qty, limit_price, strength, dry_oid, client_order_id
                     )
-                # mark as seen + cooldown (so to nestraľuje dookola)
                 seen_signal_ids.add(sig_id)
                 last_submit_ts_by_symbol[symbol] = now_ts
             else:
