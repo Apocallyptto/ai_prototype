@@ -1,48 +1,108 @@
-# tools/show_recent_signals.py
 import os
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
-import psycopg2.extras
+from psycopg2.extras import RealDictCursor
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
-MIN_STRENGTH = float(os.getenv("MIN_STRENGTH", "0.60"))
-WINDOW_MIN = int(os.getenv("EXECUTOR_SIGNAL_WINDOW_MIN", "10"))
-PORTFOLIO_ID = os.getenv("PORTFOLIO_ID")
 
-def _utcnow():
-    return datetime.now(timezone.utc)
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if not v:
+        return default
+    return int(v)
 
-def main():
-    since_dt = _utcnow() - timedelta(minutes=WINDOW_MIN)
-    and_portfolio = "AND portfolio_id = %s" if PORTFOLIO_ID else ""
-    params = [SYMBOLS, MIN_STRENGTH, since_dt]
-    if PORTFOLIO_ID:
-        params.append(int(PORTFOLIO_ID))
 
-    sql = f"""
-        SELECT DISTINCT ON (symbol)
-            symbol, side, strength, created_at, portfolio_id, source
-        FROM public.signals
-        WHERE symbol = ANY(%s)
-          AND strength >= %s
-          AND created_at >= %s
-          {and_portfolio}
-        ORDER BY symbol, created_at DESC
-    """
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if not v:
+        return default
+    return float(v)
 
-    with psycopg2.connect(DATABASE_URL) as c, c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+def _get_dsn() -> str:
+    return os.getenv("DATABASE_URL") or os.getenv("DB_URL") or ""
+
+
+def _get_symbols() -> list[str]:
+    raw = os.getenv("SYMBOLS") or os.getenv("TICKERS") or "AAPL,MSFT"
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
+def _table_cols(cur, table: str) -> list[str]:
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=%s
+        ORDER BY ordinal_position
+        """,
+        (table,),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+def main() -> None:
+    dsn = _get_dsn()
+    if not dsn:
+        raise RuntimeError("Missing DATABASE_URL / DB_URL env")
+
+    symbols = _get_symbols()
+    min_strength = _env_float("MIN_STRENGTH", 0.60)
+    window_min = _env_int("WINDOW_MIN", 180)
+    limit = _env_int("LIMIT", 200)
+    portfolio_id = int(os.getenv("PORTFOLIO_ID", "1"))
+
+    since_dt = datetime.now(timezone.utc) - timedelta(minutes=window_min)
+
+    conn = psycopg2.connect(dsn)
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        cols = _table_cols(cur, "signals")
+        wanted = ["id", "symbol", "side", "strength", "price", "created_at", "portfolio_id", "source"]
+        sel = [c for c in wanted if c in cols]
+        if not sel:
+            raise RuntimeError(f"signals table has unexpected columns: {cols}")
+
+        sql = f"""
+            SELECT {", ".join(sel)}
+            FROM signals
+            WHERE portfolio_id = %s
+              AND symbol = ANY(%s)
+              AND created_at >= %s
+              AND strength >= %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """
+
+        params = (portfolio_id, symbols, since_dt, min_strength, limit)
         cur.execute(sql, params)
         rows = cur.fetchall()
 
-    if not rows:
-        print(f"No rows within {WINDOW_MIN}m window (min_strength={MIN_STRENGTH}).")
-        return
+        print(f"Window: last {window_min}m | portfolio_id={portfolio_id} | symbols={symbols} | min_strength={min_strength}")
+        print(f"Columns: {sel}")
+        print(f"Rows: {len(rows)}")
+        for r in rows[:50]:
+            print(r)
 
-    rows.sort(key=lambda r: r["created_at"], reverse=True)
-    for r in rows:
-        print(f"{r['symbol']:5s} {r['side']:4s} strength={r['strength']:.2f} at={r['created_at']} src={r.get('source') or 'unknown'}")
+        # Show last side per symbol (debug for crossover)
+        cur.execute(
+            """
+            SELECT DISTINCT ON (symbol) symbol, side, strength, created_at
+            FROM signals
+            WHERE portfolio_id = %s AND symbol = ANY(%s)
+            ORDER BY symbol, created_at DESC
+            """,
+            (portfolio_id, symbols),
+        )
+        print("\nLast per symbol:")
+        for r in cur.fetchall():
+            print(r)
+
+        cur.close()
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
     main()
