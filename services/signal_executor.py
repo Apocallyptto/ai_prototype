@@ -63,6 +63,11 @@ class Cfg:
 
     allow_fractional_market: bool
 
+    exit_prefix: str
+    pause_on_unprotected_positions: bool
+    pause_on_account_blocked: bool
+    pause_on_pdt_flag: bool
+
 
 def _env_bool(key: str, default: bool) -> bool:
     v = os.getenv(key)
@@ -115,7 +120,7 @@ def _round_price(p: float) -> float:
 
 def _load_cfg() -> Cfg:
     cfg = Cfg()
-    cfg.poll_seconds = int(os.getenv("POLL_SECONDS", "20"))
+    cfg.poll_seconds = int(os.getenv("EXECUTOR_POLL_SECONDS", os.getenv("POLL_SECONDS", "20")))
     cfg.min_strength = float(os.getenv("MIN_STRENGTH", "0.6"))
 
     sym_raw = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
@@ -151,6 +156,11 @@ def _load_cfg() -> Cfg:
     cfg.dry_run = _env_bool("DRY_RUN", True)
 
     cfg.allow_fractional_market = _env_bool("ALLOW_FRACTIONAL_MARKET", True)
+
+    cfg.exit_prefix = (os.getenv("EXIT_PREFIX") or "EXIT-OCO-").strip()
+    cfg.pause_on_unprotected_positions = _env_bool("PAUSE_ON_UNPROTECTED_POSITIONS", True)
+    cfg.pause_on_account_blocked = _env_bool("PAUSE_ON_ACCOUNT_BLOCKED", True)
+    cfg.pause_on_pdt_flag = _env_bool("PAUSE_ON_PDT_FLAG", False)
 
     return cfg
 
@@ -203,6 +213,59 @@ def _count_open_entry_orders(open_orders: list) -> int:
             continue
         n += 1
     return n
+
+
+def _has_exit_sl(open_orders: list, symbol: str, exit_prefix: str) -> bool:
+    symu = (symbol or "").upper()
+    pref = f"{(exit_prefix or '').strip()}{symu}-SL-".lower()
+    for o in open_orders:
+        osym = str(getattr(o, "symbol", "") or "").upper()
+        if osym != symu:
+            continue
+        cid = str(getattr(o, "client_order_id", "") or "").lower()
+        if cid.startswith(pref):
+            return True
+    return False
+
+
+def _unprotected_symbols(positions: list, open_orders: list, exit_prefix: str) -> List[str]:
+    unprot: List[str] = []
+    for p in positions:
+        qty = float(getattr(p, "qty", 0) or 0)
+        if qty == 0:
+            continue
+        sym = str(getattr(p, "symbol", "") or "").upper()
+        if not sym:
+            continue
+        if not _has_exit_sl(open_orders, sym, exit_prefix):
+            unprot.append(sym)
+    return sorted(set(unprot))
+
+
+def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool) -> tuple[bool, str]:
+    try:
+        a = tc.get_account()
+        status = str(getattr(a, "status", "") or "")
+        trading_blocked = bool(getattr(a, "trading_blocked", False))
+        account_blocked = bool(getattr(a, "account_blocked", False))
+        pdt = bool(getattr(a, "pattern_day_trader", False))
+
+        dtbp = getattr(a, "daytrading_buying_power", None)
+        dtc = getattr(a, "daytrade_count", None)
+
+        reason = f"status={status} trading_blocked={trading_blocked} account_blocked={account_blocked} pattern_day_trader={pdt}"
+        if dtbp is not None:
+            reason += f" daytrading_buying_power={dtbp}"
+        if dtc is not None:
+            reason += f" daytrade_count={dtc}"
+
+        if trading_blocked or account_blocked:
+            return True, reason
+        if pause_on_pdt_flag and pdt:
+            return True, reason
+        return False, reason
+    except Exception as e:
+        return False, f"account_check_failed err={e!r}"
 
 
 def _safe_mid_from_quotes(symbol: str) -> Optional[float]:
@@ -359,7 +422,7 @@ def main() -> None:
         "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | "
         "DAILY_LOSS_STOP_PCT=%.1f | MAX_DAILY_LOSS_USD=%.1f | ENABLE_DAILY_RISK_GUARD=%s | SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
         "TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s | "
-        "ALLOW_FRACTIONAL_MARKET=%s",
+        "ALLOW_FRACTIONAL_MARKET=%s | EXIT_PREFIX=%s | PAUSE_ON_UNPROTECTED_POSITIONS=%s | PAUSE_ON_ACCOUNT_BLOCKED=%s | PAUSE_ON_PDT_FLAG=%s",
         mode,
         paper,
         base,
@@ -388,6 +451,10 @@ def main() -> None:
         cfg.trading_paused,
         cfg.dry_run,
         cfg.allow_fractional_market,
+        cfg.exit_prefix,
+        cfg.pause_on_unprotected_positions,
+        cfg.pause_on_account_blocked,
+        cfg.pause_on_pdt_flag,
     )
 
     seen_signal_ids: Set[int] = set()
@@ -420,6 +487,26 @@ def main() -> None:
 
             open_orders = _get_open_orders(tc)
             positions = _get_positions(tc)
+
+            # safety gates (live): do not place new entries if account is blocked or if any open position lacks our SL
+            if cfg.pause_on_account_blocked:
+                blocked, reason = _is_account_blocked(tc, cfg.pause_on_pdt_flag)
+                if blocked:
+                    LOG.warning("gate_account_blocked | %s | sleep=%ss", reason, cfg.poll_seconds)
+                    time.sleep(cfg.poll_seconds)
+                    continue
+
+            if cfg.pause_on_unprotected_positions:
+                unprot = _unprotected_symbols(positions, open_orders, cfg.exit_prefix)
+                if unprot:
+                    LOG.warning(
+                        "gate_unprotected_positions | exit_prefix=%s unprotected=%s | sleep=%ss",
+                        cfg.exit_prefix,
+                        unprot,
+                        cfg.poll_seconds,
+                    )
+                    time.sleep(cfg.poll_seconds)
+                    continue
 
             # max open positions gate
             if cfg.max_open_positions > 0:
