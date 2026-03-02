@@ -229,7 +229,7 @@ def _unprotected_symbols(positions: list, open_orders: list, exit_prefix: str) -
     return sorted(set(unprot))
 
 
-def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool) -> Tuple[bool, str]:
+def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
     try:
         a = tc.get_account()
         status = str(getattr(a, "status", "") or "")
@@ -245,6 +245,16 @@ def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool) -> Tuple[boo
             reason += f" daytrading_buying_power={dtbp}"
         if dtc is not None:
             reason += f" daytrade_count={dtc}"
+
+        # NEW: guard - stop trading when daytrade_count is too high
+        pause_on_daytrade_ge = int(os.getenv("PAUSE_ON_DAYTRADE_COUNT_GE", "999"))
+        try:
+            dtc_int = int(dtc) if dtc is not None else None
+        except Exception:
+            dtc_int = None
+
+        if dtc_int is not None and dtc_int >= pause_on_daytrade_ge:
+            return True, reason + f" PAUSE_ON_DAYTRADE_COUNT_GE={pause_on_daytrade_ge}"
 
         if trading_blocked or account_blocked:
             return True, reason
