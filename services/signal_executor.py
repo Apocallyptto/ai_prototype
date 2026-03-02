@@ -246,7 +246,7 @@ def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
         if dtc is not None:
             reason += f" daytrade_count={dtc}"
 
-        # NEW: guard - stop trading when daytrade_count is too high
+        # NEW: stop trading when daytrade_count is too high (prevents unprotectable positions)
         pause_on_daytrade_ge = int(os.getenv("PAUSE_ON_DAYTRADE_COUNT_GE", "999"))
         try:
             dtc_int = int(dtc) if dtc is not None else None
