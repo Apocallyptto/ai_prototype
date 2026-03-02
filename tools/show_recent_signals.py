@@ -38,7 +38,16 @@ def _table_cols(cur, table: str) -> list[str]:
         """,
         (table,),
     )
-    return [r[0] for r in cur.fetchall()]
+    rows = cur.fetchall() or []
+    # rows are dicts because RealDictCursor
+    out = []
+    for r in rows:
+        if isinstance(r, dict) and "column_name" in r:
+            out.append(r["column_name"])
+        else:
+            # fallback if cursor type changes
+            out.append(r[0])
+    return out
 
 
 def main() -> None:
@@ -77,7 +86,7 @@ def main() -> None:
 
         params = (portfolio_id, symbols, since_dt, min_strength, limit)
         cur.execute(sql, params)
-        rows = cur.fetchall()
+        rows = cur.fetchall() or []
 
         print(f"Window: last {window_min}m | portfolio_id={portfolio_id} | symbols={symbols} | min_strength={min_strength}")
         print(f"Columns: {sel}")
@@ -85,7 +94,6 @@ def main() -> None:
         for r in rows[:50]:
             print(r)
 
-        # Show last side per symbol (debug for crossover)
         cur.execute(
             """
             SELECT DISTINCT ON (symbol) symbol, side, strength, created_at
@@ -96,7 +104,7 @@ def main() -> None:
             (portfolio_id, symbols),
         )
         print("\nLast per symbol:")
-        for r in cur.fetchall():
+        for r in (cur.fetchall() or []):
             print(r)
 
         cur.close()
