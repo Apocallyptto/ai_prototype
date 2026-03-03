@@ -1,146 +1,357 @@
 import os
 import time
 import logging
-from datetime import date
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional, List, Dict
 
-import sqlalchemy as sa
 from sqlalchemy import text
+from tools.db import get_engine
+
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.requests import GetOrdersRequest
 
-from utils import get_engine
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("pnl_recorder")
-
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-PORTFOLIO_ID = int(os.getenv("PORTFOLIO_ID", "1"))
-PNL_POLL_SECONDS = int(os.getenv("PNL_POLL_SECONDS", "3600"))  # default: 1h
-
-# DB + Alpaca klient
-engine = get_engine()
-trading_client = TradingClient(
-    api_key=os.getenv("ALPACA_API_KEY"),
-    secret_key=os.getenv("ALPACA_API_SECRET"),
-    paper=os.getenv("TRADING_MODE", "paper") == "paper",
-)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+LOG = logging.getLogger("pnl_recorder")
 
 
-def already_recorded_today() -> bool:
-    """Check, whether we already have PnL record for today."""
-    sql = text(
-        """
-        SELECT 1
-        FROM daily_pnl
-        WHERE as_of_date = CURRENT_DATE
-          AND portfolio_id = :pid
-        LIMIT 1
-        """
-    )
-    with engine.begin() as conn:
-        row = conn.execute(sql, {"pid": PORTFOLIO_ID}).first()
-    return row is not None
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return int(v)
 
 
-def record_pnl_once():
-    """Fetch account from Alpaca and store one row into daily_pnl."""
-    if already_recorded_today():
-        logger.info("PnL for today already recorded (portfolio_id=%s)", PORTFOLIO_ID)
-        return
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = str(v).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off", ""):
+        return False
+    return default
+
+
+def _to_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _dt_utc_naive(dt: Any) -> Optional[datetime]:
+    """
+    Normalize various datetime-ish inputs to UTC naive datetime (for Postgres TIMESTAMP).
+    """
+    if dt is None:
+        return None
+
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    if not isinstance(dt, datetime):
+        return None
+
+    if dt.tzinfo is None:
+        # assume already UTC
+        return dt
 
     try:
-        account = trading_client.get_account()
-    except Exception as e:
-        logger.error("Failed to fetch account from Alpaca: %s", e)
-        return
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return dt.replace(tzinfo=None)
 
+
+def _now_utc_naive() -> datetime:
+    return datetime.utcnow().replace(tzinfo=None)
+
+
+def _make_trading_client() -> TradingClient:
+    key = os.getenv("ALPACA_API_KEY")
+    sec = os.getenv("ALPACA_API_SECRET")
+    if not key or not sec:
+        raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_API_SECRET")
+
+    # live/paper resolution:
+    mode = (os.getenv("TRADING_MODE") or "").strip().lower()
+    if mode in ("paper", "live"):
+        paper = (mode == "paper")
+    else:
+        paper = _env_bool("ALPACA_PAPER", True)
+
+    return TradingClient(key, sec, paper=paper)
+
+
+def _ensure_tables(engine) -> None:
+    with engine.begin() as con:
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS equity_snapshots (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMP NOT NULL,
+            equity DOUBLE PRECISION,
+            cash DOUBLE PRECISION,
+            buying_power DOUBLE PRECISION,
+            portfolio_value DOUBLE PRECISION,
+            long_market_value DOUBLE PRECISION,
+            short_market_value DOUBLE PRECISION,
+            daytrade_count INTEGER,
+            daytrading_buying_power DOUBLE PRECISION,
+            account_status TEXT,
+            raw JSONB
+        );
+        """))
+
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS position_snapshots (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMP NOT NULL,
+            symbol TEXT NOT NULL,
+            qty DOUBLE PRECISION NOT NULL,
+            avg_entry_price DOUBLE PRECISION,
+            current_price DOUBLE PRECISION,
+            market_value DOUBLE PRECISION,
+            unrealized_pl DOUBLE PRECISION,
+            unrealized_plpc DOUBLE PRECISION
+        );
+        """))
+
+        # "orders" table for dedupe + history. Safe even if already exists.
+        con.execute(text("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            alpaca_order_id TEXT UNIQUE,
+            client_order_id TEXT,
+            symbol TEXT,
+            side TEXT,
+            type TEXT,
+            status TEXT,
+            time_in_force TEXT,
+            qty DOUBLE PRECISION,
+            notional DOUBLE PRECISION,
+            filled_qty DOUBLE PRECISION,
+            filled_avg_price DOUBLE PRECISION,
+            submitted_at TIMESTAMP,
+            filled_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            raw JSONB,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """))
+
+
+def _upsert_orders(engine, orders: List[Any]) -> int:
+    if not orders:
+        return 0
+
+    q = text("""
+    INSERT INTO orders (
+        alpaca_order_id, client_order_id, symbol, side, type, status, time_in_force,
+        qty, notional, filled_qty, filled_avg_price,
+        submitted_at, filled_at, updated_at, raw
+    )
+    VALUES (
+        :alpaca_order_id, :client_order_id, :symbol, :side, :type, :status, :time_in_force,
+        :qty, :notional, :filled_qty, :filled_avg_price,
+        :submitted_at, :filled_at, :updated_at, :raw
+    )
+    ON CONFLICT (alpaca_order_id) DO UPDATE SET
+        client_order_id = EXCLUDED.client_order_id,
+        symbol = EXCLUDED.symbol,
+        side = EXCLUDED.side,
+        type = EXCLUDED.type,
+        status = EXCLUDED.status,
+        time_in_force = EXCLUDED.time_in_force,
+        qty = EXCLUDED.qty,
+        notional = EXCLUDED.notional,
+        filled_qty = EXCLUDED.filled_qty,
+        filled_avg_price = EXCLUDED.filled_avg_price,
+        submitted_at = EXCLUDED.submitted_at,
+        filled_at = EXCLUDED.filled_at,
+        updated_at = EXCLUDED.updated_at,
+        raw = EXCLUDED.raw;
+    """)
+
+    rows = []
+    for o in orders:
+        oid = str(getattr(o, "id", "") or "")
+        if not oid:
+            continue
+
+        raw = None
+        try:
+            # alpaca-py objects usually have model_dump()
+            if hasattr(o, "model_dump"):
+                raw = o.model_dump()
+            elif hasattr(o, "dict"):
+                raw = o.dict()
+            else:
+                raw = None
+        except Exception:
+            raw = None
+
+        rows.append({
+            "alpaca_order_id": oid,
+            "client_order_id": str(getattr(o, "client_order_id", "") or "") or None,
+            "symbol": str(getattr(o, "symbol", "") or "") or None,
+            "side": str(getattr(o, "side", "") or "") or None,
+            "type": str(getattr(o, "type", "") or "") or None,
+            "status": str(getattr(o, "status", "") or "") or None,
+            "time_in_force": str(getattr(o, "time_in_force", "") or "") or None,
+            "qty": _to_float(getattr(o, "qty", None), default=None),
+            "notional": _to_float(getattr(o, "notional", None), default=None),
+            "filled_qty": _to_float(getattr(o, "filled_qty", None), default=None),
+            "filled_avg_price": _to_float(getattr(o, "filled_avg_price", None), default=None),
+            "submitted_at": _dt_utc_naive(getattr(o, "submitted_at", None)),
+            "filled_at": _dt_utc_naive(getattr(o, "filled_at", None)),
+            "updated_at": _dt_utc_naive(getattr(o, "updated_at", None)),
+            "raw": raw,
+        })
+
+    if not rows:
+        return 0
+
+    with engine.begin() as con:
+        con.execute(q, rows)
+
+    return len(rows)
+
+
+def _insert_equity(engine, account: Any) -> None:
+    ts = _now_utc_naive()
+
+    raw = None
     try:
-        equity = float(account.equity)
-        cash = float(account.cash)
-        buying_power = float(account.buying_power)
-        portfolio_value = float(account.portfolio_value)
-        long_mv = float(account.long_market_value)
-        short_mv = float(account.short_market_value)
-    except Exception as e:
-        logger.error("Failed to parse account numbers: %s", e)
-        return
+        if hasattr(account, "model_dump"):
+            raw = account.model_dump()
+        elif hasattr(account, "dict"):
+            raw = account.dict()
+    except Exception:
+        raw = None
 
-    logger.info(
-        "Recording PnL for %s | equity=%.2f cash=%.2f bp=%.2f pv=%.2f",
-        date.today(),
-        equity,
-        cash,
-        buying_power,
-        portfolio_value,
-    )
-
-    sql = text(
-        """
-        INSERT INTO daily_pnl (
-            as_of_date,
-            portfolio_id,
-            equity,
-            cash,
-            buying_power,
-            portfolio_value,
-            long_market_value,
-            short_market_value
-        )
-        VALUES (
-            CURRENT_DATE,
-            :pid,
-            :equity,
-            :cash,
-            :bp,
-            :pv,
-            :long_mv,
-            :short_mv
-        )
-        ON CONFLICT (as_of_date, portfolio_id)
-        DO UPDATE
-        SET
-            equity = EXCLUDED.equity,
-            cash = EXCLUDED.cash,
-            buying_power = EXCLUDED.buying_power,
-            portfolio_value = EXCLUDED.portfolio_value,
-            long_market_value = EXCLUDED.long_market_value,
-            short_market_value = EXCLUDED.short_market_value,
-            created_at = NOW();
-        """
-    )
-
-    with engine.begin() as conn:
-        conn.execute(
-            sql,
+    with engine.begin() as con:
+        con.execute(
+            text("""
+            INSERT INTO equity_snapshots (
+                ts, equity, cash, buying_power, portfolio_value,
+                long_market_value, short_market_value,
+                daytrade_count, daytrading_buying_power, account_status, raw
+            )
+            VALUES (
+                :ts, :equity, :cash, :buying_power, :portfolio_value,
+                :long_market_value, :short_market_value,
+                :daytrade_count, :daytrading_buying_power, :account_status, :raw
+            );
+            """),
             {
-                "pid": PORTFOLIO_ID,
-                "equity": equity,
-                "cash": cash,
-                "bp": buying_power,
-                "pv": portfolio_value,
-                "long_mv": long_mv,
-                "short_mv": short_mv,
+                "ts": ts,
+                "equity": _to_float(getattr(account, "equity", None), default=None),
+                "cash": _to_float(getattr(account, "cash", None), default=None),
+                "buying_power": _to_float(getattr(account, "buying_power", None), default=None),
+                "portfolio_value": _to_float(getattr(account, "portfolio_value", None), default=None),
+                "long_market_value": _to_float(getattr(account, "long_market_value", None), default=None),
+                "short_market_value": _to_float(getattr(account, "short_market_value", None), default=None),
+                "daytrade_count": int(getattr(account, "daytrade_count", 0) or 0),
+                "daytrading_buying_power": _to_float(getattr(account, "daytrading_buying_power", None), default=None),
+                "account_status": str(getattr(account, "status", "") or ""),
+                "raw": raw,
             },
         )
 
-    logger.info("PnL record stored / updated successfully.")
+
+def _insert_positions(engine, positions: List[Any]) -> int:
+    ts = _now_utc_naive()
+    rows = []
+
+    for p in positions or []:
+        qty = _to_float(getattr(p, "qty", 0.0), default=0.0)
+        if qty == 0:
+            continue
+        rows.append({
+            "ts": ts,
+            "symbol": str(getattr(p, "symbol", "") or "").upper(),
+            "qty": qty,
+            "avg_entry_price": _to_float(getattr(p, "avg_entry_price", None), default=None),
+            "current_price": _to_float(getattr(p, "current_price", None), default=None),
+            "market_value": _to_float(getattr(p, "market_value", None), default=None),
+            "unrealized_pl": _to_float(getattr(p, "unrealized_pl", None), default=None),
+            "unrealized_plpc": _to_float(getattr(p, "unrealized_plpc", None), default=None),
+        })
+
+    if not rows:
+        return 0
+
+    with engine.begin() as con:
+        con.execute(
+            text("""
+            INSERT INTO position_snapshots (
+                ts, symbol, qty, avg_entry_price, current_price, market_value, unrealized_pl, unrealized_plpc
+            )
+            VALUES (
+                :ts, :symbol, :qty, :avg_entry_price, :current_price, :market_value, :unrealized_pl, :unrealized_plpc
+            );
+            """),
+            rows,
+        )
+
+    return len(rows)
 
 
-def main_loop():
-    logger.info(
-        "pnl_recorder starting | PORTFOLIO_ID=%s | PNL_POLL_SECONDS=%s",
-        PORTFOLIO_ID,
-        PNL_POLL_SECONDS,
+def main() -> None:
+    poll = _env_int("PNL_POLL_SECONDS", 300)
+    orders_lookback_hours = _env_int("PNL_ORDERS_LOOKBACK_HOURS", 48)
+    record_positions = _env_bool("PNL_RECORD_POSITIONS", True)
+
+    tc = _make_trading_client()
+    engine = get_engine()
+    _ensure_tables(engine)
+
+    LOG.info(
+        "pnl_recorder starting | poll=%ss | orders_lookback_hours=%s | record_positions=%s",
+        poll, orders_lookback_hours, record_positions
     )
 
     while True:
         try:
-            record_pnl_once()
+            acct = tc.get_account()
+            _insert_equity(engine, acct)
+
+            if record_positions:
+                pos = tc.get_all_positions() or []
+                npos = _insert_positions(engine, pos)
+            else:
+                npos = 0
+
+            after_dt = datetime.now(timezone.utc) - timedelta(hours=orders_lookback_hours)
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                limit=500,
+                nested=True,
+                after=after_dt,
+            )
+            closed = tc.get_orders(filter=req) or []
+            norders = _upsert_orders(engine, list(closed))
+
+            LOG.info(
+                "recorded | equity=%.2f cash=%.2f daytrade_count=%s | positions_rows=%s | upsert_orders=%s",
+                _to_float(getattr(acct, "equity", 0.0), default=0.0),
+                _to_float(getattr(acct, "cash", 0.0), default=0.0),
+                getattr(acct, "daytrade_count", None),
+                npos,
+                norders,
+            )
+
         except Exception as e:
-            logger.exception("Error in PnL loop: %s", e)
-        time.sleep(PNL_POLL_SECONDS)
+            LOG.exception("loop_error: %r", e)
+
+        time.sleep(poll)
 
 
 if __name__ == "__main__":
-    main_loop()
+    main()
