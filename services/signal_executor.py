@@ -65,6 +65,10 @@ class Cfg:
     pause_on_account_blocked: bool
     pause_on_pdt_flag: bool
 
+    # swing / PDT safety
+    exit_on_sell_signal: bool
+    min_hold_minutes: int
+
 
 def _env_bool(key: str, default: bool) -> bool:
     v = os.getenv(key)
@@ -150,6 +154,10 @@ def _load_cfg() -> Cfg:
     cfg.pause_on_unprotected_positions = _env_bool("PAUSE_ON_UNPROTECTED_POSITIONS", True)
     cfg.pause_on_account_blocked = _env_bool("PAUSE_ON_ACCOUNT_BLOCKED", True)
     cfg.pause_on_pdt_flag = _env_bool("PAUSE_ON_PDT_FLAG", False)
+
+    # swing / PDT safety
+    cfg.exit_on_sell_signal = _env_bool("EXIT_ON_SELL_SIGNAL", False)
+    cfg.min_hold_minutes = int(os.getenv("MIN_HOLD_MINUTES", "0"))
 
     return cfg
 
@@ -246,7 +254,7 @@ def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
         if dtc is not None:
             reason += f" daytrade_count={dtc}"
 
-        # NEW: stop trading when daytrade_count is too high (prevents unprotectable positions)
+        # stop trading when daytrade_count is too high (prevents unprotectable positions)
         pause_on_daytrade_ge = int(os.getenv("PAUSE_ON_DAYTRADE_COUNT_GE", "999"))
         try:
             dtc_int = int(dtc) if dtc is not None else None
@@ -403,7 +411,8 @@ def main() -> None:
         "ALPACA_DEDUPE_MINUTES=%s | CANCEL_OPPOSITE_OPEN_ORDERS=%s | MAX_OPEN_POSITIONS=%s | MAX_OPEN_ORDERS=%s | "
         "SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
         "TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s | "
-        "ALLOW_FRACTIONAL_MARKET=%s | EXIT_PREFIX=%s | PAUSE_ON_UNPROTECTED_POSITIONS=%s | PAUSE_ON_ACCOUNT_BLOCKED=%s | PAUSE_ON_PDT_FLAG=%s",
+        "ALLOW_FRACTIONAL_MARKET=%s | EXIT_PREFIX=%s | PAUSE_ON_UNPROTECTED_POSITIONS=%s | PAUSE_ON_ACCOUNT_BLOCKED=%s | PAUSE_ON_PDT_FLAG=%s | "
+        "EXIT_ON_SELL_SIGNAL=%s | MIN_HOLD_MINUTES=%s",
         mode, paper, base,
         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
         cfg.allow_short, cfg.long_only,
@@ -414,11 +423,15 @@ def main() -> None:
         cfg.trade_only_when_market_open, cfg.preopen_window_seconds, cfg.allow_trade_on_clock_error,
         cfg.trading_paused, cfg.dry_run,
         cfg.allow_fractional_market,
-        cfg.exit_prefix, cfg.pause_on_unprotected_positions, cfg.pause_on_account_blocked, cfg.pause_on_pdt_flag
+        cfg.exit_prefix, cfg.pause_on_unprotected_positions, cfg.pause_on_account_blocked, cfg.pause_on_pdt_flag,
+        cfg.exit_on_sell_signal, cfg.min_hold_minutes,
     )
 
     seen_signal_ids: Set[int] = set()
     last_submit_ts_by_symbol: Dict[str, float] = {}
+
+    # best-effort entry timestamps (for MIN_HOLD_MINUTES). Safe fallback: if unknown -> don't exit on sell.
+    last_entry_ts_by_symbol: Dict[str, float] = {}
 
     while True:
         try:
@@ -458,8 +471,12 @@ def main() -> None:
             if cfg.pause_on_unprotected_positions:
                 unprot = _unprotected_symbols(positions, open_orders, cfg.exit_prefix)
                 if unprot:
-                    LOG.warning("gate_unprotected_positions | exit_prefix=%s unprotected=%s | sleep=%ss",
-                                cfg.exit_prefix, unprot, cfg.poll_seconds)
+                    LOG.warning(
+                        "gate_unprotected_positions | exit_prefix=%s unprotected=%s | sleep=%ss",
+                        cfg.exit_prefix,
+                        unprot,
+                        cfg.poll_seconds,
+                    )
                     time.sleep(cfg.poll_seconds)
                     continue
 
@@ -472,15 +489,25 @@ def main() -> None:
                     sym = str(getattr(p, "symbol", "") or "").upper()
                     live_pos.append((sym, qty))
                 if len(live_pos) >= cfg.max_open_positions:
-                    LOG.info("gate_max_open_positions | have=%s limit=%s | positions=%s | sleep=%ss",
-                             len(live_pos), cfg.max_open_positions, live_pos, cfg.poll_seconds)
+                    LOG.info(
+                        "gate_max_open_positions | have=%s limit=%s | positions=%s | sleep=%ss",
+                        len(live_pos),
+                        cfg.max_open_positions,
+                        live_pos,
+                        cfg.poll_seconds,
+                    )
                     time.sleep(cfg.poll_seconds)
                     continue
 
             if cfg.max_open_orders > 0:
                 entry_open = _count_open_entry_orders(open_orders)
                 if entry_open >= cfg.max_open_orders:
-                    LOG.info("gate_max_open_orders | have=%s limit=%s | sleep=%ss", entry_open, cfg.max_open_orders, cfg.poll_seconds)
+                    LOG.info(
+                        "gate_max_open_orders | have=%s limit=%s | sleep=%ss",
+                        entry_open,
+                        cfg.max_open_orders,
+                        cfg.poll_seconds,
+                    )
                     time.sleep(cfg.poll_seconds)
                     continue
 
@@ -509,6 +536,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
+            # long-only sell handling (optional exit)
             if cfg.long_only and side == "sell":
                 pos_qty = 0.0
                 for p in positions:
@@ -518,6 +546,37 @@ def main() -> None:
                         break
 
                 if pos_qty > 0:
+                    if not cfg.exit_on_sell_signal:
+                        LOG.info("skip sell signal (EXIT_ON_SELL_SIGNAL=0) | symbol=%s", symbol)
+                        seen_signal_ids.add(sig_id)
+                        time.sleep(cfg.poll_seconds)
+                        continue
+
+                    if cfg.min_hold_minutes > 0:
+                        entry_ts = last_entry_ts_by_symbol.get(symbol)
+                        if not entry_ts:
+                            LOG.warning(
+                                "skip sell exit (min_hold active but entry_ts unknown) | symbol=%s MIN_HOLD_MINUTES=%s",
+                                symbol,
+                                cfg.min_hold_minutes,
+                            )
+                            seen_signal_ids.add(sig_id)
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
+                        hold_sec = cfg.min_hold_minutes * 60
+                        age_sec = now_ts - entry_ts
+                        if age_sec < hold_sec:
+                            LOG.info(
+                                "skip sell exit (min_hold) | symbol=%s age_sec=%.1f < hold_sec=%s",
+                                symbol,
+                                age_sec,
+                                hold_sec,
+                            )
+                            seen_signal_ids.add(sig_id)
+                            time.sleep(cfg.poll_seconds)
+                            continue
+
                     cid = f"X-{symbol}-STC-{sig_id}"
                     if cfg.dry_run:
                         LOG.info("DRY_RUN exit_long | symbol=%s qty=%s cid=%s", symbol, pos_qty, cid)
@@ -593,17 +652,47 @@ def main() -> None:
             client_order_id = _mk_client_order_id(symbol, side, sig_id, kind)
 
             if cfg.dry_run:
-                LOG.info("DRY_RUN would_submit | symbol=%s side=%s kind=%s qty=%.6f price=%.4f strength=%.4f cid=%s",
-                         symbol, side, kind, qty, price, strength, client_order_id)
+                LOG.info(
+                    "DRY_RUN would_submit | symbol=%s side=%s kind=%s qty=%.6f price=%.4f strength=%.4f cid=%s",
+                    symbol,
+                    side,
+                    kind,
+                    qty,
+                    price,
+                    strength,
+                    client_order_id,
+                )
+                if side == "buy":
+                    last_entry_ts_by_symbol[symbol] = now_ts
             else:
                 if kind == "MARKET_NOTIONAL":
                     oid = _place_market_notional(tc, symbol, side, notional, client_order_id)
-                    LOG.info("submitted | %s %s kind=%s notional=%.2f oid=%s strength=%.4f cid=%s",
-                             symbol, side, kind, notional, oid, strength, client_order_id)
+                    LOG.info(
+                        "submitted | %s %s kind=%s notional=%.2f oid=%s strength=%.4f cid=%s",
+                        symbol,
+                        side,
+                        kind,
+                        notional,
+                        oid,
+                        strength,
+                        client_order_id,
+                    )
                 else:
                     oid = _place_limit(tc, symbol, side, qty, limit_price, client_order_id)
-                    LOG.info("submitted | %s %s kind=%s qty=%.6f limit=%.4f oid=%s strength=%.4f cid=%s",
-                             symbol, side, kind, qty, limit_price, oid, strength, client_order_id)
+                    LOG.info(
+                        "submitted | %s %s kind=%s qty=%.6f limit=%.4f oid=%s strength=%.4f cid=%s",
+                        symbol,
+                        side,
+                        kind,
+                        qty,
+                        limit_price,
+                        oid,
+                        strength,
+                        client_order_id,
+                    )
+
+                if side == "buy":
+                    last_entry_ts_by_symbol[symbol] = now_ts
 
             seen_signal_ids.add(sig_id)
             last_submit_ts_by_symbol[symbol] = now_ts
