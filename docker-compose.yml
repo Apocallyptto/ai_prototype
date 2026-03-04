@@ -119,5 +119,16 @@
     command: ["python", "-u", "-m", "services.record_pnl"]
     restart: unless-stopped
 
+  auto_pause_guard:
+    build: .
+    container_name: trader_auto_pause_guard
+    env_file:
+      - .env.live
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python -m services.auto_pause_guard
+    restart: unless-stopped
+
 volumes:
   pgdata:
