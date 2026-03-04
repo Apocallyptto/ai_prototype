@@ -9,6 +9,8 @@ from sqlalchemy import text, bindparam
 
 from tools.db import get_engine
 
+from tools.system_flags import get_flag
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
     QueryOrderStatus,
@@ -435,6 +437,11 @@ def main() -> None:
 
     while True:
         try:
+            # DB-controlled pause (auto-guard)
+            if get_flag("TRADING_PAUSED", "0") == "1":
+                LOG.warning("trading_paused_by_db_flag | reason=%s", get_flag("TRADING_PAUSED_REASON", ""))
+                time.sleep(cfg.poll_seconds)
+                continue
             if cfg.trading_paused:
                 LOG.info("trading_paused | sleep=%ss", cfg.poll_seconds)
                 time.sleep(cfg.poll_seconds)
