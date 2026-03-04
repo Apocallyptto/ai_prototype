@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, List
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from tools.db import get_engine
 
 from alpaca.trading.client import TradingClient
@@ -126,7 +127,6 @@ def _ensure_tables(engine) -> None:
         );
         """))
 
-        # NEW: separate table for pnl recorder (avoid collision with existing public.orders)
         con.execute(text("""
         CREATE TABLE IF NOT EXISTS alpaca_orders (
             alpaca_order_id TEXT PRIMARY KEY,
@@ -227,7 +227,6 @@ def _insert_positions(engine, positions: List[Any]) -> int:
             """),
             rows,
         )
-
     return len(rows)
 
 
@@ -305,22 +304,42 @@ def _upsert_alpaca_orders(engine, orders: List[Any]) -> int:
     return len(rows)
 
 
+def _wait_for_db(engine, sleep_seconds: int) -> None:
+    while True:
+        try:
+            with engine.connect() as con:
+                con.execute(text("SELECT 1"))
+            return
+        except OperationalError as e:
+            LOG.warning("db_not_ready (will retry) | err=%r", e)
+            time.sleep(sleep_seconds)
+        except Exception as e:
+            # includes DNS resolution errors surfaced via SQLAlchemy/psycopg
+            LOG.warning("db_not_ready (will retry) | err=%r", e)
+            time.sleep(sleep_seconds)
+
+
 def main() -> None:
     poll = _env_int("PNL_POLL_SECONDS", 300)
     orders_lookback_hours = _env_int("PNL_ORDERS_LOOKBACK_HOURS", 48)
     record_positions = _env_bool("PNL_RECORD_POSITIONS", True)
+    db_retry_seconds = _env_int("DB_RETRY_SECONDS", 5)
 
     tc = _make_trading_client()
     engine = get_engine()
+
+    # NEW: wait for DB/DNS to be ready instead of crashing
+    _wait_for_db(engine, db_retry_seconds)
     _ensure_tables(engine)
 
     LOG.info(
-        "pnl_recorder starting | poll=%ss | orders_lookback_hours=%s | record_positions=%s",
-        poll, orders_lookback_hours, record_positions
+        "pnl_recorder starting | poll=%ss | orders_lookback_hours=%s | record_positions=%s | db_retry=%ss",
+        poll, orders_lookback_hours, record_positions, db_retry_seconds
     )
 
     while True:
         try:
+            # if DB becomes temporarily unavailable mid-run, just retry next cycle
             acct = tc.get_account()
             _insert_equity(engine, acct)
 
@@ -341,8 +360,8 @@ def main() -> None:
 
             LOG.info(
                 "recorded | equity=%.2f cash=%.2f daytrade_count=%s | positions_rows=%s | upsert_alpaca_orders=%s",
-                _to_float(getattr(acct, "equity", 0.0), default=0.0) or 0.0,
-                _to_float(getattr(acct, "cash", 0.0), default=0.0) or 0.0,
+                (_to_float(getattr(acct, "equity", 0.0), default=0.0) or 0.0),
+                (_to_float(getattr(acct, "cash", 0.0), default=0.0) or 0.0),
                 getattr(acct, "daytrade_count", None),
                 npos,
                 norders,
