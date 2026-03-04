@@ -7,6 +7,7 @@ from sqlalchemy import text
 from tools.db import get_engine
 from tools.system_flags import set_flag
 
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 LOG = logging.getLogger("auto_pause_guard")
 
@@ -51,7 +52,12 @@ def main():
 
     while True:
         try:
+            # Heartbeat so we can see guard is alive (even when it doesn't pause)
+            set_flag("GUARD_HEARTBEAT_TS", datetime.now(timezone.utc).isoformat())
+            set_flag("GUARD_STATUS", "OK")
+
             if not enabled:
+                set_flag("GUARD_STATUS", "DISABLED")
                 time.sleep(poll)
                 continue
 
@@ -78,6 +84,7 @@ def main():
 
             if not r or r[0] is None or r[1] is None:
                 # no data yet today
+                set_flag("GUARD_STATUS", f"NO_DATA day={day}")
                 time.sleep(poll)
                 continue
 
@@ -89,17 +96,33 @@ def main():
             pnl = last_eq - open_eq
             pnl_pct = (pnl / open_eq * 100.0) if open_eq > 0 else 0.0
 
+            # Optional: store last computed stats for visibility
+            set_flag("GUARD_LAST_PNL_USD", f"{pnl:.4f}")
+            set_flag("GUARD_LAST_PNL_PCT", f"{pnl_pct:.4f}")
+            set_flag("GUARD_LAST_EQUITY_OPEN", f"{open_eq:.4f}")
+            set_flag("GUARD_LAST_EQUITY_LAST", f"{last_eq:.4f}")
+            set_flag("GUARD_LAST_DAY", day)
+
             if pnl <= -abs(max_daily_loss_usd) or pnl_pct <= -abs(max_daily_loss_pct):
+                reason = (
+                    f"daily_loss day={day} pnl={pnl:.2f} pnl_pct={pnl_pct:.2f}% "
+                    f"open={open_eq:.2f} last={last_eq:.2f}"
+                )
                 set_flag("TRADING_PAUSED", "1")
-                set_flag("TRADING_PAUSED_REASON", f"daily_loss day={day} pnl={pnl:.2f} pnl_pct={pnl_pct:.2f}% open={open_eq:.2f} last={last_eq:.2f}")
+                set_flag("TRADING_PAUSED_REASON", reason)
+                set_flag("GUARD_STATUS", "PAUSED_TRIGGERED")
+
                 LOG.warning(
                     "PAUSED | day=%s pnl=%.2f pnl_pct=%.2f open=%.2f last=%.2f open_ts=%s last_ts=%s",
                     day, pnl, pnl_pct, open_eq, last_eq, open_ts, last_ts
                 )
+            else:
+                set_flag("GUARD_STATUS", "OK")
 
             time.sleep(poll)
 
         except Exception:
+            set_flag("GUARD_STATUS", "ERROR")
             LOG.exception("loop_error")
             time.sleep(poll)
 
