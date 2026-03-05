@@ -15,6 +15,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     StopOrderRequest,
     MarketOrderRequest,
+    LimitOrderRequest,
 )
 
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -23,21 +24,6 @@ from alpaca.data.timeframe import TimeFrame
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 LOG = logging.getLogger("oco_exit_monitor")
-
-
-class PDTBlockedError(RuntimeError):
-    """Raised when Alpaca blocks protective actions due to PDT / day-trade protection."""
-    pass
-
-
-def _is_pdt_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return (
-        "40310100" in msg
-        or "pattern day trading" in msg
-        or "day trade buying power" in msg
-        or ("pdt" in msg and "protection" in msg)
-    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -220,6 +206,48 @@ def _find_sl_orders(open_orders, sym: str, prefix: str) -> list:
     return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
 
 
+def _find_tp_orders(open_orders, sym: str, prefix: str) -> list:
+    symu = sym.upper()
+    pref = f"{prefix}{symu}-TP-"
+    return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
+
+
+def _place_tp_limit(
+    tc: TradingClient,
+    sym: str,
+    qty_abs: float,
+    exit_side: OrderSide,
+    intent: PositionIntent,
+    tp: float,
+    tif: TimeInForce,
+    cid: str,
+    dry_run: bool,
+) -> bool:
+    tp = _round2(tp)
+    if dry_run:
+        LOG.info("DRY_RUN place_tp | sym=%s qty=%s side=%s intent=%s tp=%s tif=%s cid=%s",
+                 sym, qty_abs, exit_side.value, intent.value, tp, tif.value, cid)
+        return True
+    try:
+        req = LimitOrderRequest(
+            symbol=sym,
+            qty=float(qty_abs),
+            side=exit_side,
+            time_in_force=tif,
+            limit_price=float(tp),
+            position_intent=intent,
+            client_order_id=cid,
+        )
+        o = tc.submit_order(order_data=req)
+        oid = str(getattr(o, "id", "") or "")
+        LOG.info("placed_tp | sym=%s qty=%s side=%s intent=%s tp=%s oid=%s cid=%s",
+                 sym, qty_abs, exit_side.value, intent.value, tp, oid, cid)
+        return True
+    except Exception as e:
+        LOG.error("place_tp failed sym=%s: %s", sym, e, exc_info=True)
+        return False
+
+
 def _place_sl(
     tc: TradingClient,
     sym: str,
@@ -252,10 +280,11 @@ def _place_sl(
                  sym, qty_abs, exit_side.value, intent.value, sl, oid, cid)
         return True
     except Exception as e:
-        if _is_pdt_error(e):
-            LOG.error("place_sl blocked_by_pdt | sym=%s err=%s", sym, e)
-            raise PDTBlockedError(str(e))
-        LOG.error("place_sl failed sym=%s: %s", sym, e, exc_info=True)
+        msg = str(e)
+        if "40310100" in msg or "pattern day trading" in msg.lower():
+            LOG.error("place_sl blocked_by_pdt | sym=%s err=%s", sym, msg)
+        else:
+            LOG.error("place_sl failed sym=%s: %s", sym, e, exc_info=True)
         return False
 
 
@@ -289,18 +318,14 @@ def _close_market(
                  sym, qty_abs, exit_side.value, intent.value, oid, cid)
         return True
     except Exception as e:
-        if _is_pdt_error(e):
-            LOG.error("close_market blocked_by_pdt | sym=%s err=%s", sym, e)
-            raise PDTBlockedError(str(e))
         LOG.error("close_market failed sym=%s: %s", sym, e, exc_info=True)
         return False
 
 
 def main():
-    poll_seconds = _env_int("OCO_POLL_SECONDS", _env_int("POLL_SECONDS", 5))
-    heartbeat_seconds = _env_int("OCO_HEARTBEAT_SECONDS", _env_int("HEARTBEAT_SECONDS", 60))
-    error_backoff_seconds = _env_int("OCO_ERROR_BACKOFF_SECONDS", _env_int("ERROR_BACKOFF_SECONDS", 30))
-    pdt_backoff_seconds = _env_int("PDT_BACKOFF_SECONDS", 1800)
+    poll_seconds = _env_int("POLL_SECONDS", 5)
+    heartbeat_seconds = _env_int("HEARTBEAT_SECONDS", 60)
+    error_backoff_seconds = _env_int("ERROR_BACKOFF_SECONDS", 30)
 
     min_qty = float(os.getenv("MIN_QTY", "0") or "0")
     qty_buffer_pct = _env_float("QTY_BUFFER_PCT", 0.0)
@@ -313,13 +338,16 @@ def main():
     tp_pct = _env_float("TP_PCT", 1.0)
     sl_pct = _env_float("SL_PCT", 0.75)
 
+    enable_tp_limit = _env_bool("ENABLE_TP_LIMIT", False)
+    tp_as_limit_only = _env_bool("TP_LIMIT_ONLY", True)
+
     min_sl_gap_pct = _env_float("MIN_SL_GAP_PCT", 0.20)
 
-    tif_raw = (os.getenv("TIF", "day") or "day").strip().lower()
+    tif_raw = (os.getenv("OCO_TIF") or os.getenv("TIF") or "day").strip().lower()
     try:
-        tif = TimeInForce(tif_raw)
+        tif_exit = TimeInForce(tif_raw)
     except Exception:
-        tif = TimeInForce.DAY
+        tif_exit = TimeInForce.DAY
 
     enable_repair = _env_bool("ENABLE_REPAIR", True)
     dry_run = _env_bool("DRY_RUN", False)
@@ -333,11 +361,11 @@ def main():
 
     LOG.info(
         "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | min_qty=%s | qty_buffer_pct=%s | "
-        "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | min_sl_gap_pct=%s | "
-        "tif=%s | enable_repair=%s | dry_run=%s | cleanup_orphans=%s | prefix=%s | error_backoff=%ss | pdt_backoff=%ss",
+        "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | enable_tp_limit=%s | tp_limit_only=%s | min_sl_gap_pct=%s | "
+        "tif=%s | enable_repair=%s | dry_run=%s | cleanup_orphans=%s | prefix=%s | error_backoff=%ss",
         mode, paper, base, poll_seconds, heartbeat_seconds, min_qty, qty_buffer_pct,
-        use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct, min_sl_gap_pct,
-        tif.value, enable_repair, dry_run, cleanup_orphans, prefix, error_backoff_seconds, pdt_backoff_seconds
+        use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct, enable_tp_limit, tp_as_limit_only, min_sl_gap_pct,
+        tif_exit.value, enable_repair, dry_run, cleanup_orphans, prefix, error_backoff_seconds
     )
 
     tc = get_trading_client()
@@ -345,7 +373,7 @@ def main():
 
     last_heartbeat = 0.0
     errors = 0
-    next_retry_ts: Dict[str, float] = {}
+    last_fail_ts: Dict[str, float] = {}
 
     while True:
         try:
@@ -369,8 +397,7 @@ def main():
 
             for sym in sorted(active_syms):
                 now = time.time()
-                nxt = next_retry_ts.get(sym)
-                if nxt is not None and now < nxt:
+                if sym in last_fail_ts and (now - last_fail_ts[sym]) < error_backoff_seconds:
                     continue
 
                 qty, avg_entry, cur_price = _pos_info(tc, sym)
@@ -421,8 +448,36 @@ def main():
                 tp, sl = _ensure_tp_sl(exit_side, tp, sl)
                 sl = _clamp_sl_away_from_market(exit_side, sl, cur_price, min_sl_gap_pct)
 
-                # TP trigger: cancel SL -> market close
+                # ensure TP limit exists (optional)
+                tp_orders = _find_tp_orders(open_orders, sym, prefix)
+                if enable_tp_limit and not tp_orders and enable_repair:
+                    ok_tp = _place_tp_limit(
+                        tc=tc,
+                        sym=sym,
+                        qty_abs=qty_eff,
+                        exit_side=exit_side,
+                        intent=intent,
+                        tp=tp,
+                        tif=tif_exit,
+                        cid=f"{prefix}{sym}-TP-{int(time.time())}",
+                        dry_run=dry_run,
+                    )
+                    if ok_tp:
+                        placed += 1
+                    else:
+                        errors += 1
+                        last_fail_ts[sym] = time.time()
+
+                # TP handling:
+                # - if TP limit-only mode enabled and TP order exists, we just wait for fill.
+                # - otherwise fallback to legacy TP trigger -> cancel SL -> market close.
                 if _tp_hit(exit_side, cur_price, tp):
+                    if enable_tp_limit and tp_as_limit_only:
+                        if tp_orders:
+                            protected += 1
+                            continue
+
+                    # legacy: TP trigger: cancel SL -> market close
                     sl_orders = _find_sl_orders(open_orders, sym, prefix)
                     for o in sl_orders:
                         oid = str(getattr(o, "id", "") or "")
@@ -435,27 +490,21 @@ def main():
                         protected += 1
                         continue
 
-                    try:
-                        ok = _close_market(
-                            tc=tc,
-                            sym=sym,
-                            qty_abs=abs(qty2),
-                            exit_side=exit_side,
-                            intent=intent,
-                            tif=tif,
-                            cid=f"{prefix}{sym}-TPMKT-{int(time.time())}",
-                            dry_run=dry_run,
-                        )
-                    except PDTBlockedError as e:
-                        errors += 1
-                        next_retry_ts[sym] = time.time() + float(pdt_backoff_seconds)
-                        LOG.warning("tp_close_blocked_by_pdt | sym=%s backoff=%ss | err=%s", sym, pdt_backoff_seconds, e)
+                    ok = _close_market(
+                        tc=tc,
+                        sym=sym,
+                        qty_abs=abs(qty2),
+                        exit_side=exit_side,
+                        intent=intent,
+                        tif=TimeInForce.DAY,
+                        cid=f"{prefix}{sym}-TPMKT-{int(time.time())}",
+                        dry_run=dry_run,
+                    )
+                    if ok:
+                        placed += 1
                     else:
-                        if ok:
-                            placed += 1
-                        else:
-                            errors += 1
-                            next_retry_ts[sym] = time.time() + float(error_backoff_seconds)
+                        errors += 1
+                        last_fail_ts[sym] = time.time()
                     continue
 
                 # ensure SL exists
@@ -468,29 +517,22 @@ def main():
                     unprotected.append(sym)
                     continue
 
-                try:
-                    ok = _place_sl(
-                        tc=tc,
-                        sym=sym,
-                        qty_abs=qty_eff,
-                        exit_side=exit_side,
-                        intent=intent,
-                        sl=sl,
-                        tif=tif,
-                        cid=f"{prefix}{sym}-SL-{int(time.time())}",
-                        dry_run=dry_run,
-                    )
-                except PDTBlockedError as e:
-                    errors += 1
-                    next_retry_ts[sym] = time.time() + float(pdt_backoff_seconds)
-                    LOG.warning("sl_blocked_by_pdt | sym=%s backoff=%ss | err=%s", sym, pdt_backoff_seconds, e)
-                    unprotected.append(sym)
+                ok = _place_sl(
+                    tc=tc,
+                    sym=sym,
+                    qty_abs=qty_eff,
+                    exit_side=exit_side,
+                    intent=intent,
+                    sl=sl,
+                    tif=tif_exit,
+                    cid=f"{prefix}{sym}-SL-{int(time.time())}",
+                    dry_run=dry_run,
+                )
+                if ok:
+                    placed += 1
                 else:
-                    if ok:
-                        placed += 1
-                    else:
-                        errors += 1
-                        next_retry_ts[sym] = time.time() + float(error_backoff_seconds)
+                    errors += 1
+                    last_fail_ts[sym] = time.time()
 
             now = time.time()
             if now - last_heartbeat >= heartbeat_seconds:
