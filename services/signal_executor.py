@@ -8,7 +8,6 @@ from typing import Optional, Dict, Any, List, Set, Tuple
 from sqlalchemy import text, bindparam
 
 from tools.db import get_engine
-
 from tools.system_flags import get_flag
 
 from alpaca.trading.client import TradingClient
@@ -70,6 +69,12 @@ class Cfg:
     # swing / PDT safety
     exit_on_sell_signal: bool
     min_hold_minutes: int
+
+    # confidence sizing (AI feeling)
+    confidence_sizing: bool
+    notional_min: float
+    notional_max: float
+    confidence_full_strength: float
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -160,6 +165,23 @@ def _load_cfg() -> Cfg:
     # swing / PDT safety
     cfg.exit_on_sell_signal = _env_bool("EXIT_ON_SELL_SIGNAL", False)
     cfg.min_hold_minutes = int(os.getenv("MIN_HOLD_MINUTES", "0"))
+
+    # confidence sizing (AI-like sizing)
+    cfg.confidence_sizing = _env_bool("CONFIDENCE_SIZING", True)
+    cfg.notional_min = float(os.getenv("NOTIONAL_MIN", "5"))
+    cfg.notional_max = float(os.getenv("NOTIONAL_MAX", str(cfg.max_notional)))
+    cfg.confidence_full_strength = float(os.getenv("CONFIDENCE_FULL_STRENGTH", "1.0"))
+
+    # sanitize + cap
+    if cfg.notional_min < 0:
+        cfg.notional_min = 0.0
+    if cfg.notional_max < 0:
+        cfg.notional_max = 0.0
+    if cfg.notional_min > cfg.notional_max:
+        cfg.notional_min, cfg.notional_max = cfg.notional_max, cfg.notional_min
+
+    # hard cap by MAX_NOTIONAL
+    cfg.notional_max = min(cfg.notional_max, cfg.max_notional)
 
     return cfg
 
@@ -256,7 +278,6 @@ def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
         if dtc is not None:
             reason += f" daytrade_count={dtc}"
 
-        # stop trading when daytrade_count is too high (prevents unprotectable positions)
         pause_on_daytrade_ge = int(os.getenv("PAUSE_ON_DAYTRADE_COUNT_GE", "999"))
         try:
             dtc_int = int(dtc) if dtc is not None else None
@@ -340,16 +361,6 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
     return None
 
 
-def _calc_qty(cfg: Cfg, price: float) -> float:
-    if price <= 0:
-        return 0.0
-    q_notional = cfg.max_notional / price
-    qty = min(cfg.max_qty, cfg.max_position_qty, q_notional)
-    if qty <= 0:
-        return 0.0
-    return float(f"{qty:.6f}")
-
-
 def _mk_client_order_id(symbol: str, side: str, sig_id: int, kind: str) -> str:
     s = "B" if side == "buy" else "S"
     k = "N" if kind == "MARKET_NOTIONAL" else "L"
@@ -402,6 +413,52 @@ def _place_market_notional(tc: TradingClient, symbol: str, side: str, notional: 
     return str(getattr(o, "id", ""))
 
 
+def _scaled_notional(cfg: Cfg, strength: float) -> float:
+    """
+    Map strength -> notional (USD), linearly:
+      strength == cfg.min_strength -> cfg.notional_min
+      strength == cfg.confidence_full_strength -> cfg.notional_max
+    Always capped by cfg.max_notional.
+    """
+    cap = float(cfg.max_notional)
+    if not getattr(cfg, "confidence_sizing", False):
+        return float(f"{cap:.2f}")
+
+    s = abs(float(strength))
+    lo = float(cfg.min_strength)
+    hi = float(getattr(cfg, "confidence_full_strength", 1.0) or 1.0)
+    if hi <= lo:
+        hi = lo + 1e-6
+
+    t = (s - lo) / (hi - lo)
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+
+    nmin = float(getattr(cfg, "notional_min", 0.0) or 0.0)
+    nmax = float(getattr(cfg, "notional_max", cap) or cap)
+    if nmin > nmax:
+        nmin, nmax = nmax, nmin
+
+    n = nmin + t * (nmax - nmin)
+    if n > cap:
+        n = cap
+    if n < 0:
+        n = 0
+    return float(f"{n:.2f}")
+
+
+def _qty_from_notional(cfg: Cfg, price: float, notional: float) -> float:
+    if price <= 0 or notional <= 0:
+        return 0.0
+    q_notional = notional / price
+    qty = min(cfg.max_qty, cfg.max_position_qty, q_notional)
+    if qty <= 0:
+        return 0.0
+    return float(f"{qty:.6f}")
+
+
 def main() -> None:
     cfg = _load_cfg()
     engine = get_engine()
@@ -414,7 +471,7 @@ def main() -> None:
         "SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
         "TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s | "
         "ALLOW_FRACTIONAL_MARKET=%s | EXIT_PREFIX=%s | PAUSE_ON_UNPROTECTED_POSITIONS=%s | PAUSE_ON_ACCOUNT_BLOCKED=%s | PAUSE_ON_PDT_FLAG=%s | "
-        "EXIT_ON_SELL_SIGNAL=%s | MIN_HOLD_MINUTES=%s",
+        "EXIT_ON_SELL_SIGNAL=%s | MIN_HOLD_MINUTES=%s | CONFIDENCE_SIZING=%s | NOTIONAL_MIN=%.2f | NOTIONAL_MAX=%.2f | FULL_STRENGTH=%.2f",
         mode, paper, base,
         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
         cfg.allow_short, cfg.long_only,
@@ -427,6 +484,7 @@ def main() -> None:
         cfg.allow_fractional_market,
         cfg.exit_prefix, cfg.pause_on_unprotected_positions, cfg.pause_on_account_blocked, cfg.pause_on_pdt_flag,
         cfg.exit_on_sell_signal, cfg.min_hold_minutes,
+        cfg.confidence_sizing, cfg.notional_min, cfg.notional_max, cfg.confidence_full_strength,
     )
 
     seen_signal_ids: Set[int] = set()
@@ -442,6 +500,7 @@ def main() -> None:
                 LOG.warning("trading_paused_by_db_flag | reason=%s", get_flag("TRADING_PAUSED_REASON", ""))
                 time.sleep(cfg.poll_seconds)
                 continue
+
             if cfg.trading_paused:
                 LOG.info("trading_paused | sleep=%ss", cfg.poll_seconds)
                 time.sleep(cfg.poll_seconds)
@@ -635,7 +694,15 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            qty = _calc_qty(cfg, price)
+            if cfg.cancel_opposite_open_orders:
+                _cancel_opposite(tc, symbol, side, open_orders)
+
+            # === CONFIDENCE-BASED SIZING (BUY) ===
+            trade_notional = cfg.max_notional
+            if side == "buy":
+                trade_notional = _scaled_notional(cfg, strength)
+
+            qty = _qty_from_notional(cfg, price, trade_notional)
             if qty <= 0:
                 LOG.info("skip qty<=0 | %s", symbol)
                 time.sleep(cfg.poll_seconds)
@@ -645,25 +712,24 @@ def main() -> None:
             notional = 0.0
             limit_price = price
 
+            # Use market-notional for fractional BUYs
             if cfg.allow_fractional_market and side == "buy" and qty < 1.0:
                 kind = "MARKET_NOTIONAL"
-                notional = float(f"{min(cfg.max_notional, qty * price):.2f}")
+                notional = float(f"{trade_notional:.2f}")
                 if notional <= 0:
                     LOG.info("skip notional<=0 | %s", symbol)
                     time.sleep(cfg.poll_seconds)
                     continue
 
-            if cfg.cancel_opposite_open_orders:
-                _cancel_opposite(tc, symbol, side, open_orders)
-
             client_order_id = _mk_client_order_id(symbol, side, sig_id, kind)
 
             if cfg.dry_run:
                 LOG.info(
-                    "DRY_RUN would_submit | symbol=%s side=%s kind=%s qty=%.6f price=%.4f strength=%.4f cid=%s",
+                    "DRY_RUN would_submit | symbol=%s side=%s kind=%s notional=%.2f qty=%.6f price=%.4f strength=%.4f cid=%s",
                     symbol,
                     side,
                     kind,
+                    float(trade_notional),
                     qty,
                     price,
                     strength,
@@ -687,12 +753,13 @@ def main() -> None:
                 else:
                     oid = _place_limit(tc, symbol, side, qty, limit_price, client_order_id)
                     LOG.info(
-                        "submitted | %s %s kind=%s qty=%.6f limit=%.4f oid=%s strength=%.4f cid=%s",
+                        "submitted | %s %s kind=%s qty=%.6f limit=%.4f notional=%.2f oid=%s strength=%.4f cid=%s",
                         symbol,
                         side,
                         kind,
                         qty,
                         limit_price,
+                        float(trade_notional),
                         oid,
                         strength,
                         client_order_id,
