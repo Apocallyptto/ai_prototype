@@ -15,7 +15,6 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     StopOrderRequest,
     MarketOrderRequest,
-    LimitOrderRequest,
 )
 
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -157,10 +156,6 @@ def _cleanup_orphan_exit_orders(tc: TradingClient, orders, active_symbols: Set[s
 
 
 def _ensure_tp_sl(exit_side: OrderSide, tp: float, sl: float) -> tuple[float, float]:
-    """
-    exit_side SELL: closing long -> want TP > SL
-    exit_side BUY : closing short -> want TP < SL
-    """
     tp = float(tp)
     sl = float(sl)
     if exit_side == OrderSide.SELL:
@@ -173,11 +168,6 @@ def _ensure_tp_sl(exit_side: OrderSide, tp: float, sl: float) -> tuple[float, fl
 
 
 def _clamp_sl_away_from_market(exit_side: OrderSide, sl: float, cur: float, min_gap_pct: float) -> float:
-    """
-    Prevent instant-trigger STOP:
-    - For SELL stop (long protection), ensure sl < cur*(1 - gap)
-    - For BUY stop (short protection), ensure sl > cur*(1 + gap)
-    """
     if cur <= 0:
         return sl
     gap = max(0.0, float(min_gap_pct)) / 100.0
@@ -206,46 +196,25 @@ def _find_sl_orders(open_orders, sym: str, prefix: str) -> list:
     return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
 
 
-def _find_tp_orders(open_orders, sym: str, prefix: str) -> list:
+def _find_any_exit_orders(open_orders, sym: str, prefix: str) -> list:
     symu = sym.upper()
-    pref = f"{prefix}{symu}-TP-"
+    pref = f"{prefix}{symu}-"
     return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
 
 
-def _place_tp_limit(
-    tc: TradingClient,
-    sym: str,
-    qty_abs: float,
-    exit_side: OrderSide,
-    intent: PositionIntent,
-    tp: float,
-    tif: TimeInForce,
-    cid: str,
-    dry_run: bool,
-) -> bool:
-    tp = _round2(tp)
-    if dry_run:
-        LOG.info("DRY_RUN place_tp | sym=%s qty=%s side=%s intent=%s tp=%s tif=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, tp, tif.value, cid)
-        return True
-    try:
-        req = LimitOrderRequest(
-            symbol=sym,
-            qty=float(qty_abs),
-            side=exit_side,
-            time_in_force=tif,
-            limit_price=float(tp),
-            position_intent=intent,
-            client_order_id=cid,
-        )
-        o = tc.submit_order(order_data=req)
-        oid = str(getattr(o, "id", "") or "")
-        LOG.info("placed_tp | sym=%s qty=%s side=%s intent=%s tp=%s oid=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, tp, oid, cid)
-        return True
-    except Exception as e:
-        LOG.error("place_tp failed sym=%s: %s", sym, e, exc_info=True)
-        return False
+def _has_oco_parent(open_orders, sym: str, prefix: str) -> bool:
+    symu = sym.upper()
+    pref = f"{prefix}{symu}-OCO-"
+    for o in open_orders:
+        if (getattr(o, "symbol", "") or "").upper() != symu:
+            continue
+        cid = _cid(o)
+        if cid.startswith(pref):
+            return True
+        oc = str(getattr(o, "order_class", "") or "").lower()
+        if oc == "oco":
+            return True
+    return False
 
 
 def _place_sl(
@@ -276,8 +245,8 @@ def _place_sl(
         )
         o = tc.submit_order(order_data=req)
         oid = str(getattr(o, "id", "") or "")
-        LOG.info("placed_sl | sym=%s qty=%s side=%s intent=%s sl=%s oid=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, sl, oid, cid)
+        LOG.info("placed_sl | sym=%s qty=%s side=%s intent=%s sl=%s tif=%s oid=%s cid=%s",
+                 sym, qty_abs, exit_side.value, intent.value, sl, tif.value, oid, cid)
         return True
     except Exception as e:
         msg = str(e)
@@ -294,7 +263,6 @@ def _close_market(
     qty_abs: float,
     exit_side: OrderSide,
     intent: PositionIntent,
-    tif: TimeInForce,
     cid: str,
     dry_run: bool,
 ) -> bool:
@@ -307,7 +275,7 @@ def _close_market(
             symbol=sym,
             qty=float(qty_abs),
             side=exit_side,
-            time_in_force=tif,
+            time_in_force=TimeInForce.DAY,
             type=OrderType.MARKET,
             position_intent=intent,
             client_order_id=cid,
@@ -319,6 +287,51 @@ def _close_market(
         return True
     except Exception as e:
         LOG.error("close_market failed sym=%s: %s", sym, e, exc_info=True)
+        return False
+
+
+def _place_exit_oco(
+    tc: TradingClient,
+    sym: str,
+    qty_abs: float,
+    exit_side: OrderSide,
+    tp: float,
+    sl: float,
+    tif: TimeInForce,
+    cid: str,
+    dry_run: bool,
+) -> bool:
+    """
+    Submit one OCO exit order (TP limit + SL stop) for whole shares (qty >= 1).
+    Payload is per Alpaca docs: type must be "limit", order_class="oco", with take_profit and stop_loss legs.
+    """
+    tp = _round2(tp)
+    sl = _round2(sl)
+
+    payload = {
+        "side": "sell" if exit_side == OrderSide.SELL else "buy",
+        "symbol": sym,
+        "type": "limit",
+        "qty": str(float(qty_abs)),
+        "time_in_force": tif.value,
+        "order_class": "oco",
+        "take_profit": {"limit_price": str(tp)},
+        "stop_loss": {"stop_price": str(sl)},
+        "client_order_id": cid,
+    }
+
+    if dry_run:
+        LOG.info("DRY_RUN place_oco | %s", payload)
+        return True
+
+    try:
+        o = tc.submit_order(order_data=payload)
+        oid = str(getattr(o, "id", "") or "")
+        LOG.info("placed_oco | sym=%s qty=%s tif=%s tp=%s sl=%s oid=%s cid=%s",
+                 sym, qty_abs, tif.value, tp, sl, oid, cid)
+        return True
+    except Exception as e:
+        LOG.error("place_oco failed sym=%s: %s", sym, e, exc_info=True)
         return False
 
 
@@ -335,14 +348,13 @@ def main():
     atr_mult_tp = _env_float("ATR_MULT_TP", 2.0)
     atr_mult_sl = _env_float("ATR_MULT_SL", 1.5)
 
-    tp_pct = _env_float("TP_PCT", 1.0)
-    sl_pct = _env_float("SL_PCT", 0.75)
+    tp_pct = _env_float("TP_PCT", 5.0)
+    sl_pct = _env_float("SL_PCT", 3.0)
 
-    enable_tp_limit = _env_bool("ENABLE_TP_LIMIT", False)
-    tp_as_limit_only = _env_bool("TP_LIMIT_ONLY", True)
-
+    enable_tp_limit = _env_bool("ENABLE_TP_LIMIT", True)     # now means: whole shares -> OCO
     min_sl_gap_pct = _env_float("MIN_SL_GAP_PCT", 0.20)
 
+    # Whole-shares OCO can be GTC; fractional must be DAY anyway.
     tif_raw = (os.getenv("OCO_TIF") or os.getenv("TIF") or "day").strip().lower()
     try:
         tif_exit = TimeInForce(tif_raw)
@@ -353,6 +365,14 @@ def main():
     dry_run = _env_bool("DRY_RUN", False)
     cleanup_orphans = _env_bool("CLEANUP_ORPHAN_EXITS", True)
 
+    # Fractional behavior:
+    # - can't keep TP+SL as two orders (qty gets reserved)
+    # - so we keep SL, and if TP is hit we do cancel SL + market close
+    fractional_tp_market_close = _env_bool("FRACTIONAL_TP_MARKET_CLOSE", True)
+
+    # threshold where we consider position "fractional"
+    fractional_threshold = float(os.getenv("FRACTIONAL_QTY_THRESHOLD", "1.0"))
+
     prefix = (os.getenv("EXIT_PREFIX", "EXIT-OCO-") or "EXIT-OCO-").strip()
 
     mode = _resolve_mode()
@@ -360,12 +380,12 @@ def main():
     base = "https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets"
 
     LOG.info(
-        "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | min_qty=%s | qty_buffer_pct=%s | "
-        "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | enable_tp_limit=%s | tp_limit_only=%s | min_sl_gap_pct=%s | "
-        "tif=%s | enable_repair=%s | dry_run=%s | cleanup_orphans=%s | prefix=%s | error_backoff=%ss",
-        mode, paper, base, poll_seconds, heartbeat_seconds, min_qty, qty_buffer_pct,
-        use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct, enable_tp_limit, tp_as_limit_only, min_sl_gap_pct,
-        tif_exit.value, enable_repair, dry_run, cleanup_orphans, prefix, error_backoff_seconds
+        "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | "
+        "use_atr=%s | tp_pct=%s | sl_pct=%s | enable_tp_limit=%s | tif=%s | "
+        "fractional_threshold=%s | fractional_tp_market_close=%s | dry_run=%s | prefix=%s | error_backoff=%ss",
+        mode, paper, base, poll_seconds, heartbeat_seconds,
+        use_atr, tp_pct, sl_pct, enable_tp_limit, tif_exit.value,
+        fractional_threshold, fractional_tp_market_close, dry_run, prefix, error_backoff_seconds
     )
 
     tc = get_trading_client()
@@ -374,6 +394,7 @@ def main():
     last_heartbeat = 0.0
     errors = 0
     last_fail_ts: Dict[str, float] = {}
+    warned_fractional: Set[str] = set()
 
     while True:
         try:
@@ -416,6 +437,10 @@ def main():
                 exit_side = OrderSide.SELL if pos_is_long else OrderSide.BUY
                 intent = PositionIntent.SELL_TO_CLOSE if pos_is_long else PositionIntent.BUY_TO_CLOSE
 
+                # fractional must be DAY; whole shares can use tif_exit
+                is_fractional = (qty_eff > 0 and qty_eff < fractional_threshold)
+                tif_eff = TimeInForce.DAY if is_fractional else tif_exit
+
                 ref_price = avg_entry if avg_entry > 0 else cur_price
                 if ref_price <= 0 or cur_price <= 0:
                     continue
@@ -448,36 +473,48 @@ def main():
                 tp, sl = _ensure_tp_sl(exit_side, tp, sl)
                 sl = _clamp_sl_away_from_market(exit_side, sl, cur_price, min_sl_gap_pct)
 
-                # ensure TP limit exists (optional)
-                tp_orders = _find_tp_orders(open_orders, sym, prefix)
-                if enable_tp_limit and not tp_orders and enable_repair:
-                    ok_tp = _place_tp_limit(
-                        tc=tc,
-                        sym=sym,
-                        qty_abs=qty_eff,
-                        exit_side=exit_side,
-                        intent=intent,
-                        tp=tp,
-                        tif=tif_exit,
-                        cid=f"{prefix}{sym}-TP-{int(time.time())}",
-                        dry_run=dry_run,
-                    )
-                    if ok_tp:
-                        placed += 1
-                    else:
-                        errors += 1
-                        last_fail_ts[sym] = time.time()
+                # === WHOLE SHARES: use OCO (TP+SL) ===
+                if (not is_fractional) and enable_tp_limit:
+                    if not _has_oco_parent(open_orders, sym, prefix):
+                        # cancel any old simple exit orders for this symbol (free qty)
+                        for o in _find_any_exit_orders(open_orders, sym, prefix):
+                            oid = str(getattr(o, "id", "") or "")
+                            if oid:
+                                _cancel_order_safely(tc, oid, sym, "replace_with_oco")
 
-                # TP handling:
-                # - if TP limit-only mode enabled and TP order exists, we just wait for fill.
-                # - otherwise fallback to legacy TP trigger -> cancel SL -> market close.
-                if _tp_hit(exit_side, cur_price, tp):
-                    if enable_tp_limit and tp_as_limit_only:
-                        if tp_orders:
-                            protected += 1
+                        time.sleep(0.3)
+                        ok = _place_exit_oco(
+                            tc=tc,
+                            sym=sym,
+                            qty_abs=qty_eff,
+                            exit_side=exit_side,
+                            tp=tp,
+                            sl=sl,
+                            tif=tif_eff,
+                            cid=f"{prefix}{sym}-OCO-{int(time.time())}",
+                            dry_run=dry_run,
+                        )
+                        if ok:
+                            placed += 1
+                            open_orders = _get_orders(tc, QueryOrderStatus.OPEN)
+                        else:
+                            errors += 1
+                            last_fail_ts[sym] = time.time()
                             continue
 
-                    # legacy: TP trigger: cancel SL -> market close
+                    protected += 1
+                    continue
+
+                # === FRACTIONAL: cannot keep TP+SL as two separate orders. Keep SL only. ===
+                if is_fractional and sym not in warned_fractional:
+                    warned_fractional.add(sym)
+                    LOG.warning(
+                        "fractional_mode | sym=%s qty=%.6f -> keep SL only; TP will be market-close on hit (if enabled)",
+                        sym, qty_eff
+                    )
+
+                # TP hit handling for fractional (market close)
+                if is_fractional and fractional_tp_market_close and _tp_hit(exit_side, cur_price, tp):
                     sl_orders = _find_sl_orders(open_orders, sym, prefix)
                     for o in sl_orders:
                         oid = str(getattr(o, "id", "") or "")
@@ -496,7 +533,6 @@ def main():
                         qty_abs=abs(qty2),
                         exit_side=exit_side,
                         intent=intent,
-                        tif=TimeInForce.DAY,
                         cid=f"{prefix}{sym}-TPMKT-{int(time.time())}",
                         dry_run=dry_run,
                     )
@@ -507,7 +543,7 @@ def main():
                         last_fail_ts[sym] = time.time()
                     continue
 
-                # ensure SL exists
+                # ensure SL exists (fractional and also non-tp-limit mode)
                 sl_orders = _find_sl_orders(open_orders, sym, prefix)
                 if sl_orders:
                     protected += 1
@@ -524,12 +560,13 @@ def main():
                     exit_side=exit_side,
                     intent=intent,
                     sl=sl,
-                    tif=tif_exit,
+                    tif=tif_eff,
                     cid=f"{prefix}{sym}-SL-{int(time.time())}",
                     dry_run=dry_run,
                 )
                 if ok:
                     placed += 1
+                    open_orders = _get_orders(tc, QueryOrderStatus.OPEN)
                 else:
                     errors += 1
                     last_fail_ts[sym] = time.time()
