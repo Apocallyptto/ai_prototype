@@ -2,6 +2,7 @@ import os
 import time
 import logging
 from typing import Optional, List, Set, Dict
+from datetime import datetime, timezone, timedelta
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
@@ -79,6 +80,25 @@ def get_data_client() -> StockHistoricalDataClient:
 
 def _round2(x: float) -> float:
     return float(f"{float(x):.2f}")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dt_utc(dt) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _atr_pct(dc: StockHistoricalDataClient, sym: str, lookback: int = 50) -> Optional[float]:
@@ -196,27 +216,6 @@ def _find_sl_orders(open_orders, sym: str, prefix: str) -> list:
     return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
 
 
-def _find_any_exit_orders(open_orders, sym: str, prefix: str) -> list:
-    symu = sym.upper()
-    pref = f"{prefix}{symu}-"
-    return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
-
-
-def _has_oco_parent(open_orders, sym: str, prefix: str) -> bool:
-    symu = sym.upper()
-    pref = f"{prefix}{symu}-OCO-"
-    for o in open_orders:
-        if (getattr(o, "symbol", "") or "").upper() != symu:
-            continue
-        cid = _cid(o)
-        if cid.startswith(pref):
-            return True
-        oc = str(getattr(o, "order_class", "") or "").lower()
-        if oc == "oco":
-            return True
-    return False
-
-
 def _place_sl(
     tc: TradingClient,
     sym: str,
@@ -249,11 +248,7 @@ def _place_sl(
                  sym, qty_abs, exit_side.value, intent.value, sl, tif.value, oid, cid)
         return True
     except Exception as e:
-        msg = str(e)
-        if "40310100" in msg or "pattern day trading" in msg.lower():
-            LOG.error("place_sl blocked_by_pdt | sym=%s err=%s", sym, msg)
-        else:
-            LOG.error("place_sl failed sym=%s: %s", sym, e, exc_info=True)
+        LOG.error("place_sl failed sym=%s: %s", sym, e, exc_info=True)
         return False
 
 
@@ -290,58 +285,44 @@ def _close_market(
         return False
 
 
-def _place_exit_oco(
-    tc: TradingClient,
-    sym: str,
-    qty_abs: float,
-    exit_side: OrderSide,
-    tp: float,
-    sl: float,
-    tif: TimeInForce,
-    cid: str,
-    dry_run: bool,
-) -> bool:
+def _last_filled_entry_ts(tc: TradingClient, sym: str, lookback_days: int = 14) -> Optional[datetime]:
     """
-    Submit one OCO exit order (TP limit + SL stop) for whole shares (qty >= 1).
-    Payload is per Alpaca docs: type must be "limit", order_class="oco", with take_profit and stop_loss legs.
+    Find latest filled entry order timestamp:
+    - long positions: last FILLED BUY for symbol
     """
-    tp = _round2(tp)
-    sl = _round2(sl)
-
-    payload = {
-        "side": "sell" if exit_side == OrderSide.SELL else "buy",
-        "symbol": sym,
-        "type": "limit",
-        "qty": str(float(qty_abs)),
-        "time_in_force": tif.value,
-        "order_class": "oco",
-        "take_profit": {"limit_price": str(tp)},
-        "stop_loss": {"stop_price": str(sl)},
-        "client_order_id": cid,
-    }
-
-    if dry_run:
-        LOG.info("DRY_RUN place_oco | %s", payload)
-        return True
-
+    symu = sym.upper()
+    after = _utc_now() - timedelta(days=lookback_days)
     try:
-        o = tc.submit_order(order_data=payload)
-        oid = str(getattr(o, "id", "") or "")
-        LOG.info("placed_oco | sym=%s qty=%s tif=%s tp=%s sl=%s oid=%s cid=%s",
-                 sym, qty_abs, tif.value, tp, sl, oid, cid)
-        return True
+        req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500, nested=True, after=after)
+        orders = tc.get_orders(filter=req) or []
     except Exception as e:
-        LOG.error("place_oco failed sym=%s: %s", sym, e, exc_info=True)
-        return False
+        LOG.warning("entry_ts lookup failed (orders fetch) | sym=%s err=%r", symu, e)
+        return None
+
+    best: Optional[datetime] = None
+    for o in orders:
+        if (getattr(o, "symbol", "") or "").upper() != symu:
+            continue
+        side = str(getattr(o, "side", "") or "").lower()
+        status = str(getattr(o, "status", "") or "").lower()
+        if side != "buy":
+            continue
+        if "filled" not in status:
+            continue
+
+        ts = _dt_utc(getattr(o, "filled_at", None)) or _dt_utc(getattr(o, "submitted_at", None)) or _dt_utc(getattr(o, "updated_at", None))
+        if not ts:
+            continue
+        if best is None or ts > best:
+            best = ts
+
+    return best
 
 
 def main():
     poll_seconds = _env_int("POLL_SECONDS", 5)
     heartbeat_seconds = _env_int("HEARTBEAT_SECONDS", 60)
     error_backoff_seconds = _env_int("ERROR_BACKOFF_SECONDS", 30)
-
-    min_qty = float(os.getenv("MIN_QTY", "0") or "0")
-    qty_buffer_pct = _env_float("QTY_BUFFER_PCT", 0.0)
 
     use_atr = _env_bool("USE_ATR", True)
     atr_lookback = _env_int("ATR_LOOKBACK", 50)
@@ -351,27 +332,18 @@ def main():
     tp_pct = _env_float("TP_PCT", 5.0)
     sl_pct = _env_float("SL_PCT", 3.0)
 
-    enable_tp_limit = _env_bool("ENABLE_TP_LIMIT", True)     # now means: whole shares -> OCO
     min_sl_gap_pct = _env_float("MIN_SL_GAP_PCT", 0.20)
-
-    # Whole-shares OCO can be GTC; fractional must be DAY anyway.
-    tif_raw = (os.getenv("OCO_TIF") or os.getenv("TIF") or "day").strip().lower()
-    try:
-        tif_exit = TimeInForce(tif_raw)
-    except Exception:
-        tif_exit = TimeInForce.DAY
 
     enable_repair = _env_bool("ENABLE_REPAIR", True)
     dry_run = _env_bool("DRY_RUN", False)
     cleanup_orphans = _env_bool("CLEANUP_ORPHAN_EXITS", True)
 
-    # Fractional behavior:
-    # - can't keep TP+SL as two orders (qty gets reserved)
-    # - so we keep SL, and if TP is hit we do cancel SL + market close
+    # fractional behavior
     fractional_tp_market_close = _env_bool("FRACTIONAL_TP_MARKET_CLOSE", True)
-
-    # threshold where we consider position "fractional"
     fractional_threshold = float(os.getenv("FRACTIONAL_QTY_THRESHOLD", "1.0"))
+
+    # NEW: TP min-hold (prevents daytrades on quick TP)
+    tp_min_hold_minutes = int(os.getenv("TP_MIN_HOLD_MINUTES", os.getenv("MIN_HOLD_MINUTES", "0")))
 
     prefix = (os.getenv("EXIT_PREFIX", "EXIT-OCO-") or "EXIT-OCO-").strip()
 
@@ -381,11 +353,11 @@ def main():
 
     LOG.info(
         "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | "
-        "use_atr=%s | tp_pct=%s | sl_pct=%s | enable_tp_limit=%s | tif=%s | "
-        "fractional_threshold=%s | fractional_tp_market_close=%s | dry_run=%s | prefix=%s | error_backoff=%ss",
+        "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | "
+        "fractional_threshold=%s | fractional_tp_market_close=%s | tp_min_hold_minutes=%s | dry_run=%s | prefix=%s | error_backoff=%ss",
         mode, paper, base, poll_seconds, heartbeat_seconds,
-        use_atr, tp_pct, sl_pct, enable_tp_limit, tif_exit.value,
-        fractional_threshold, fractional_tp_market_close, dry_run, prefix, error_backoff_seconds
+        use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct,
+        fractional_threshold, fractional_tp_market_close, tp_min_hold_minutes, dry_run, prefix, error_backoff_seconds
     )
 
     tc = get_trading_client()
@@ -426,20 +398,14 @@ def main():
                     continue
 
                 qty_abs = abs(qty)
-                if qty_abs < min_qty:
-                    continue
-
-                qty_eff = qty_abs * (1.0 - qty_buffer_pct / 100.0)
-                if qty_eff <= 0:
-                    continue
+                qty_eff = qty_abs
 
                 pos_is_long = qty > 0
                 exit_side = OrderSide.SELL if pos_is_long else OrderSide.BUY
                 intent = PositionIntent.SELL_TO_CLOSE if pos_is_long else PositionIntent.BUY_TO_CLOSE
 
-                # fractional must be DAY; whole shares can use tif_exit
                 is_fractional = (qty_eff > 0 and qty_eff < fractional_threshold)
-                tif_eff = TimeInForce.DAY if is_fractional else tif_exit
+                tif_eff = TimeInForce.DAY  # fractional always DAY
 
                 ref_price = avg_entry if avg_entry > 0 else cur_price
                 if ref_price <= 0 or cur_price <= 0:
@@ -449,72 +415,50 @@ def main():
                 if use_atr:
                     atrp = _atr_pct(dc, sym, lookback=atr_lookback)
                     if atrp is None:
-                        if pos_is_long:
-                            tp = ref_price * (1.0 + tp_pct / 100.0)
-                            sl = ref_price * (1.0 - sl_pct / 100.0)
-                        else:
-                            tp = ref_price * (1.0 - tp_pct / 100.0)
-                            sl = ref_price * (1.0 + sl_pct / 100.0)
-                    else:
-                        if pos_is_long:
-                            tp = ref_price * (1.0 + atrp * atr_mult_tp)
-                            sl = ref_price * (1.0 - atrp * atr_mult_sl)
-                        else:
-                            tp = ref_price * (1.0 - atrp * atr_mult_tp)
-                            sl = ref_price * (1.0 + atrp * atr_mult_sl)
-                else:
-                    if pos_is_long:
                         tp = ref_price * (1.0 + tp_pct / 100.0)
                         sl = ref_price * (1.0 - sl_pct / 100.0)
                     else:
-                        tp = ref_price * (1.0 - tp_pct / 100.0)
-                        sl = ref_price * (1.0 + sl_pct / 100.0)
+                        tp = ref_price * (1.0 + atrp * atr_mult_tp)
+                        sl = ref_price * (1.0 - atrp * atr_mult_sl)
+                else:
+                    tp = ref_price * (1.0 + tp_pct / 100.0)
+                    sl = ref_price * (1.0 - sl_pct / 100.0)
 
                 tp, sl = _ensure_tp_sl(exit_side, tp, sl)
                 sl = _clamp_sl_away_from_market(exit_side, sl, cur_price, min_sl_gap_pct)
 
-                # === WHOLE SHARES: use OCO (TP+SL) ===
-                if (not is_fractional) and enable_tp_limit:
-                    if not _has_oco_parent(open_orders, sym, prefix):
-                        # cancel any old simple exit orders for this symbol (free qty)
-                        for o in _find_any_exit_orders(open_orders, sym, prefix):
-                            oid = str(getattr(o, "id", "") or "")
-                            if oid:
-                                _cancel_order_safely(tc, oid, sym, "replace_with_oco")
-
-                        time.sleep(0.3)
-                        ok = _place_exit_oco(
-                            tc=tc,
-                            sym=sym,
-                            qty_abs=qty_eff,
-                            exit_side=exit_side,
-                            tp=tp,
-                            sl=sl,
-                            tif=tif_eff,
-                            cid=f"{prefix}{sym}-OCO-{int(time.time())}",
-                            dry_run=dry_run,
-                        )
-                        if ok:
-                            placed += 1
-                            open_orders = _get_orders(tc, QueryOrderStatus.OPEN)
-                        else:
-                            errors += 1
-                            last_fail_ts[sym] = time.time()
-                            continue
-
-                    protected += 1
-                    continue
-
-                # === FRACTIONAL: cannot keep TP+SL as two separate orders. Keep SL only. ===
                 if is_fractional and sym not in warned_fractional:
                     warned_fractional.add(sym)
                     LOG.warning(
-                        "fractional_mode | sym=%s qty=%.6f -> keep SL only; TP will be market-close on hit (if enabled)",
-                        sym, qty_eff
+                        "fractional_mode | sym=%s qty=%.6f -> keep SL only; TP will be market-close on hit (if enabled) "
+                        "AND only after tp_min_hold_minutes=%s",
+                        sym, qty_eff, tp_min_hold_minutes
                     )
 
-                # TP hit handling for fractional (market close)
+                # TP hit handling for fractional (market close) with min-hold
                 if is_fractional and fractional_tp_market_close and _tp_hit(exit_side, cur_price, tp):
+                    if tp_min_hold_minutes > 0:
+                        entry_ts = _last_filled_entry_ts(tc, sym)
+                        if entry_ts:
+                            age_min = (_utc_now() - entry_ts).total_seconds() / 60.0
+                            if age_min < tp_min_hold_minutes:
+                                LOG.info(
+                                    "tp_hit_but_min_hold_active | sym=%s age_min=%.1f < %s -> skip TPMKT",
+                                    sym, age_min, tp_min_hold_minutes
+                                )
+                                # keep SL only
+                                sl_orders = _find_sl_orders(open_orders, sym, prefix)
+                                if sl_orders:
+                                    protected += 1
+                                continue
+                        else:
+                            LOG.warning("tp_hit_but_entry_ts_unknown | sym=%s -> skip TPMKT to avoid daytrade", sym)
+                            sl_orders = _find_sl_orders(open_orders, sym, prefix)
+                            if sl_orders:
+                                protected += 1
+                            continue
+
+                    # cancel SL then market close
                     sl_orders = _find_sl_orders(open_orders, sym, prefix)
                     for o in sl_orders:
                         oid = str(getattr(o, "id", "") or "")
@@ -543,7 +487,7 @@ def main():
                         last_fail_ts[sym] = time.time()
                     continue
 
-                # ensure SL exists (fractional and also non-tp-limit mode)
+                # ensure SL exists
                 sl_orders = _find_sl_orders(open_orders, sym, prefix)
                 if sl_orders:
                     protected += 1
