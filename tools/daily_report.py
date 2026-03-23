@@ -1,29 +1,148 @@
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
 from sqlalchemy import create_engine, text
+
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.enums import QueryOrderStatus
+    from alpaca.trading.requests import GetOrdersRequest
+except Exception:
+    TradingClient = None
+    QueryOrderStatus = None
+    GetOrdersRequest = None
 
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if not v:
+    if v is None or str(v).strip() == "":
         return default
     return int(v)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off", ""):
+        return False
+    return default
+
+
 def _get_db_url() -> str:
-    return os.getenv("DB_URL") or os.getenv("DATABASE_URL") or ""
+    return (
+        os.getenv("DB_URL")
+        or os.getenv("DATABASE_URL")
+        or "postgresql+psycopg2://postgres:postgres@postgres:5432/trader"
+    )
 
 
-def main() -> None:
-    db = _get_db_url()
-    if not db:
-        raise RuntimeError("Missing DB_URL / DATABASE_URL")
+def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
-    days = _env_int("REPORT_DAYS", 14)
-    engine = create_engine(db)
 
-    # daily equity: first and last equity per UTC day
-    q_daily = text("""
+def _fmt_num(x: Any, digits: int = 2) -> str:
+    if x is None:
+        return "-"
+    try:
+        return f"{float(x):.{digits}f}"
+    except Exception:
+        return str(x)
+
+
+def _fmt_pct(x: Any, digits: int = 2) -> str:
+    if x is None:
+        return "-"
+    try:
+        return f"{float(x):.{digits}f}%"
+    except Exception:
+        return str(x)
+
+
+def _make_trading_client():
+    if TradingClient is None:
+        return None
+
+    key = os.getenv("ALPACA_API_KEY")
+    sec = os.getenv("ALPACA_API_SECRET")
+    if not key or not sec:
+        return None
+
+    mode = (os.getenv("TRADING_MODE") or "").strip().lower()
+    if mode in ("paper", "live"):
+        paper = (mode == "paper")
+    else:
+        paper = _env_bool("ALPACA_PAPER", True)
+
+    try:
+        return TradingClient(key, sec, paper=paper)
+    except Exception:
+        return None
+
+
+def _fetch_live_state() -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "account": None,
+        "positions": [],
+        "open_orders": [],
+        "error": None,
+    }
+
+    tc = _make_trading_client()
+    if tc is None:
+        out["error"] = "TradingClient unavailable or missing Alpaca credentials"
+        return out
+
+    try:
+        account = tc.get_account()
+        out["account"] = account
+    except Exception as e:
+        out["error"] = f"account_error: {e!r}"
+        return out
+
+    try:
+        positions = tc.get_all_positions() or []
+        out["positions"] = [p for p in positions if _safe_float(getattr(p, "qty", 0), 0.0)]
+    except Exception as e:
+        out["error"] = f"positions_error: {e!r}"
+
+    try:
+        if GetOrdersRequest is not None and QueryOrderStatus is not None:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200, nested=True)
+            out["open_orders"] = tc.get_orders(filter=req) or []
+    except Exception as e:
+        if out["error"]:
+            out["error"] += f" | open_orders_error: {e!r}"
+        else:
+            out["error"] = f"open_orders_error: {e!r}"
+
+    return out
+
+
+def _fetch_latest_snapshot(con) -> Optional[Tuple]:
+    q = text("""
+    SELECT
+      ts, equity, cash, buying_power, portfolio_value,
+      long_market_value, short_market_value,
+      daytrade_count, daytrading_buying_power, account_status
+    FROM equity_snapshots
+    ORDER BY ts DESC
+    LIMIT 1
+    """)
+    return con.execute(q).fetchone()
+
+
+def _fetch_daily_equity(con, days: int) -> List[Tuple]:
+    q = text("""
     WITH x AS (
       SELECT
         date_trunc('day', ts) AS day_utc,
@@ -33,7 +152,7 @@ def main() -> None:
       WHERE ts >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval
         AND equity IS NOT NULL
     ),
-    first_last AS (
+    agg AS (
       SELECT DISTINCT ON (day_utc)
         day_utc,
         FIRST_VALUE(equity) OVER (PARTITION BY day_utc ORDER BY ts ASC)  AS open_equity,
@@ -45,94 +164,234 @@ def main() -> None:
     )
     SELECT
       day_utc::date AS day,
-      round(open_equity::numeric, 2)  AS open_equity,
-      round(close_equity::numeric, 2) AS close_equity,
-      round((close_equity - open_equity)::numeric, 2) AS pnl,
-      CASE WHEN open_equity > 0 THEN round(((close_equity - open_equity)/open_equity*100)::numeric, 2) ELSE NULL END AS pnl_pct,
+      open_equity,
+      close_equity,
+      (close_equity - open_equity) AS pnl,
+      CASE
+        WHEN open_equity > 0 THEN ((close_equity - open_equity) / open_equity * 100.0)
+        ELSE NULL
+      END AS pnl_pct,
       first_ts,
       last_ts
-    FROM first_last
-    ORDER BY day DESC;
+    FROM agg
+    ORDER BY day DESC
     """)
+    return list(con.execute(q, {"days": days}).fetchall())
 
-    # today snapshot
-    q_latest = text("""
-    SELECT ts, equity, cash, daytrade_count
-    FROM equity_snapshots
-    ORDER BY ts DESC
-    LIMIT 1;
-    """)
 
-    # current position (latest snapshot per symbol)
-    q_pos = text("""
-    WITH x AS (
-      SELECT *,
-        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) rn
-      FROM position_snapshots
-      WHERE ts >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval
-    )
-    SELECT ts, symbol, qty, current_price, unrealized_pl, unrealized_plpc
-    FROM x
-    WHERE rn=1
-    ORDER BY symbol;
-    """)
-
-    # closed orders summary last N days (from alpaca_orders)
-    q_orders = text("""
+def _fetch_today_order_summary(con) -> Optional[Tuple]:
+    q = text("""
     SELECT
+      COUNT(*) FILTER (WHERE LOWER(status) = 'filled') AS filled_total,
+      COUNT(*) FILTER (WHERE LOWER(status) = 'filled' AND LOWER(side) = 'buy') AS filled_buys,
+      COUNT(*) FILTER (WHERE LOWER(status) = 'filled' AND LOWER(side) = 'sell') AS filled_sells,
+      COUNT(*) FILTER (WHERE LOWER(status) = 'canceled') AS canceled_total,
+      COUNT(DISTINCT symbol) FILTER (WHERE symbol IS NOT NULL AND symbol <> '') AS symbols_total,
+      COALESCE(SUM(CASE WHEN LOWER(status) = 'filled' AND LOWER(side) = 'buy'  THEN COALESCE(notional, 0) ELSE 0 END), 0) AS buy_notional,
+      COALESCE(SUM(CASE WHEN LOWER(status) = 'filled' AND LOWER(side) = 'sell' THEN COALESCE(notional, 0) ELSE 0 END), 0) AS sell_notional
+    FROM alpaca_orders
+    WHERE recorded_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+      AND recorded_at <  date_trunc('day', NOW() AT TIME ZONE 'UTC') + interval '1 day'
+    """)
+    return con.execute(q).fetchone()
+
+
+def _fetch_recent_order_rows(con, days: int, limit_rows: int = 20) -> List[Tuple]:
+    q = text("""
+    SELECT
+      recorded_at,
       symbol,
       side,
       status,
-      count(*) AS n,
-      round(sum(COALESCE(notional, 0))::numeric, 2) AS notional_sum
+      type,
+      qty,
+      filled_qty,
+      filled_avg_price,
+      notional,
+      client_order_id
     FROM alpaca_orders
     WHERE recorded_at >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval
-    GROUP BY symbol, side, status
-    ORDER BY symbol, side, status;
+    ORDER BY recorded_at DESC
+    LIMIT :limit_rows
     """)
+    return list(con.execute(q, {"days": days, "limit_rows": limit_rows}).fetchall())
+
+
+def _fetch_system_flags(con) -> Dict[str, str]:
+    q = text("""
+    SELECT key, value
+    FROM system_flags
+    WHERE key LIKE 'GUARD_%' OR key LIKE 'TRADING_%'
+    """)
+    rows = con.execute(q).fetchall()
+    return {str(r[0]): "" if r[1] is None else str(r[1]) for r in rows}
+
+
+def _build_verdict(
+    flags: Dict[str, str],
+    live_positions: List[Any],
+    live_open_orders: List[Any],
+    latest_snapshot: Optional[Tuple],
+) -> Tuple[str, str]:
+    guard_status = flags.get("GUARD_STATUS", "")
+    trading_paused = flags.get("TRADING_PAUSED", "")
+    paused_reason = flags.get("TRADING_PAUSED_REASON", "")
+    daytrade_count = None
+    if latest_snapshot is not None:
+        daytrade_count = latest_snapshot[7]
+
+    if trading_paused == "1":
+        return "ACTION NEEDED", f"TRADING_PAUSED=1 reason={paused_reason or '-'}"
+
+    if live_positions and not live_open_orders:
+        syms = ",".join(sorted({str(getattr(p, 'symbol', '?')) for p in live_positions}))
+        return "ACTION NEEDED", f"open position(s) without open exit order(s): {syms}"
+
+    if isinstance(guard_status, str) and guard_status.startswith("ERROR"):
+        return "WARNING", f"guard reports ERROR: {guard_status}"
+
+    if isinstance(guard_status, str) and guard_status.startswith("NO_DATA"):
+        return "WARNING", f"guard reports NO_DATA: {guard_status}"
+
+    if daytrade_count is not None and int(daytrade_count or 0) >= 3:
+        return "WARNING", f"PDT/daytrade guard threshold reached: daytrade_count={daytrade_count}"
+
+    return "OK", "system looks healthy"
+
+
+def main() -> None:
+    days = _env_int("REPORT_DAYS", 14)
+    engine = create_engine(_get_db_url())
 
     with engine.connect() as con:
-        latest = con.execute(q_latest).fetchone()
-        daily = con.execute(q_daily, {"days": days}).fetchall()
-        pos = con.execute(q_pos, {"days": days}).fetchall()
-        orders = con.execute(q_orders, {"days": days}).fetchall()
+        latest = _fetch_latest_snapshot(con)
+        daily = _fetch_daily_equity(con, days)
+        today_orders = _fetch_today_order_summary(con)
+        recent_orders = _fetch_recent_order_rows(con, days, limit_rows=20)
+        flags = _fetch_system_flags(con)
 
-    print("=" * 80)
-    print(f"DAILY REPORT (UTC) | last {days} days | generated_at_utc={datetime.now(timezone.utc).isoformat()}")
-    print("=" * 80)
+    live = _fetch_live_state()
+    live_account = live["account"]
+    live_positions = live["positions"]
+    live_open_orders = live["open_orders"]
+    live_error = live["error"]
 
-    if latest:
-        print("\nLatest snapshot:")
-        print(f"  ts={latest[0]} equity={latest[1]} cash={latest[2]} daytrade_count={latest[3]}")
+    verdict, verdict_detail = _build_verdict(flags, live_positions, live_open_orders, latest)
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    print("=" * 100)
+    print(f"DAILY REPORT V2 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print("=" * 100)
+
+    print("\n[1] ACCOUNT SNAPSHOT")
+    if latest is None:
+        print("  latest_db_snapshot: (none)")
     else:
-        print("\nLatest snapshot: (none)")
+        print(f"  latest_db_ts={latest[0]}")
+        print(f"  equity={_fmt_num(latest[1])} | cash={_fmt_num(latest[2])} | buying_power={_fmt_num(latest[3])}")
+        print(f"  portfolio_value={_fmt_num(latest[4])} | long_mv={_fmt_num(latest[5])} | short_mv={_fmt_num(latest[6])}")
+        print(f"  daytrade_count={latest[7]} | dtbp={_fmt_num(latest[8])} | account_status={latest[9]}")
 
-    print("\nEquity by day (UTC):")
+    if live_account is not None:
+        print("  live_account:")
+        print(
+            f"    status={getattr(live_account, 'status', None)}"
+            f" | trading_blocked={getattr(live_account, 'trading_blocked', None)}"
+            f" | account_blocked={getattr(live_account, 'account_blocked', None)}"
+            f" | pattern_day_trader={getattr(live_account, 'pattern_day_trader', None)}"
+            f" | daytrade_count={getattr(live_account, 'daytrade_count', None)}"
+            f" | daytrading_buying_power={getattr(live_account, 'daytrading_buying_power', None)}"
+        )
+    else:
+        print(f"  live_account: unavailable ({live_error or 'unknown'})")
+
+    print("\n[2] GUARD / SYSTEM FLAGS")
+    if not flags:
+        print("  (no flags)")
+    else:
+        wanted = [
+            "GUARD_STATUS",
+            "GUARD_LAST_DAY",
+            "GUARD_LAST_EQUITY_OPEN",
+            "GUARD_LAST_EQUITY_LAST",
+            "GUARD_LAST_PNL_USD",
+            "GUARD_LAST_PNL_PCT",
+            "GUARD_HEARTBEAT_TS",
+            "TRADING_PAUSED",
+            "TRADING_PAUSED_REASON",
+        ]
+        for k in wanted:
+            print(f"  {k}={flags.get(k, '')}")
+
+    print("\n[3] DAILY EQUITY SUMMARY")
     if not daily:
         print("  (no rows)")
     else:
         for r in daily:
-            # (day, open_equity, close_equity, pnl, pnl_pct, first_ts, last_ts)
-            print(f"  {r[0]}  open={r[1]}  close={r[2]}  pnl={r[3]}  pnl%={r[4]}  samples=({r[5]}..{r[6]})")
+            print(
+                f"  {r[0]} | open={_fmt_num(r[1])} | close={_fmt_num(r[2])} | "
+                f"pnl={_fmt_num(r[3])} | pnl_pct={_fmt_pct(r[4])} | samples=({r[5]} .. {r[6]})"
+            )
 
-    print("\nCurrent positions (latest snapshots):")
-    if not pos:
-        print("  (no positions in snapshots)")
+    print("\n[4] TODAY ORDER SUMMARY (from alpaca_orders by recorded_at UTC day)")
+    if today_orders is None:
+        print("  (no summary)")
     else:
-        for r in pos:
-            print(f"  {r[1]} qty={r[2]} px={r[3]} uPnL={r[4]} uPnL%={r[5]} ts={r[0]}")
+        print(
+            f"  filled_total={today_orders[0]} | filled_buys={today_orders[1]} | "
+            f"filled_sells={today_orders[2]} | canceled_total={today_orders[3]} | "
+            f"symbols_total={today_orders[4]}"
+        )
+        print(
+            f"  buy_notional={_fmt_num(today_orders[5])} | "
+            f"sell_notional={_fmt_num(today_orders[6])} | "
+            f"net_cashflow={_fmt_num((today_orders[6] or 0) - (today_orders[5] or 0))}"
+        )
 
-    print("\nOrders summary (alpaca_orders):")
-    if not orders:
-        print("  (no orders)")
+    print("\n[5] LIVE POSITIONS")
+    if not live_positions:
+        print("  (no live positions)")
     else:
-        for r in orders:
-            print(f"  {r[0]} | {r[1]} | {r[2]} | n={r[3]} | notional_sum={r[4]}")
+        for p in live_positions:
+            print(
+                f"  {getattr(p, 'symbol', '?')} | qty={getattr(p, 'qty', '?')} | "
+                f"avg_entry={getattr(p, 'avg_entry_price', '?')} | current={getattr(p, 'current_price', '?')} | "
+                f"uPnL={getattr(p, 'unrealized_pl', '?')} | uPnL%={getattr(p, 'unrealized_plpc', '?')}"
+            )
+
+    print("\n[6] LIVE OPEN ORDERS")
+    if not live_open_orders:
+        print("  (no live open orders)")
+    else:
+        for o in live_open_orders:
+            print(
+                f"  {getattr(o, 'symbol', '?')} | side={getattr(o, 'side', '?')} | "
+                f"type={getattr(o, 'type', '?')} | status={getattr(o, 'status', '?')} | "
+                f"tif={getattr(o, 'time_in_force', '?')} | stop={getattr(o, 'stop_price', None)} | "
+                f"limit={getattr(o, 'limit_price', None)} | cid={getattr(o, 'client_order_id', '')}"
+            )
+
+    print("\n[7] RECENT ORDER ROWS (last 20 from alpaca_orders)")
+    if not recent_orders:
+        print("  (no recent orders)")
+    else:
+        for r in recent_orders:
+            print(
+                f"  {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | "
+                f"qty={r[5]} | filled_qty={r[6]} | fill_px={r[7]} | notional={r[8]} | cid={r[9]}"
+            )
+
+    print("\n[8] FINAL VERDICT")
+    print(f"  status={verdict}")
+    print(f"  detail={verdict_detail}")
 
     print("\nNotes:")
-    print("  - Equity PnL is based on snapshots; for more accurate daily close, increase snapshot frequency or align to market close.")
-    print("  - With small account + PDT limits, prefer swing holds (>1 day).")
-    print("=" * 80)
+    print("  - Equity by day is based on equity_snapshots.")
+    print("  - Today order summary is based on alpaca_orders.recorded_at in UTC day.")
+    print("  - Live positions/open orders come from Alpaca API when credentials are available.")
+    print("  - If status=WARNING or ACTION NEEDED, inspect positions/open orders/flags first.")
+    print("=" * 100)
 
 
 if __name__ == "__main__":
