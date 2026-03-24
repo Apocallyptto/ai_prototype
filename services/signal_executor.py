@@ -1,6 +1,5 @@
 ﻿import os
 import time
-import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Set, Tuple
@@ -9,6 +8,7 @@ from sqlalchemy import text, bindparam
 
 from tools.db import get_engine
 from tools.system_flags import get_flag
+from tools.execution_audit import log_blocked_signal, log_submitted_order
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
@@ -70,7 +70,7 @@ class Cfg:
     exit_on_sell_signal: bool
     min_hold_minutes: int
 
-    # confidence sizing (AI feeling)
+    # confidence sizing
     confidence_sizing: bool
     notional_min: float
     notional_max: float
@@ -121,6 +121,37 @@ def _round_price(p: float) -> float:
     return float(f"{p:.2f}")
 
 
+def _safe_audit_block(sig: Optional[Dict[str, Any]], reason: str, detail: str) -> None:
+    try:
+        log_blocked_signal(
+            symbol=(sig or {}).get("symbol"),
+            side=(sig or {}).get("side"),
+            strength=(sig or {}).get("strength"),
+            source=(sig or {}).get("source"),
+            portfolio_id=(sig or {}).get("portfolio_id"),
+            signal_ts=(sig or {}).get("created_at"),
+            reason=reason,
+            detail=detail,
+        )
+    except Exception as e:
+        LOG.warning("audit_block_failed | reason=%s err=%r", reason, e)
+
+
+def _safe_audit_submit(sig: Optional[Dict[str, Any]], detail: str) -> None:
+    try:
+        log_submitted_order(
+            symbol=(sig or {}).get("symbol"),
+            side=(sig or {}).get("side"),
+            strength=(sig or {}).get("strength"),
+            source=(sig or {}).get("source"),
+            portfolio_id=(sig or {}).get("portfolio_id"),
+            signal_ts=(sig or {}).get("created_at"),
+            detail=detail,
+        )
+    except Exception as e:
+        LOG.warning("audit_submit_failed | err=%r", e)
+
+
 def _load_cfg() -> Cfg:
     cfg = Cfg()
     cfg.poll_seconds = int(os.getenv("EXECUTOR_POLL_SECONDS", os.getenv("POLL_SECONDS", "20")))
@@ -156,23 +187,19 @@ def _load_cfg() -> Cfg:
 
     cfg.allow_fractional_market = _env_bool("ALLOW_FRACTIONAL_MARKET", True)
 
-    # safety gates
     cfg.exit_prefix = (os.getenv("EXIT_PREFIX") or "EXIT-OCO-").strip()
     cfg.pause_on_unprotected_positions = _env_bool("PAUSE_ON_UNPROTECTED_POSITIONS", True)
     cfg.pause_on_account_blocked = _env_bool("PAUSE_ON_ACCOUNT_BLOCKED", True)
     cfg.pause_on_pdt_flag = _env_bool("PAUSE_ON_PDT_FLAG", False)
 
-    # swing / PDT safety
     cfg.exit_on_sell_signal = _env_bool("EXIT_ON_SELL_SIGNAL", False)
     cfg.min_hold_minutes = int(os.getenv("MIN_HOLD_MINUTES", "0"))
 
-    # confidence sizing (AI-like sizing)
     cfg.confidence_sizing = _env_bool("CONFIDENCE_SIZING", True)
     cfg.notional_min = float(os.getenv("NOTIONAL_MIN", "5"))
     cfg.notional_max = float(os.getenv("NOTIONAL_MAX", str(cfg.max_notional)))
     cfg.confidence_full_strength = float(os.getenv("CONFIDENCE_FULL_STRENGTH", "1.0"))
 
-    # sanitize + cap
     if cfg.notional_min < 0:
         cfg.notional_min = 0.0
     if cfg.notional_max < 0:
@@ -180,9 +207,7 @@ def _load_cfg() -> Cfg:
     if cfg.notional_min > cfg.notional_max:
         cfg.notional_min, cfg.notional_max = cfg.notional_max, cfg.notional_min
 
-    # hard cap by MAX_NOTIONAL
     cfg.notional_max = min(cfg.notional_max, cfg.max_notional)
-
     return cfg
 
 
@@ -285,15 +310,15 @@ def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
             dtc_int = None
 
         if dtc_int is not None and dtc_int >= pause_on_daytrade_ge:
-            return True, reason + f" PAUSE_ON_DAYTRADE_COUNT_GE={pause_on_daytrade_ge}"
+            return True, reason + f" PAUSE_ON_DAYTRADE_COUNT_GE={pause_on_daytrade_ge}", "pdt_gate"
 
         if trading_blocked or account_blocked:
-            return True, reason
+            return True, reason, "account_blocked"
         if pause_on_pdt_flag and pdt:
-            return True, reason
-        return False, reason
+            return True, reason, "pdt_flag"
+        return False, reason, ""
     except Exception as e:
-        return False, f"account_check_failed err={e!r}"
+        return False, f"account_check_failed err={e!r}", ""
 
 
 def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
@@ -326,7 +351,7 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
     q = (
         text(
             """
-            SELECT id, created_at, symbol, side, strength, price
+            SELECT id, created_at, symbol, side, strength, price, source, portfolio_id
             FROM signals
             WHERE portfolio_id=:pid
               AND symbol IN :symbols
@@ -414,12 +439,6 @@ def _place_market_notional(tc: TradingClient, symbol: str, side: str, notional: 
 
 
 def _scaled_notional(cfg: Cfg, strength: float) -> float:
-    """
-    Map strength -> notional (USD), linearly:
-      strength == cfg.min_strength -> cfg.notional_min
-      strength == cfg.confidence_full_strength -> cfg.notional_max
-    Always capped by cfg.max_notional.
-    """
     cap = float(cfg.max_notional)
     if not getattr(cfg, "confidence_sizing", False):
         return float(f"{cap:.2f}")
@@ -489,20 +508,21 @@ def main() -> None:
 
     seen_signal_ids: Set[int] = set()
     last_submit_ts_by_symbol: Dict[str, float] = {}
-
-    # best-effort entry timestamps (for MIN_HOLD_MINUTES). Safe fallback: if unknown -> don't exit on sell.
     last_entry_ts_by_symbol: Dict[str, float] = {}
 
     while True:
         try:
-            # DB-controlled pause (auto-guard)
-            if get_flag("TRADING_PAUSED", "0") == "1":
-                LOG.warning("trading_paused_by_db_flag | reason=%s", get_flag("TRADING_PAUSED_REASON", ""))
+            db_paused = get_flag("TRADING_PAUSED", "0") == "1"
+            db_pause_reason = get_flag("TRADING_PAUSED_REASON", "")
+            if db_paused:
+                LOG.warning("trading_paused_by_db_flag | reason=%s", db_pause_reason)
+                _safe_audit_block(None, "trading_paused_db", f"reason={db_pause_reason}")
                 time.sleep(cfg.poll_seconds)
                 continue
 
             if cfg.trading_paused:
                 LOG.info("trading_paused | sleep=%ss", cfg.poll_seconds)
+                _safe_audit_block(None, "trading_paused_cfg", "TRADING_PAUSED config is enabled")
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -514,6 +534,7 @@ def main() -> None:
                             pass
                         else:
                             LOG.info("market_closed | sleep=%ss", cfg.poll_seconds)
+                            _safe_audit_block(None, "market_closed", "market is closed and preopen window not active")
                             time.sleep(cfg.poll_seconds)
                             continue
                 except Exception as e:
@@ -521,6 +542,7 @@ def main() -> None:
                         LOG.warning("clock_error allow_trade_on_clock_error=True | %r", e)
                     else:
                         LOG.warning("clock_error FAIL_CLOSED allow_trade_on_clock_error=False | %r", e)
+                        _safe_audit_block(None, "clock_error_fail_closed", repr(e))
                         time.sleep(cfg.poll_seconds)
                         continue
 
@@ -528,21 +550,23 @@ def main() -> None:
             positions = _get_positions(tc)
 
             if cfg.pause_on_account_blocked:
-                blocked, reason = _is_account_blocked(tc, cfg.pause_on_pdt_flag)
+                blocked, reason, reason_code = _is_account_blocked(tc, cfg.pause_on_pdt_flag)
                 if blocked:
                     LOG.warning("gate_account_blocked | %s | sleep=%ss", reason, cfg.poll_seconds)
+                    _safe_audit_block(None, reason_code or "account_blocked", reason)
                     time.sleep(cfg.poll_seconds)
                     continue
 
             if cfg.pause_on_unprotected_positions:
                 unprot = _unprotected_symbols(positions, open_orders, cfg.exit_prefix)
                 if unprot:
+                    detail = f"exit_prefix={cfg.exit_prefix} unprotected={unprot}"
                     LOG.warning(
-                        "gate_unprotected_positions | exit_prefix=%s unprotected=%s | sleep=%ss",
-                        cfg.exit_prefix,
-                        unprot,
+                        "gate_unprotected_positions | %s | sleep=%ss",
+                        detail,
                         cfg.poll_seconds,
                     )
+                    _safe_audit_block(None, "unprotected_positions", detail)
                     time.sleep(cfg.poll_seconds)
                     continue
 
@@ -555,31 +579,25 @@ def main() -> None:
                     sym = str(getattr(p, "symbol", "") or "").upper()
                     live_pos.append((sym, qty))
                 if len(live_pos) >= cfg.max_open_positions:
-                    LOG.info(
-                        "gate_max_open_positions | have=%s limit=%s | positions=%s | sleep=%ss",
-                        len(live_pos),
-                        cfg.max_open_positions,
-                        live_pos,
-                        cfg.poll_seconds,
-                    )
+                    detail = f"have={len(live_pos)} limit={cfg.max_open_positions} positions={live_pos}"
+                    LOG.info("gate_max_open_positions | %s | sleep=%ss", detail, cfg.poll_seconds)
+                    _safe_audit_block(None, "max_open_positions", detail)
                     time.sleep(cfg.poll_seconds)
                     continue
 
             if cfg.max_open_orders > 0:
                 entry_open = _count_open_entry_orders(open_orders)
                 if entry_open >= cfg.max_open_orders:
-                    LOG.info(
-                        "gate_max_open_orders | have=%s limit=%s | sleep=%ss",
-                        entry_open,
-                        cfg.max_open_orders,
-                        cfg.poll_seconds,
-                    )
+                    detail = f"have={entry_open} limit={cfg.max_open_orders}"
+                    LOG.info("gate_max_open_orders | %s | sleep=%ss", detail, cfg.poll_seconds)
+                    _safe_audit_block(None, "max_open_orders", detail)
                     time.sleep(cfg.poll_seconds)
                     continue
 
             sig = _pick_signal(engine, cfg, seen_signal_ids)
             if not sig:
                 LOG.info("no_signal | sleep=%ss", cfg.poll_seconds)
+                _safe_audit_block(None, "no_signal", "no eligible fresh signal selected by picker")
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -592,17 +610,19 @@ def main() -> None:
             now_ts = time.time()
             last_ts = last_submit_ts_by_symbol.get(symbol, 0.0)
             if cfg.symbol_cooldown_seconds > 0 and (now_ts - last_ts) < cfg.symbol_cooldown_seconds:
-                LOG.info("cooldown_skip | symbol=%s cooldown=%ss", symbol, cfg.symbol_cooldown_seconds)
+                detail = f"symbol={symbol} cooldown={cfg.symbol_cooldown_seconds}s"
+                LOG.info("cooldown_skip | %s", detail)
+                _safe_audit_block(sig, "cooldown", detail)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             if side not in ("buy", "sell"):
                 LOG.info("skip invalid side | %s", side)
+                _safe_audit_block(sig, "invalid_side", f"side={side}")
                 seen_signal_ids.add(sig_id)
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # long-only sell handling (optional exit)
             if cfg.long_only and side == "sell":
                 pos_qty = 0.0
                 for p in positions:
@@ -613,7 +633,9 @@ def main() -> None:
 
                 if pos_qty > 0:
                     if not cfg.exit_on_sell_signal:
-                        LOG.info("skip sell signal (EXIT_ON_SELL_SIGNAL=0) | symbol=%s", symbol)
+                        detail = f"symbol={symbol} EXIT_ON_SELL_SIGNAL=0"
+                        LOG.info("skip sell signal | %s", detail)
+                        _safe_audit_block(sig, "sell_disabled_long_only", detail)
                         seen_signal_ids.add(sig_id)
                         time.sleep(cfg.poll_seconds)
                         continue
@@ -621,11 +643,9 @@ def main() -> None:
                     if cfg.min_hold_minutes > 0:
                         entry_ts = last_entry_ts_by_symbol.get(symbol)
                         if not entry_ts:
-                            LOG.warning(
-                                "skip sell exit (min_hold active but entry_ts unknown) | symbol=%s MIN_HOLD_MINUTES=%s",
-                                symbol,
-                                cfg.min_hold_minutes,
-                            )
+                            detail = f"symbol={symbol} MIN_HOLD_MINUTES={cfg.min_hold_minutes} entry_ts unknown"
+                            LOG.warning("skip sell exit | %s", detail)
+                            _safe_audit_block(sig, "min_hold_entry_ts_unknown", detail)
                             seen_signal_ids.add(sig_id)
                             time.sleep(cfg.poll_seconds)
                             continue
@@ -633,19 +653,18 @@ def main() -> None:
                         hold_sec = cfg.min_hold_minutes * 60
                         age_sec = now_ts - entry_ts
                         if age_sec < hold_sec:
-                            LOG.info(
-                                "skip sell exit (min_hold) | symbol=%s age_sec=%.1f < hold_sec=%s",
-                                symbol,
-                                age_sec,
-                                hold_sec,
-                            )
+                            detail = f"symbol={symbol} age_sec={age_sec:.1f} hold_sec={hold_sec}"
+                            LOG.info("skip sell exit | %s", detail)
+                            _safe_audit_block(sig, "min_hold_not_reached", detail)
                             seen_signal_ids.add(sig_id)
                             time.sleep(cfg.poll_seconds)
                             continue
 
                     cid = f"X-{symbol}-STC-{sig_id}"
                     if cfg.dry_run:
-                        LOG.info("DRY_RUN exit_long | symbol=%s qty=%s cid=%s", symbol, pos_qty, cid)
+                        detail = f"DRY_RUN exit_long symbol={symbol} qty={pos_qty} cid={cid}"
+                        LOG.info(detail)
+                        _safe_audit_submit(sig, detail)
                     else:
                         req = MarketOrderRequest(
                             symbol=symbol,
@@ -658,20 +677,25 @@ def main() -> None:
                         )
                         o = tc.submit_order(order_data=req)
                         oid = str(getattr(o, "id", "") or "")
-                        LOG.info("exit_long_submitted | symbol=%s qty=%s oid=%s cid=%s", symbol, pos_qty, oid, cid)
+                        detail = f"exit_long_submitted symbol={symbol} qty={pos_qty} oid={oid} cid={cid}"
+                        LOG.info(detail)
+                        _safe_audit_submit(sig, detail)
 
                     seen_signal_ids.add(sig_id)
                     last_submit_ts_by_symbol[symbol] = now_ts
                     time.sleep(cfg.poll_seconds)
                     continue
 
-                LOG.info("skip sell (long_only, no long to close) | symbol=%s", symbol)
+                detail = f"symbol={symbol} long_only and no long to close"
+                LOG.info("skip sell | %s", detail)
+                _safe_audit_block(sig, "sell_no_position", detail)
                 seen_signal_ids.add(sig_id)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             if price <= 0:
                 LOG.info("skip no_price | %s", symbol)
+                _safe_audit_block(sig, "no_price", f"symbol={symbol} price={price}")
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -683,28 +707,33 @@ def main() -> None:
                         cur_qty = float(getattr(p, "qty", 0) or 0)
                         break
                 if cur_qty != 0:
-                    LOG.info("skip_add_to_position | %s qty=%s", symbol, cur_qty)
+                    detail = f"symbol={symbol} current_qty={cur_qty}"
+                    LOG.info("skip_add_to_position | %s", detail)
+                    _safe_audit_block(sig, "add_to_position_blocked", detail)
                     seen_signal_ids.add(sig_id)
                     last_submit_ts_by_symbol[symbol] = now_ts
                     time.sleep(cfg.poll_seconds)
                     continue
 
             if not _dedupe_ok(engine, symbol, side, cfg.alpaca_dedupe_minutes):
-                LOG.info("dedupe_skip | %s %s", symbol, side)
+                detail = f"symbol={symbol} side={side} dedupe_minutes={cfg.alpaca_dedupe_minutes}"
+                LOG.info("dedupe_skip | %s", detail)
+                _safe_audit_block(sig, "dedupe", detail)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             if cfg.cancel_opposite_open_orders:
                 _cancel_opposite(tc, symbol, side, open_orders)
 
-            # === CONFIDENCE-BASED SIZING (BUY) ===
             trade_notional = cfg.max_notional
             if side == "buy":
                 trade_notional = _scaled_notional(cfg, strength)
 
             qty = _qty_from_notional(cfg, price, trade_notional)
             if qty <= 0:
-                LOG.info("skip qty<=0 | %s", symbol)
+                detail = f"symbol={symbol} side={side} price={price} trade_notional={trade_notional}"
+                LOG.info("skip qty<=0 | %s", detail)
+                _safe_audit_block(sig, "qty_zero", detail)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -712,58 +741,46 @@ def main() -> None:
             notional = 0.0
             limit_price = price
 
-            # Use market-notional for fractional BUYs
             if cfg.allow_fractional_market and side == "buy" and qty < 1.0:
                 kind = "MARKET_NOTIONAL"
                 notional = float(f"{trade_notional:.2f}")
                 if notional <= 0:
-                    LOG.info("skip notional<=0 | %s", symbol)
+                    detail = f"symbol={symbol} side={side} notional={notional}"
+                    LOG.info("skip notional<=0 | %s", detail)
+                    _safe_audit_block(sig, "qty_zero", detail)
                     time.sleep(cfg.poll_seconds)
                     continue
 
             client_order_id = _mk_client_order_id(symbol, side, sig_id, kind)
 
             if cfg.dry_run:
-                LOG.info(
-                    "DRY_RUN would_submit | symbol=%s side=%s kind=%s notional=%.2f qty=%.6f price=%.4f strength=%.4f cid=%s",
-                    symbol,
-                    side,
-                    kind,
-                    float(trade_notional),
-                    qty,
-                    price,
-                    strength,
-                    client_order_id,
+                detail = (
+                    f"DRY_RUN would_submit symbol={symbol} side={side} kind={kind} "
+                    f"notional={float(trade_notional):.2f} qty={qty:.6f} price={price:.4f} "
+                    f"strength={strength:.4f} cid={client_order_id}"
                 )
+                LOG.info(detail)
+                _safe_audit_submit(sig, detail)
                 if side == "buy":
                     last_entry_ts_by_symbol[symbol] = now_ts
             else:
                 if kind == "MARKET_NOTIONAL":
                     oid = _place_market_notional(tc, symbol, side, notional, client_order_id)
-                    LOG.info(
-                        "submitted | %s %s kind=%s notional=%.2f oid=%s strength=%.4f cid=%s",
-                        symbol,
-                        side,
-                        kind,
-                        notional,
-                        oid,
-                        strength,
-                        client_order_id,
+                    detail = (
+                        f"submitted symbol={symbol} side={side} kind={kind} "
+                        f"notional={notional:.2f} oid={oid} strength={strength:.4f} cid={client_order_id}"
                     )
+                    LOG.info(detail)
+                    _safe_audit_submit(sig, detail)
                 else:
                     oid = _place_limit(tc, symbol, side, qty, limit_price, client_order_id)
-                    LOG.info(
-                        "submitted | %s %s kind=%s qty=%.6f limit=%.4f notional=%.2f oid=%s strength=%.4f cid=%s",
-                        symbol,
-                        side,
-                        kind,
-                        qty,
-                        limit_price,
-                        float(trade_notional),
-                        oid,
-                        strength,
-                        client_order_id,
+                    detail = (
+                        f"submitted symbol={symbol} side={side} kind={kind} qty={qty:.6f} "
+                        f"limit={limit_price:.4f} notional={float(trade_notional):.2f} "
+                        f"oid={oid} strength={strength:.4f} cid={client_order_id}"
                     )
+                    LOG.info(detail)
+                    _safe_audit_submit(sig, detail)
 
                 if side == "buy":
                     last_entry_ts_by_symbol[symbol] = now_ts
