@@ -98,6 +98,21 @@ def _normalize_side(side: Any) -> str:
     return s
 
 
+def _normalize_status(status: Any) -> str:
+    s = str(status or "").strip().lower()
+    if s.endswith(".filled") or s == "filled":
+        return "filled"
+    if s.endswith(".canceled") or s == "canceled":
+        return "canceled"
+    if s.endswith(".cancelled") or s == "cancelled":
+        return "canceled"
+    if s.endswith(".new") or s == "new":
+        return "new"
+    if s.endswith(".open") or s == "open":
+        return "open"
+    return s
+
+
 def _make_trading_client():
     if TradingClient is None:
         return None
@@ -239,21 +254,66 @@ def _fetch_daily_equity(con, days: int) -> List[Tuple]:
     return list(con.execute(q, {"days": days}).fetchall())
 
 
-def _fetch_today_order_summary(con) -> Optional[Tuple]:
+def _fetch_today_order_rows(con) -> List[Tuple]:
     q = text("""
     SELECT
-      COUNT(*) FILTER (WHERE LOWER(status) = 'filled') AS filled_total,
-      COUNT(*) FILTER (WHERE LOWER(side) LIKE '%buy') AS filled_buys,
-      COUNT(*) FILTER (WHERE LOWER(side) LIKE '%sell') AS filled_sells,
-      COUNT(*) FILTER (WHERE LOWER(status) = 'canceled') AS canceled_total,
-      COUNT(DISTINCT symbol) FILTER (WHERE symbol IS NOT NULL AND symbol <> '') AS symbols_total,
-      COALESCE(SUM(CASE WHEN LOWER(side) LIKE '%buy'  AND LOWER(status) = 'filled' THEN COALESCE(notional, 0) ELSE 0 END), 0) AS buy_notional,
-      COALESCE(SUM(CASE WHEN LOWER(side) LIKE '%sell' AND LOWER(status) = 'filled' THEN COALESCE(notional, 0) ELSE 0 END), 0) AS sell_notional
+      recorded_at,
+      symbol,
+      side,
+      status,
+      type,
+      qty,
+      filled_qty,
+      filled_avg_price,
+      notional,
+      client_order_id
     FROM alpaca_orders
     WHERE recorded_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
       AND recorded_at <  date_trunc('day', NOW() AT TIME ZONE 'UTC') + interval '1 day'
+    ORDER BY recorded_at ASC
     """)
-    return con.execute(q).fetchone()
+    return list(con.execute(q).fetchall())
+
+
+def _summarize_order_rows(rows: List[Tuple]) -> Dict[str, Any]:
+    filled_total = 0
+    filled_buys = 0
+    filled_sells = 0
+    canceled_total = 0
+    symbols = set()
+    buy_notional = 0.0
+    sell_notional = 0.0
+
+    for r in rows:
+        _, symbol, side, status, _, _, _, _, notional, _ = r
+        st = _normalize_status(status)
+        sd = _normalize_side(side)
+
+        if symbol:
+            symbols.add(str(symbol))
+
+        if st == "filled":
+            filled_total += 1
+            if sd == "buy":
+                filled_buys += 1
+                buy_notional += _safe_float(notional, 0.0) or 0.0
+            elif sd == "sell":
+                filled_sells += 1
+                sell_notional += _safe_float(notional, 0.0) or 0.0
+
+        if st == "canceled":
+            canceled_total += 1
+
+    return {
+        "filled_total": filled_total,
+        "filled_buys": filled_buys,
+        "filled_sells": filled_sells,
+        "canceled_total": canceled_total,
+        "symbols_total": len(symbols),
+        "buy_notional": buy_notional,
+        "sell_notional": sell_notional,
+        "net_cashflow": sell_notional - buy_notional,
+    }
 
 
 def _fetch_recent_order_rows(con, days: int, limit_rows: int = 20) -> List[Tuple]:
@@ -292,10 +352,10 @@ def _fetch_filled_order_rows(con, days: int) -> List[Tuple]:
       client_order_id
     FROM alpaca_orders
     WHERE recorded_at >= (NOW() AT TIME ZONE 'UTC') - (:days || ' days')::interval
-      AND LOWER(status) = 'filled'
     ORDER BY recorded_at ASC
     """)
-    return list(con.execute(q, {"days": days}).fetchall())
+    rows = list(con.execute(q, {"days": days}).fetchall())
+    return [r for r in rows if _normalize_status(r[3]) == "filled"]
 
 
 def _fetch_system_flags(con) -> Dict[str, str]:
@@ -453,11 +513,11 @@ def _fetch_signal_summary(con) -> Dict[str, Any]:
 
 def _build_execution_funnel(
     signal_summary: Dict[str, Any],
-    today_orders: Optional[Tuple],
+    today_order_summary: Dict[str, Any],
 ) -> Dict[str, Any]:
-    filled_total = int((today_orders[0] if today_orders is not None and today_orders[0] is not None else 0) or 0)
-    filled_buys = int((today_orders[1] if today_orders is not None and today_orders[1] is not None else 0) or 0)
-    filled_sells = int((today_orders[2] if today_orders is not None and today_orders[2] is not None else 0) or 0)
+    filled_total = int(today_order_summary.get("filled_total", 0) or 0)
+    filled_buys = int(today_order_summary.get("filled_buys", 0) or 0)
+    filled_sells = int(today_order_summary.get("filled_sells", 0) or 0)
 
     total_signals = int(signal_summary.get("total_signals_today") or 0)
     eligible_signals = int(signal_summary.get("eligible_signals_today") or 0)
@@ -486,13 +546,13 @@ def _build_execution_funnel(
 
 def _infer_block_summary(
     signal_summary: Dict[str, Any],
-    today_orders: Optional[Tuple],
+    today_order_summary: Dict[str, Any],
     latest_snapshot: Optional[Tuple],
     live_positions: List[Any],
     live_open_orders: List[Any],
     flags: Dict[str, str],
 ) -> Dict[str, Any]:
-    funnel = _build_execution_funnel(signal_summary, today_orders)
+    funnel = _build_execution_funnel(signal_summary, today_order_summary)
 
     max_open_positions = _env_int("MAX_OPEN_POSITIONS", 1)
     max_open_orders = _env_int("MAX_OPEN_ORDERS", 1)
@@ -627,14 +687,46 @@ def _build_realized_trade_summary(filled_rows: List[Tuple]) -> Dict[str, Any]:
     }
 
 
+def _build_aggregate_performance_summary(realized_summary: Dict[str, Any]) -> Dict[str, Any]:
+    closed_trades = realized_summary.get("closed_trades", []) or []
+
+    total_closed = len(closed_trades)
+    wins = [t for t in closed_trades if (t["pnl_usd"] or 0) > 0]
+    losses = [t for t in closed_trades if (t["pnl_usd"] or 0) < 0]
+    flats = [t for t in closed_trades if abs((t["pnl_usd"] or 0)) <= 1e-12]
+
+    total_realized_pnl = sum((t["pnl_usd"] or 0) for t in closed_trades)
+    avg_pnl_per_trade = (total_realized_pnl / total_closed) if total_closed else None
+    avg_win_usd = (sum(t["pnl_usd"] for t in wins) / len(wins)) if wins else None
+    avg_loss_usd = (sum(t["pnl_usd"] for t in losses) / len(losses)) if losses else None
+    win_rate = (len(wins) / total_closed * 100.0) if total_closed else None
+
+    best_trade = max(closed_trades, key=lambda t: t["pnl_usd"]) if closed_trades else None
+    worst_trade = min(closed_trades, key=lambda t: t["pnl_usd"]) if closed_trades else None
+
+    return {
+        "total_closed_trades": total_closed,
+        "wins": len(wins),
+        "losses": len(losses),
+        "flats": len(flats),
+        "win_rate": win_rate,
+        "total_realized_pnl": total_realized_pnl,
+        "avg_pnl_per_trade": avg_pnl_per_trade,
+        "avg_win_usd": avg_win_usd,
+        "avg_loss_usd": avg_loss_usd,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+    }
+
+
 def _classify_day(
     signal_summary: Dict[str, Any],
-    today_orders: Optional[Tuple],
+    today_order_summary: Dict[str, Any],
     flags: Dict[str, str],
     live_positions: List[Any],
     live_open_orders: List[Any],
 ) -> str:
-    funnel = _build_execution_funnel(signal_summary, today_orders)
+    funnel = _build_execution_funnel(signal_summary, today_order_summary)
     guard_status = flags.get("GUARD_STATUS", "")
     trading_paused = flags.get("TRADING_PAUSED", "")
 
@@ -727,7 +819,8 @@ def main() -> None:
     with engine.connect() as con:
         latest = _fetch_latest_snapshot(con)
         daily = _fetch_daily_equity(con, days)
-        today_orders = _fetch_today_order_summary(con)
+        today_order_rows = _fetch_today_order_rows(con)
+        today_order_summary = _summarize_order_rows(today_order_rows)
         recent_orders = _fetch_recent_order_rows(con, days, limit_rows=20)
         filled_rows = _fetch_filled_order_rows(con, days)
         flags = _fetch_system_flags(con)
@@ -741,7 +834,7 @@ def main() -> None:
 
     block_summary = _infer_block_summary(
         signal_summary=signal_summary,
-        today_orders=today_orders,
+        today_order_summary=today_order_summary,
         latest_snapshot=latest,
         live_positions=live_positions,
         live_open_orders=live_open_orders,
@@ -749,6 +842,7 @@ def main() -> None:
     )
     funnel = block_summary["funnel"]
     realized_summary = _build_realized_trade_summary(filled_rows)
+    aggregate_summary = _build_aggregate_performance_summary(realized_summary)
     verdict, verdict_detail = _build_verdict(
         flags=flags,
         live_positions=live_positions,
@@ -758,7 +852,7 @@ def main() -> None:
     )
     day_class = _classify_day(
         signal_summary=signal_summary,
-        today_orders=today_orders,
+        today_order_summary=today_order_summary,
         flags=flags,
         live_positions=live_positions,
         live_open_orders=live_open_orders,
@@ -775,7 +869,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc).isoformat()
 
     print("=" * 100)
-    print(f"DAILY REPORT V2.3.1 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print(f"DAILY REPORT V2.4 (UTC) | last {days} days | generated_at_utc={now_utc}")
     print("=" * 100)
 
     print("\n[0] OPERATOR SUMMARY")
@@ -833,19 +927,18 @@ def main() -> None:
             )
 
     print("\n[4] TODAY ORDER SUMMARY (from alpaca_orders by recorded_at UTC day)")
-    if today_orders is None:
-        print("  (no summary)")
-    else:
-        print(
-            f"  filled_total={today_orders[0]} | filled_buys={today_orders[1]} | "
-            f"filled_sells={today_orders[2]} | canceled_total={today_orders[3]} | "
-            f"symbols_total={today_orders[4]}"
-        )
-        print(
-            f"  buy_notional={_fmt_num(today_orders[5])} | "
-            f"sell_notional={_fmt_num(today_orders[6])} | "
-            f"net_cashflow={_fmt_num((today_orders[6] or 0) - (today_orders[5] or 0))}"
-        )
+    print(
+        f"  filled_total={today_order_summary['filled_total']} | "
+        f"filled_buys={today_order_summary['filled_buys']} | "
+        f"filled_sells={today_order_summary['filled_sells']} | "
+        f"canceled_total={today_order_summary['canceled_total']} | "
+        f"symbols_total={today_order_summary['symbols_total']}"
+    )
+    print(
+        f"  buy_notional={_fmt_num(today_order_summary['buy_notional'])} | "
+        f"sell_notional={_fmt_num(today_order_summary['sell_notional'])} | "
+        f"net_cashflow={_fmt_num(today_order_summary['net_cashflow'])}"
+    )
 
     print("\n[5] SIGNAL SUMMARY")
     if not signal_summary.get("available"):
@@ -914,16 +1007,47 @@ def main() -> None:
     else:
         print("  last_closed_trade=(none)")
 
+    print("\n[9] AGGREGATE PERFORMANCE SUMMARY")
+    print(
+        f"  total_closed_trades={aggregate_summary['total_closed_trades']} | "
+        f"wins={aggregate_summary['wins']} | losses={aggregate_summary['losses']} | flats={aggregate_summary['flats']}"
+    )
+    print(
+        f"  win_rate={_fmt_pct(aggregate_summary['win_rate'])} | "
+        f"total_realized_pnl={_fmt_num(aggregate_summary['total_realized_pnl'], 4)} | "
+        f"avg_pnl_per_trade={_fmt_num(aggregate_summary['avg_pnl_per_trade'], 4)}"
+    )
+    print(
+        f"  avg_win_usd={_fmt_num(aggregate_summary['avg_win_usd'], 4)} | "
+        f"avg_loss_usd={_fmt_num(aggregate_summary['avg_loss_usd'], 4)}"
+    )
+    best_trade = aggregate_summary["best_trade"]
+    worst_trade = aggregate_summary["worst_trade"]
+    if best_trade:
+        print(
+            f"  best_trade={best_trade['symbol']} | exit_ts={best_trade['exit_ts']} | "
+            f"pnl_usd={_fmt_num(best_trade['pnl_usd'], 4)} | pnl_pct={_fmt_pct(best_trade['pnl_pct'], 4)}"
+        )
+    else:
+        print("  best_trade=(none)")
+    if worst_trade:
+        print(
+            f"  worst_trade={worst_trade['symbol']} | exit_ts={worst_trade['exit_ts']} | "
+            f"pnl_usd={_fmt_num(worst_trade['pnl_usd'], 4)} | pnl_pct={_fmt_pct(worst_trade['pnl_pct'], 4)}"
+        )
+    else:
+        print("  worst_trade=(none)")
+
     if signal_summary.get("available"):
         recent_signal_rows = signal_summary.get("recent_rows") or []
-        print("\n[9] RECENT SIGNAL ROWS (last 20 today)")
+        print("\n[10] RECENT SIGNAL ROWS (last 20 today)")
         if not recent_signal_rows:
             print("  (no recent signal rows today)")
         else:
             for r in recent_signal_rows:
                 print("  " + " | ".join(str(x) for x in r))
 
-    print("\n[10] LIVE POSITIONS")
+    print("\n[11] LIVE POSITIONS")
     if not live_positions:
         print("  (no live positions)")
     else:
@@ -934,7 +1058,7 @@ def main() -> None:
                 f"uPnL={getattr(p, 'unrealized_pl', '?')} | uPnL%={getattr(p, 'unrealized_plpc', '?')}"
             )
 
-    print("\n[11] LIVE OPEN ORDERS")
+    print("\n[12] LIVE OPEN ORDERS")
     if not live_open_orders:
         print("  (no live open orders)")
     else:
@@ -946,7 +1070,7 @@ def main() -> None:
                 f"limit={getattr(o, 'limit_price', None)} | cid={getattr(o, 'client_order_id', '')}"
             )
 
-    print("\n[12] RECENT CLOSED TRADES (last 20)")
+    print("\n[13] RECENT CLOSED TRADES (last 20)")
     closed_trades = realized_summary["closed_trades"][-20:]
     if not closed_trades:
         print("  (no recent closed trades)")
@@ -959,7 +1083,7 @@ def main() -> None:
                 f"exit_type={t['exit_type']}"
             )
 
-    print("\n[13] RECENT ORDER ROWS (last 20 from alpaca_orders)")
+    print("\n[14] RECENT ORDER ROWS (last 20 from alpaca_orders)")
     if not recent_orders:
         print("  (no recent orders)")
     else:
@@ -969,20 +1093,20 @@ def main() -> None:
                 f"qty={r[5]} | filled_qty={r[6]} | fill_px={r[7]} | notional={r[8]} | cid={r[9]}"
             )
 
-    print("\n[14] DAY CLASSIFICATION")
+    print("\n[15] DAY CLASSIFICATION")
     print(f"  class={day_class}")
 
-    print("\n[15] FINAL VERDICT")
+    print("\n[16] FINAL VERDICT")
     print(f"  status={verdict}")
     print(f"  detail={verdict_detail}")
 
     print("\nNotes:")
     print("  - Equity by day is based on equity_snapshots.")
-    print("  - Today order summary is based on alpaca_orders.recorded_at in UTC day.")
+    print("  - Today order summary uses Python-side normalization for OrderStatus.* / OrderSide.* values.")
     print("  - Signal/block summary is heuristic unless executor block reasons are explicitly persisted.")
     print("  - Execution funnel explains signal -> eligible -> executed flow.")
     print("  - Realized trade summary is FIFO-based approximation from filled alpaca_orders rows.")
-    print("  - Side parsing now supports values like OrderSide.BUY / OrderSide.SELL.")
+    print("  - Aggregate performance summary is computed from the same FIFO-matched closed trades.")
     print("  - Live positions/open orders come from Alpaca API when credentials are available.")
     print("  - If status=WARNING or ACTION NEEDED, inspect positions/open orders/flags first.")
     print("=" * 100)
