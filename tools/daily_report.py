@@ -89,6 +89,15 @@ def _csv_env(name: str) -> List[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+def _normalize_side(side: Any) -> str:
+    s = str(side or "").strip().lower()
+    if s.endswith(".buy") or s == "buy":
+        return "buy"
+    if s.endswith(".sell") or s == "sell":
+        return "sell"
+    return s
+
+
 def _make_trading_client():
     if TradingClient is None:
         return None
@@ -234,12 +243,12 @@ def _fetch_today_order_summary(con) -> Optional[Tuple]:
     q = text("""
     SELECT
       COUNT(*) FILTER (WHERE LOWER(status) = 'filled') AS filled_total,
-      COUNT(*) FILTER (WHERE LOWER(status) = 'filled' AND LOWER(side) = 'buy') AS filled_buys,
-      COUNT(*) FILTER (WHERE LOWER(status) = 'filled' AND LOWER(side) = 'sell') AS filled_sells,
+      COUNT(*) FILTER (WHERE LOWER(side) LIKE '%buy') AS filled_buys,
+      COUNT(*) FILTER (WHERE LOWER(side) LIKE '%sell') AS filled_sells,
       COUNT(*) FILTER (WHERE LOWER(status) = 'canceled') AS canceled_total,
       COUNT(DISTINCT symbol) FILTER (WHERE symbol IS NOT NULL AND symbol <> '') AS symbols_total,
-      COALESCE(SUM(CASE WHEN LOWER(status) = 'filled' AND LOWER(side) = 'buy'  THEN COALESCE(notional, 0) ELSE 0 END), 0) AS buy_notional,
-      COALESCE(SUM(CASE WHEN LOWER(status) = 'filled' AND LOWER(side) = 'sell' THEN COALESCE(notional, 0) ELSE 0 END), 0) AS sell_notional
+      COALESCE(SUM(CASE WHEN LOWER(side) LIKE '%buy'  AND LOWER(status) = 'filled' THEN COALESCE(notional, 0) ELSE 0 END), 0) AS buy_notional,
+      COALESCE(SUM(CASE WHEN LOWER(side) LIKE '%sell' AND LOWER(status) = 'filled' THEN COALESCE(notional, 0) ELSE 0 END), 0) AS sell_notional
     FROM alpaca_orders
     WHERE recorded_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
       AND recorded_at <  date_trunc('day', NOW() AT TIME ZONE 'UTC') + interval '1 day'
@@ -536,10 +545,6 @@ def _infer_block_summary(
 
 
 def _build_realized_trade_summary(filled_rows: List[Tuple]) -> Dict[str, Any]:
-    """
-    FIFO realized PnL approximation from filled alpaca_orders rows.
-    Assumes long-only bot for now.
-    """
     lots_by_symbol: Dict[str, Deque[Dict[str, Any]]] = defaultdict(deque)
     closed_trades: List[Dict[str, Any]] = []
 
@@ -547,14 +552,14 @@ def _build_realized_trade_summary(filled_rows: List[Tuple]) -> Dict[str, Any]:
         ts, symbol, side, status, order_type, qty, filled_qty, fill_px, notional, client_order_id = r
 
         sym = str(symbol or "")
-        side_s = str(side or "").lower()
+        side_s = _normalize_side(side)
         qty_f = _safe_float(filled_qty, 0.0)
         px_f = _safe_float(fill_px, None)
 
         if not sym or qty_f is None or qty_f <= 0 or px_f is None or px_f <= 0:
             continue
 
-        if "buy" in side_s:
+        if side_s == "buy":
             lots_by_symbol[sym].append({
                 "qty": qty_f,
                 "px": px_f,
@@ -564,7 +569,7 @@ def _build_realized_trade_summary(filled_rows: List[Tuple]) -> Dict[str, Any]:
             })
             continue
 
-        if "sell" not in side_s:
+        if side_s != "sell":
             continue
 
         qty_to_close = qty_f
@@ -770,7 +775,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc).isoformat()
 
     print("=" * 100)
-    print(f"DAILY REPORT V2.3 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print(f"DAILY REPORT V2.3.1 (UTC) | last {days} days | generated_at_utc={now_utc}")
     print("=" * 100)
 
     print("\n[0] OPERATOR SUMMARY")
@@ -977,6 +982,7 @@ def main() -> None:
     print("  - Signal/block summary is heuristic unless executor block reasons are explicitly persisted.")
     print("  - Execution funnel explains signal -> eligible -> executed flow.")
     print("  - Realized trade summary is FIFO-based approximation from filled alpaca_orders rows.")
+    print("  - Side parsing now supports values like OrderSide.BUY / OrderSide.SELL.")
     print("  - Live positions/open orders come from Alpaca API when credentials are available.")
     print("  - If status=WARNING or ACTION NEEDED, inspect positions/open orders/flags first.")
     print("=" * 100)
