@@ -2,7 +2,7 @@
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Set, Tuple
+from typing import Optional, Dict, Any, List, Set, Tuple, Sequence
 
 from sqlalchemy import text, bindparam
 
@@ -347,16 +347,144 @@ def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
         return age_sec >= minutes * 60
 
 
+def _table_exists(engine, table_name: str) -> bool:
+    q = text(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name = :table_name
+        )
+        """
+    )
+    with engine.connect() as con:
+        return bool(con.execute(q, {"table_name": table_name}).scalar())
+
+
+def _table_columns(engine, table_name: str) -> List[str]:
+    q = text(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = :table_name
+        ORDER BY ordinal_position
+        """
+    )
+    with engine.connect() as con:
+        return [str(r[0]) for r in con.execute(q, {"table_name": table_name}).fetchall()]
+
+
+def _pick_first(existing: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
+    s = set(existing)
+    for c in candidates:
+        if c in s:
+            return c
+    return None
+
+
+def _get_signal_schema(engine) -> Optional[Dict[str, Optional[str]]]:
+    if not _table_exists(engine, "signals"):
+        LOG.error("signals table not found")
+        return None
+
+    cols = _table_columns(engine, "signals")
+
+    id_col = _pick_first(cols, ["id"])
+    time_col = _pick_first(cols, ["created_at", "ts", "inserted_at", "recorded_at", "updated_at"])
+    symbol_col = _pick_first(cols, ["symbol", "ticker"])
+    side_col = _pick_first(cols, ["side", "signal_side"])
+    strength_col = _pick_first(cols, ["strength", "score", "confidence"])
+    price_col = _pick_first(cols, ["price", "px", "close", "last_price"])
+    source_col = _pick_first(cols, ["source", "model_name", "strategy"])
+    portfolio_col = _pick_first(cols, ["portfolio_id"])
+
+    missing_required = [
+        name
+        for name, col in [
+            ("id", id_col),
+            ("time", time_col),
+            ("symbol", symbol_col),
+            ("side", side_col),
+            ("strength", strength_col),
+        ]
+        if col is None
+    ]
+    if missing_required:
+        LOG.error("signals schema missing required columns: %s", missing_required)
+        return None
+
+    return {
+        "id_col": id_col,
+        "time_col": time_col,
+        "symbol_col": symbol_col,
+        "side_col": side_col,
+        "strength_col": strength_col,
+        "price_col": price_col,
+        "source_col": source_col,
+        "portfolio_col": portfolio_col,
+    }
+
+
 def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any]]:
+    schema = _get_signal_schema(engine)
+    if not schema:
+        return None
+
+    id_col = schema["id_col"]
+    time_col = schema["time_col"]
+    symbol_col = schema["symbol_col"]
+    side_col = schema["side_col"]
+    strength_col = schema["strength_col"]
+    price_col = schema["price_col"]
+    source_col = schema["source_col"]
+    portfolio_col = schema["portfolio_col"]
+
+    select_parts = [
+        f"{id_col} AS id",
+        f"{time_col} AS created_at",
+        f"{symbol_col} AS symbol",
+        f"{side_col} AS side",
+        f"{strength_col} AS strength",
+    ]
+
+    if price_col:
+        select_parts.append(f"{price_col} AS price")
+    else:
+        select_parts.append("NULL::double precision AS price")
+
+    if source_col:
+        select_parts.append(f"{source_col} AS source")
+    else:
+        select_parts.append("NULL::text AS source")
+
+    if portfolio_col:
+        select_parts.append(f"{portfolio_col} AS portfolio_id")
+    else:
+        select_parts.append(f"{int(cfg.portfolio_id)} AS portfolio_id")
+
+    where_parts = [
+        f"{symbol_col} IN :symbols",
+        f"COALESCE({strength_col}, 0) >= :min_strength",
+    ]
+
+    params: Dict[str, Any] = {
+        "symbols": cfg.symbols,
+        "min_strength": cfg.min_strength,
+    }
+
+    if portfolio_col:
+        where_parts.insert(0, f"CAST({portfolio_col} AS INTEGER) = :pid")
+        params["pid"] = cfg.portfolio_id
+
     q = (
         text(
-            """
-            SELECT id, created_at, symbol, side, strength, price, source, portfolio_id
+            f"""
+            SELECT {", ".join(select_parts)}
             FROM signals
-            WHERE portfolio_id=:pid
-              AND symbol IN :symbols
-              AND strength >= :min_strength
-            ORDER BY created_at DESC
+            WHERE {" AND ".join(where_parts)}
+            ORDER BY {time_col} DESC
             LIMIT 25
             """
         )
@@ -365,10 +493,7 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
 
     now = _now_utc()
     with engine.connect() as con:
-        rows = con.execute(
-            q,
-            {"pid": cfg.portfolio_id, "symbols": cfg.symbols, "min_strength": cfg.min_strength},
-        ).mappings().all()
+        rows = con.execute(q, params).mappings().all()
 
     for r in rows:
         sid = int(r["id"])
@@ -696,6 +821,7 @@ def main() -> None:
             if price <= 0:
                 LOG.info("skip no_price | %s", symbol)
                 _safe_audit_block(sig, "no_price", f"symbol={symbol} price={price}")
+                seen_signal_ids.add(sig_id)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -719,6 +845,7 @@ def main() -> None:
                 detail = f"symbol={symbol} side={side} dedupe_minutes={cfg.alpaca_dedupe_minutes}"
                 LOG.info("dedupe_skip | %s", detail)
                 _safe_audit_block(sig, "dedupe", detail)
+                seen_signal_ids.add(sig_id)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -734,6 +861,7 @@ def main() -> None:
                 detail = f"symbol={symbol} side={side} price={price} trade_notional={trade_notional}"
                 LOG.info("skip qty<=0 | %s", detail)
                 _safe_audit_block(sig, "qty_zero", detail)
+                seen_signal_ids.add(sig_id)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -748,6 +876,7 @@ def main() -> None:
                     detail = f"symbol={symbol} side={side} notional={notional}"
                     LOG.info("skip notional<=0 | %s", detail)
                     _safe_audit_block(sig, "qty_zero", detail)
+                    seen_signal_ids.add(sig_id)
                     time.sleep(cfg.poll_seconds)
                     continue
 
