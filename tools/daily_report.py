@@ -601,6 +601,78 @@ def _infer_block_summary(
         "funnel": funnel,
         "reason_counts": reason_counts,
         "top_reason": top_reason,
+        "source": "heuristic",
+        "total_blocked": max(int(funnel.get("blocked_eligible", 0) or 0), 0),
+    }
+
+
+def _fetch_execution_audit_block_summary(con) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "available": False,
+        "reason_counts": [],
+        "top_reason": None,
+        "total_blocked": 0,
+        "source": "execution_audit",
+    }
+
+    if not _table_exists(con, "execution_audit"):
+        return result
+
+    q = text("""
+    SELECT
+      COALESCE(NULLIF(reason, ''), 'unknown') AS reason,
+      COUNT(*) AS cnt
+    FROM execution_audit
+    WHERE event_type = 'blocked_signal'
+      AND (ts AT TIME ZONE 'UTC') >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
+      AND (ts AT TIME ZONE 'UTC') <  date_trunc('day', NOW() AT TIME ZONE 'UTC') + interval '1 day'
+    GROUP BY COALESCE(NULLIF(reason, ''), 'unknown')
+    ORDER BY cnt DESC, reason ASC
+    """)
+
+    rows = list(con.execute(q).fetchall())
+    if not rows:
+        result["available"] = True
+        return result
+
+    reason_counts: List[Tuple[str, int]] = []
+    total_blocked = 0
+    for r in rows:
+        reason = str(r[0])
+        cnt = int(r[1] or 0)
+        reason_counts.append((reason, cnt))
+        total_blocked += cnt
+
+    result["available"] = True
+    result["reason_counts"] = reason_counts
+    result["top_reason"] = reason_counts[0][0]
+    result["total_blocked"] = total_blocked
+    return result
+
+
+def _merge_block_summaries(
+    heuristic_summary: Dict[str, Any],
+    audit_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    funnel = heuristic_summary["funnel"]
+
+    if audit_summary.get("available") and audit_summary.get("reason_counts"):
+        return {
+            "funnel": funnel,
+            "reason_counts": audit_summary["reason_counts"],
+            "top_reason": audit_summary["top_reason"],
+            "total_blocked": audit_summary["total_blocked"],
+            "source": "execution_audit",
+            "fallback_top_reason": heuristic_summary.get("top_reason"),
+        }
+
+    return {
+        "funnel": funnel,
+        "reason_counts": heuristic_summary.get("reason_counts", []),
+        "top_reason": heuristic_summary.get("top_reason"),
+        "total_blocked": heuristic_summary.get("total_blocked", 0),
+        "source": "heuristic",
+        "fallback_top_reason": heuristic_summary.get("top_reason"),
     }
 
 
@@ -780,7 +852,7 @@ def _build_verdict(
         return "WARNING", f"PDT/daytrade guard threshold reached: daytrade_count={daytrade_count}"
 
     if funnel.get("blocked_eligible", 0) > 0:
-        return "WARNING", f"eligible signals blocked: {block_summary.get('top_reason')}"
+        return "WARNING", f"eligible signals blocked: {block_summary.get('top_reason') or 'unknown'}"
 
     return "OK", "system looks healthy"
 
@@ -825,6 +897,7 @@ def main() -> None:
         filled_rows = _fetch_filled_order_rows(con, days)
         flags = _fetch_system_flags(con)
         signal_summary = _fetch_signal_summary(con)
+        audit_block_summary = _fetch_execution_audit_block_summary(con)
 
     live = _fetch_live_state()
     live_account = live["account"]
@@ -832,7 +905,7 @@ def main() -> None:
     live_open_orders = live["open_orders"]
     live_error = live["error"]
 
-    block_summary = _infer_block_summary(
+    heuristic_block_summary = _infer_block_summary(
         signal_summary=signal_summary,
         today_order_summary=today_order_summary,
         latest_snapshot=latest,
@@ -840,6 +913,11 @@ def main() -> None:
         live_open_orders=live_open_orders,
         flags=flags,
     )
+    block_summary = _merge_block_summaries(
+        heuristic_summary=heuristic_block_summary,
+        audit_summary=audit_block_summary,
+    )
+
     funnel = block_summary["funnel"]
     realized_summary = _build_realized_trade_summary(filled_rows)
     aggregate_summary = _build_aggregate_performance_summary(realized_summary)
@@ -869,7 +947,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc).isoformat()
 
     print("=" * 100)
-    print(f"DAILY REPORT V2.4 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print(f"DAILY REPORT V2.5 (UTC) | last {days} days | generated_at_utc={now_utc}")
     print("=" * 100)
 
     print("\n[0] OPERATOR SUMMARY")
@@ -978,11 +1056,21 @@ def main() -> None:
         f"blocked_eligible_buys={funnel['blocked_eligible_buys']}"
     )
 
-    print("\n[7] BLOCK SUMMARY (heuristic)")
-    print(f"  top_reason={block_summary.get('top_reason')}")
-    if block_summary.get("reason_counts"):
-        for reason, count in block_summary["reason_counts"]:
+    if block_summary.get("source") == "execution_audit":
+        print("\n[7] BLOCK SUMMARY (from execution_audit)")
+        print(f"  blocked_signal_rows_today={block_summary.get('total_blocked', 0)}")
+        print(f"  top_reason={block_summary.get('top_reason')}")
+        for reason, count in block_summary.get("reason_counts", []):
             print(f"  - {reason}: {count}")
+    else:
+        print("\n[7] BLOCK SUMMARY (heuristic fallback)")
+        print(f"  blocked_signal_rows_today={block_summary.get('total_blocked', 0)}")
+        print(f"  top_reason={block_summary.get('top_reason')}")
+        if block_summary.get("reason_counts"):
+            for reason, count in block_summary["reason_counts"]:
+                print(f"  - {reason}: {count}")
+        else:
+            print("  (no block reasons)")
 
     print("\n[8] REALIZED TRADE SUMMARY")
     print(
@@ -1103,7 +1191,7 @@ def main() -> None:
     print("\nNotes:")
     print("  - Equity by day is based on equity_snapshots.")
     print("  - Today order summary uses Python-side normalization for OrderStatus.* / OrderSide.* values.")
-    print("  - Signal/block summary is heuristic unless executor block reasons are explicitly persisted.")
+    print("  - Signal/block summary uses execution_audit when available; otherwise it falls back to heuristic inference.")
     print("  - Execution funnel explains signal -> eligible -> executed flow.")
     print("  - Realized trade summary is FIFO-based approximation from filled alpaca_orders rows.")
     print("  - Aggregate performance summary is computed from the same FIFO-matched closed trades.")
