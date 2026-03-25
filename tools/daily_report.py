@@ -15,6 +15,9 @@ except Exception:
     GetOrdersRequest = None
 
 
+NON_BLOCKING_AUDIT_REASONS = {"no_signal"}
+
+
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None or str(v).strip() == "":
@@ -378,13 +381,17 @@ def _fetch_signal_summary(con) -> Dict[str, Any]:
         "side_col": None,
         "source_col": None,
         "portfolio_col": None,
+        "fresh_window_seconds": _env_int("PICK_TTL_SECONDS", 0),
         "total_signals_today": 0,
         "eligible_signals_today": 0,
+        "eligible_fresh_signals_now": 0,
         "symbols_today": 0,
         "buy_signals_today": 0,
         "sell_signals_today": 0,
         "eligible_buy_signals_today": 0,
         "eligible_sell_signals_today": 0,
+        "eligible_fresh_buy_signals_now": 0,
+        "eligible_fresh_sell_signals_now": 0,
         "recent_rows": [],
     }
 
@@ -415,6 +422,7 @@ def _fetch_signal_summary(con) -> Dict[str, Any]:
     min_strength = _env_float("MIN_STRENGTH", 0.0)
     wanted_portfolio = (os.getenv("PORTFOLIO_ID") or "").strip()
     wanted_symbols = set(_csv_env("SYMBOLS"))
+    fresh_window_seconds = int(result["fresh_window_seconds"] or 0)
 
     where_parts = [
         f"{time_col} >= date_trunc('day', NOW() AT TIME ZONE 'UTC')",
@@ -489,6 +497,39 @@ def _fetch_signal_summary(con) -> Dict[str, Any]:
             if side_row is not None:
                 result["eligible_buy_signals_today"] = int(side_row[0] or 0)
                 result["eligible_sell_signals_today"] = int(side_row[1] or 0)
+
+        if fresh_window_seconds > 0:
+            q_fresh = text(f"""
+            SELECT COUNT(*) AS n
+            FROM signals
+            WHERE {where_sql}
+              AND COALESCE({strength_col}, 0) >= :min_strength
+              AND {time_col} >= (NOW() AT TIME ZONE 'UTC') - (:fresh_window_seconds || ' seconds')::interval
+            """)
+            p3 = dict(p2)
+            p3["fresh_window_seconds"] = fresh_window_seconds
+            result["eligible_fresh_signals_now"] = int(con.execute(q_fresh, p3).scalar() or 0)
+
+            if side_col:
+                q_fresh_side = text(f"""
+                SELECT
+                  COUNT(*) FILTER (
+                    WHERE LOWER(CAST({side_col} AS TEXT)) = 'buy'
+                      AND COALESCE({strength_col}, 0) >= :min_strength
+                      AND {time_col} >= (NOW() AT TIME ZONE 'UTC') - (:fresh_window_seconds || ' seconds')::interval
+                  ) AS buy_n,
+                  COUNT(*) FILTER (
+                    WHERE LOWER(CAST({side_col} AS TEXT)) = 'sell'
+                      AND COALESCE({strength_col}, 0) >= :min_strength
+                      AND {time_col} >= (NOW() AT TIME ZONE 'UTC') - (:fresh_window_seconds || ' seconds')::interval
+                  ) AS sell_n
+                FROM signals
+                WHERE {where_sql}
+                """)
+                side_row = con.execute(q_fresh_side, p3).fetchone()
+                if side_row is not None:
+                    result["eligible_fresh_buy_signals_now"] = int(side_row[0] or 0)
+                    result["eligible_fresh_sell_signals_now"] = int(side_row[1] or 0)
     else:
         result["eligible_signals_today"] = result["total_signals_today"]
         result["eligible_buy_signals_today"] = result["buy_signals_today"]
@@ -521,21 +562,45 @@ def _build_execution_funnel(
 
     total_signals = int(signal_summary.get("total_signals_today") or 0)
     eligible_signals = int(signal_summary.get("eligible_signals_today") or 0)
+    eligible_fresh_signals_now = int(signal_summary.get("eligible_fresh_signals_now") or 0)
     buy_signals = int(signal_summary.get("buy_signals_today") or 0)
     sell_signals = int(signal_summary.get("sell_signals_today") or 0)
     eligible_buy_signals = int(signal_summary.get("eligible_buy_signals_today") or 0)
     eligible_sell_signals = int(signal_summary.get("eligible_sell_signals_today") or 0)
+    eligible_fresh_buy_signals_now = int(signal_summary.get("eligible_fresh_buy_signals_now") or 0)
+    eligible_fresh_sell_signals_now = int(signal_summary.get("eligible_fresh_sell_signals_now") or 0)
 
-    blocked_eligible = max(eligible_signals - filled_buys, 0)
+    long_only = _env_bool("LONG_ONLY", True)
+    allow_short = _env_bool("ALLOW_SHORT", False)
+
+    if long_only or not allow_short:
+        entry_mode = "buy_entries_only"
+        eligible_entry_signals_today = eligible_buy_signals
+        eligible_fresh_entry_signals_now = eligible_fresh_buy_signals_now
+        executed_entry_fills = filled_buys
+    else:
+        entry_mode = "all_eligible_signals"
+        eligible_entry_signals_today = eligible_signals
+        eligible_fresh_entry_signals_now = eligible_fresh_signals_now
+        executed_entry_fills = filled_total
+
+    blocked_eligible = max(eligible_entry_signals_today - executed_entry_fills, 0)
     blocked_eligible_buys = max(eligible_buy_signals - filled_buys, 0)
 
     return {
+        "entry_mode": entry_mode,
         "total_signals": total_signals,
         "buy_signals": buy_signals,
         "sell_signals": sell_signals,
         "eligible_signals": eligible_signals,
+        "eligible_fresh_signals_now": eligible_fresh_signals_now,
         "eligible_buy_signals": eligible_buy_signals,
         "eligible_sell_signals": eligible_sell_signals,
+        "eligible_fresh_buy_signals_now": eligible_fresh_buy_signals_now,
+        "eligible_fresh_sell_signals_now": eligible_fresh_sell_signals_now,
+        "eligible_entry_signals_today": eligible_entry_signals_today,
+        "eligible_fresh_entry_signals_now": eligible_fresh_entry_signals_now,
+        "executed_entry_fills": executed_entry_fills,
         "executed_buy_fills": filled_buys,
         "executed_sell_fills": filled_sells,
         "filled_total": filled_total,
@@ -567,34 +632,33 @@ def _infer_block_summary(
     trading_paused = flags.get("TRADING_PAUSED", "")
     paused_reason = flags.get("TRADING_PAUSED_REASON", "")
 
-    total_signals = funnel["total_signals"]
-    eligible_signals = funnel["eligible_signals"]
-    executed_buys = funnel["executed_buy_fills"]
+    eligible_entry_signals_today = funnel["eligible_entry_signals_today"]
+    executed_entry_fills = funnel["executed_entry_fills"]
 
     reason_counts: List[Tuple[str, int]] = []
 
     if trading_paused == "1":
-        reason_counts.append((f"trading_paused ({paused_reason or 'no reason'})", max(eligible_signals, 1)))
+        reason_counts.append((f"trading_paused ({paused_reason or 'no reason'})", max(eligible_entry_signals_today, 1)))
     elif daytrade_count is not None and daytrade_count >= pause_on_daytrade_ge:
-        reason_counts.append((f"PDT/daytrade gate (daytrade_count={daytrade_count}, threshold={pause_on_daytrade_ge})", max(eligible_signals - executed_buys, 1)))
-    elif total_signals == 0:
+        reason_counts.append((f"PDT/daytrade gate (daytrade_count={daytrade_count}, threshold={pause_on_daytrade_ge})", max(eligible_entry_signals_today - executed_entry_fills, 1)))
+    elif funnel["total_signals"] == 0:
         reason_counts.append(("no signals generated today", 1))
-    elif total_signals > 0 and eligible_signals == 0:
-        reason_counts.append((f"signals below threshold (MIN_STRENGTH={min_strength:.4f})", total_signals))
+    elif eligible_entry_signals_today == 0:
+        reason_counts.append((f"no eligible entry signals (MIN_STRENGTH={min_strength:.4f}, mode={funnel['entry_mode']})", 1))
     else:
-        if len(live_positions) >= max_open_positions and eligible_signals > executed_buys:
-            reason_counts.append((f"max_open_positions gate (positions={len(live_positions)}, limit={max_open_positions})", eligible_signals - executed_buys))
-        if len(live_open_orders) >= max_open_orders and eligible_signals > executed_buys:
-            reason_counts.append((f"max_open_orders gate (open_orders={len(live_open_orders)}, limit={max_open_orders})", eligible_signals - executed_buys))
+        if len(live_positions) >= max_open_positions and eligible_entry_signals_today > executed_entry_fills:
+            reason_counts.append((f"max_open_positions gate (positions={len(live_positions)}, limit={max_open_positions})", eligible_entry_signals_today - executed_entry_fills))
+        if len(live_open_orders) >= max_open_orders and eligible_entry_signals_today > executed_entry_fills:
+            reason_counts.append((f"max_open_orders gate (open_orders={len(live_open_orders)}, limit={max_open_orders})", eligible_entry_signals_today - executed_entry_fills))
         if guard_status.startswith("NO_DATA"):
             reason_counts.append((f"guard not ready at day start ({guard_status})", 1))
-        if executed_buys > 0 and eligible_signals > executed_buys:
-            reason_counts.append(("partial execution; some eligible signals likely blocked by other gates/cooldowns", eligible_signals - executed_buys))
+        if executed_entry_fills > 0 and eligible_entry_signals_today > executed_entry_fills:
+            reason_counts.append(("partial execution; some eligible entry signals likely blocked by other gates/cooldowns", eligible_entry_signals_today - executed_entry_fills))
         if not reason_counts:
-            if executed_buys > 0:
-                reason_counts.append(("all eligible signals executed", executed_buys))
+            if executed_entry_fills > 0:
+                reason_counts.append(("all eligible entry signals executed", executed_entry_fills))
             else:
-                reason_counts.append(("other executor gate / cooldown / market-state block", max(eligible_signals, 1)))
+                reason_counts.append(("eligible entry signals existed earlier today but were not executed", max(eligible_entry_signals_today, 1)))
 
     top_reason = reason_counts[0][0] if reason_counts else "unknown"
     return {
@@ -603,6 +667,9 @@ def _infer_block_summary(
         "top_reason": top_reason,
         "source": "heuristic",
         "total_blocked": max(int(funnel.get("blocked_eligible", 0) or 0), 0),
+        "state_reason_counts": [],
+        "state_top_reason": None,
+        "state_total": 0,
     }
 
 
@@ -613,6 +680,10 @@ def _fetch_execution_audit_block_summary(con) -> Dict[str, Any]:
         "top_reason": None,
         "total_blocked": 0,
         "source": "execution_audit",
+        "state_reason_counts": [],
+        "state_top_reason": None,
+        "state_total": 0,
+        "raw_total_rows": 0,
     }
 
     if not _table_exists(con, "execution_audit"):
@@ -631,22 +702,34 @@ def _fetch_execution_audit_block_summary(con) -> Dict[str, Any]:
     """)
 
     rows = list(con.execute(q).fetchall())
+    result["available"] = True
     if not rows:
-        result["available"] = True
         return result
 
-    reason_counts: List[Tuple[str, int]] = []
+    blocking_reason_counts: List[Tuple[str, int]] = []
+    state_reason_counts: List[Tuple[str, int]] = []
     total_blocked = 0
+    state_total = 0
+    raw_total_rows = 0
+
     for r in rows:
         reason = str(r[0])
         cnt = int(r[1] or 0)
-        reason_counts.append((reason, cnt))
-        total_blocked += cnt
+        raw_total_rows += cnt
+        if reason in NON_BLOCKING_AUDIT_REASONS:
+            state_reason_counts.append((reason, cnt))
+            state_total += cnt
+        else:
+            blocking_reason_counts.append((reason, cnt))
+            total_blocked += cnt
 
-    result["available"] = True
-    result["reason_counts"] = reason_counts
-    result["top_reason"] = reason_counts[0][0]
+    result["reason_counts"] = blocking_reason_counts
+    result["top_reason"] = blocking_reason_counts[0][0] if blocking_reason_counts else None
     result["total_blocked"] = total_blocked
+    result["state_reason_counts"] = state_reason_counts
+    result["state_top_reason"] = state_reason_counts[0][0] if state_reason_counts else None
+    result["state_total"] = state_total
+    result["raw_total_rows"] = raw_total_rows
     return result
 
 
@@ -664,16 +747,25 @@ def _merge_block_summaries(
             "total_blocked": audit_summary["total_blocked"],
             "source": "execution_audit",
             "fallback_top_reason": heuristic_summary.get("top_reason"),
+            "state_reason_counts": audit_summary.get("state_reason_counts", []),
+            "state_top_reason": audit_summary.get("state_top_reason"),
+            "state_total": audit_summary.get("state_total", 0),
+            "raw_total_rows": audit_summary.get("raw_total_rows", audit_summary.get("total_blocked", 0)),
         }
 
-    return {
+    merged = {
         "funnel": funnel,
         "reason_counts": heuristic_summary.get("reason_counts", []),
         "top_reason": heuristic_summary.get("top_reason"),
         "total_blocked": heuristic_summary.get("total_blocked", 0),
         "source": "heuristic",
         "fallback_top_reason": heuristic_summary.get("top_reason"),
+        "state_reason_counts": audit_summary.get("state_reason_counts", []) if audit_summary.get("available") else [],
+        "state_top_reason": audit_summary.get("state_top_reason") if audit_summary.get("available") else None,
+        "state_total": audit_summary.get("state_total", 0) if audit_summary.get("available") else 0,
+        "raw_total_rows": audit_summary.get("raw_total_rows", 0) if audit_summary.get("available") else 0,
     }
+    return merged
 
 
 def _build_realized_trade_summary(filled_rows: List[Tuple]) -> Dict[str, Any]:
@@ -808,10 +900,10 @@ def _classify_day(
         return "unprotected_position_day"
     if funnel["filled_total"] > 0:
         return "trade_day"
-    if funnel["total_signals"] > 0 and funnel["eligible_signals"] == 0:
-        return "signals_below_threshold_day"
-    if funnel["eligible_signals"] > 0 and funnel["executed_buy_fills"] == 0:
-        return "blocked_signal_day"
+    if funnel["total_signals"] > 0 and funnel["eligible_entry_signals_today"] == 0:
+        return "no_eligible_entry_signal_day"
+    if funnel["eligible_entry_signals_today"] > 0 and funnel["executed_entry_fills"] == 0:
+        return "blocked_entry_signal_day"
     if funnel["total_signals"] == 0:
         return "no_signal_day"
     if guard_status.startswith("NO_DATA"):
@@ -825,6 +917,7 @@ def _build_verdict(
     live_open_orders: List[Any],
     latest_snapshot: Optional[Tuple],
     block_summary: Dict[str, Any],
+    signal_summary: Dict[str, Any],
 ) -> Tuple[str, str]:
     guard_status = flags.get("GUARD_STATUS", "")
     trading_paused = flags.get("TRADING_PAUSED", "")
@@ -834,6 +927,7 @@ def _build_verdict(
         daytrade_count = latest_snapshot[7]
 
     funnel = block_summary["funnel"]
+    fresh_window_seconds = int(signal_summary.get("fresh_window_seconds") or 0)
 
     if trading_paused == "1":
         return "ACTION NEEDED", f"TRADING_PAUSED=1 reason={paused_reason or '-'}"
@@ -851,8 +945,19 @@ def _build_verdict(
     if daytrade_count is not None and int(daytrade_count or 0) >= 3:
         return "WARNING", f"PDT/daytrade guard threshold reached: daytrade_count={daytrade_count}"
 
-    if funnel.get("blocked_eligible", 0) > 0:
-        return "WARNING", f"eligible signals blocked: {block_summary.get('top_reason') or 'unknown'}"
+    if block_summary.get("top_reason"):
+        return "WARNING", f"eligible entry signals blocked: {block_summary.get('top_reason')}"
+
+    if funnel.get("blocked_eligible", 0) > 0 and block_summary.get("state_top_reason") == "no_signal":
+        if funnel.get("eligible_fresh_entry_signals_now", 0) == 0:
+            return (
+                "WARNING",
+                f"no fresh eligible entry signal now (PICK_TTL_SECONDS={fresh_window_seconds}); earlier eligible entry signal(s) today were not filled",
+            )
+        return "WARNING", "executor idle/no_signal while entry-capable signals remain"
+
+    if block_summary.get("state_top_reason") == "no_signal":
+        return "OK", f"executor idle: no fresh eligible entry signal now (PICK_TTL_SECONDS={fresh_window_seconds})"
 
     return "OK", "system looks healthy"
 
@@ -871,8 +976,9 @@ def _build_operator_summary(
     daytrade_count = latest_snapshot[7] if latest_snapshot is not None else None
     lines.append(
         f"daytrade_count={daytrade_count} | "
-        f"signals={funnel['total_signals']} | eligible={funnel['eligible_signals']} | "
-        f"buy_fills={funnel['executed_buy_fills']} | blocked_eligible={funnel['blocked_eligible']}"
+        f"signals={funnel['total_signals']} | eligible_entry_today={funnel['eligible_entry_signals_today']} | "
+        f"eligible_fresh_entry_now={funnel['eligible_fresh_entry_signals_now']} | "
+        f"entry_fills={funnel['executed_entry_fills']} | blocked_eligible={funnel['blocked_eligible']}"
     )
     lines.append(
         f"round_trips_today={realized_summary['completed_round_trips_today']} | "
@@ -927,6 +1033,7 @@ def main() -> None:
         live_open_orders=live_open_orders,
         latest_snapshot=latest,
         block_summary=block_summary,
+        signal_summary=signal_summary,
     )
     day_class = _classify_day(
         signal_summary=signal_summary,
@@ -947,7 +1054,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc).isoformat()
 
     print("=" * 100)
-    print(f"DAILY REPORT V2.5 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print(f"DAILY REPORT V2.6 (UTC) | last {days} days | generated_at_utc={now_utc}")
     print("=" * 100)
 
     print("\n[0] OPERATOR SUMMARY")
@@ -1034,6 +1141,12 @@ def main() -> None:
             f"eligible_sell_signals_today={signal_summary.get('eligible_sell_signals_today')}"
         )
         print(
+            f"  eligible_fresh_signals_now={signal_summary.get('eligible_fresh_signals_now')} | "
+            f"eligible_fresh_buy_signals_now={signal_summary.get('eligible_fresh_buy_signals_now')} | "
+            f"eligible_fresh_sell_signals_now={signal_summary.get('eligible_fresh_sell_signals_now')} | "
+            f"PICK_TTL_SECONDS={signal_summary.get('fresh_window_seconds')}"
+        )
+        print(
             f"  detected_columns: time={signal_summary.get('time_col')} | "
             f"symbol={signal_summary.get('symbol_col')} | side={signal_summary.get('side_col')} | "
             f"strength={signal_summary.get('strength_col')} | source={signal_summary.get('source_col')} | "
@@ -1042,35 +1155,38 @@ def main() -> None:
 
     print("\n[6] EXECUTION FUNNEL")
     print(
-        f"  total_signals={funnel['total_signals']} -> "
-        f"eligible_signals={funnel['eligible_signals']} -> "
-        f"executed_buy_fills={funnel['executed_buy_fills']}"
+        f"  entry_mode={funnel['entry_mode']} | total_signals={funnel['total_signals']} | "
+        f"eligible_signals_today={funnel['eligible_signals']} | eligible_entry_signals_today={funnel['eligible_entry_signals_today']}"
+    )
+    print(
+        f"  eligible_fresh_signals_now={funnel['eligible_fresh_signals_now']} | "
+        f"eligible_fresh_entry_signals_now={funnel['eligible_fresh_entry_signals_now']} | "
+        f"executed_entry_fills={funnel['executed_entry_fills']}"
     )
     print(
         f"  buy_signals={funnel['buy_signals']} | sell_signals={funnel['sell_signals']} | "
         f"eligible_buy_signals={funnel['eligible_buy_signals']} | eligible_sell_signals={funnel['eligible_sell_signals']}"
     )
     print(
-        f"  executed_sell_fills={funnel['executed_sell_fills']} | "
-        f"blocked_eligible={funnel['blocked_eligible']} | "
-        f"blocked_eligible_buys={funnel['blocked_eligible_buys']}"
+        f"  executed_buy_fills={funnel['executed_buy_fills']} | executed_sell_fills={funnel['executed_sell_fills']} | "
+        f"blocked_eligible={funnel['blocked_eligible']} | blocked_eligible_buys={funnel['blocked_eligible_buys']}"
     )
 
-    if block_summary.get("source") == "execution_audit":
-        print("\n[7] BLOCK SUMMARY (from execution_audit)")
-        print(f"  blocked_signal_rows_today={block_summary.get('total_blocked', 0)}")
+    print("\n[7] BLOCK SUMMARY")
+    print(f"  source={block_summary.get('source')}")
+    print(f"  blocked_reason_rows_today={block_summary.get('total_blocked', 0)}")
+    if block_summary.get("reason_counts"):
         print(f"  top_reason={block_summary.get('top_reason')}")
         for reason, count in block_summary.get("reason_counts", []):
             print(f"  - {reason}: {count}")
     else:
-        print("\n[7] BLOCK SUMMARY (heuristic fallback)")
-        print(f"  blocked_signal_rows_today={block_summary.get('total_blocked', 0)}")
-        print(f"  top_reason={block_summary.get('top_reason')}")
-        if block_summary.get("reason_counts"):
-            for reason, count in block_summary["reason_counts"]:
-                print(f"  - {reason}: {count}")
-        else:
-            print("  (no block reasons)")
+        print("  (no blocking reasons recorded today)")
+
+    if block_summary.get("state_reason_counts"):
+        print("  executor_state_rows_today=" + str(block_summary.get("state_total", 0)))
+        print(f"  executor_state_top_reason={block_summary.get('state_top_reason')}")
+        for reason, count in block_summary.get("state_reason_counts", []):
+            print(f"  - state:{reason}: {count}")
 
     print("\n[8] REALIZED TRADE SUMMARY")
     print(
@@ -1191,8 +1307,9 @@ def main() -> None:
     print("\nNotes:")
     print("  - Equity by day is based on equity_snapshots.")
     print("  - Today order summary uses Python-side normalization for OrderStatus.* / OrderSide.* values.")
-    print("  - Signal/block summary uses execution_audit when available; otherwise it falls back to heuristic inference.")
-    print("  - Execution funnel explains signal -> eligible -> executed flow.")
+    print("  - BLOCK SUMMARY uses blocking audit reasons when available and keeps non-blocking executor state separately.")
+    print("  - In LONG_ONLY mode, entry funnel is based on eligible buy-entry signals, not sell signals.")
+    print("  - Fresh signal counts use PICK_TTL_SECONDS to reflect what the picker could act on right now.")
     print("  - Realized trade summary is FIFO-based approximation from filled alpaca_orders rows.")
     print("  - Aggregate performance summary is computed from the same FIFO-matched closed trades.")
     print("  - Live positions/open orders come from Alpaca API when credentials are available.")
