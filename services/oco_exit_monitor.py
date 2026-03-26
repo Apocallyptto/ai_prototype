@@ -1,7 +1,8 @@
 import os
 import time
 import logging
-from typing import Optional, List, Set, Dict
+from typing import Optional, List, Set, Dict, Tuple
+
 from datetime import datetime, timezone, timedelta
 
 from alpaca.trading.client import TradingClient
@@ -21,6 +22,10 @@ from alpaca.trading.requests import (
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+
+from sqlalchemy import text
+
+from tools.db import get_engine
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 LOG = logging.getLogger("oco_exit_monitor")
@@ -101,6 +106,39 @@ def _dt_utc(dt) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def _normalize_side_text(v) -> str:
+    s = str(v or "").strip().lower()
+    if s.endswith(".buy") or s == "buy":
+        return "buy"
+    if s.endswith(".sell") or s == "sell":
+        return "sell"
+    return s
+
+
+def _normalize_status_text(v) -> str:
+    s = str(v or "").strip().lower()
+    if s.endswith(".filled") or s == "filled":
+        return "filled"
+    if s.endswith(".canceled") or s == "canceled":
+        return "canceled"
+    if s.endswith(".cancelled") or s == "cancelled":
+        return "canceled"
+    if s.endswith(".new") or s == "new":
+        return "new"
+    if s.endswith(".open") or s == "open":
+        return "open"
+    return s
+
+
+def _should_log_throttled(bucket: Dict[str, float], key: str, min_interval_sec: float = 60.0) -> bool:
+    now = time.time()
+    prev = bucket.get(key, 0.0)
+    if now - prev >= min_interval_sec:
+        bucket[key] = now
+        return True
+    return False
+
+
 def _atr_pct(dc: StockHistoricalDataClient, sym: str, lookback: int = 50) -> Optional[float]:
     """Return ATR/close (e.g. 0.0012 = 0.12%)."""
     try:
@@ -158,7 +196,11 @@ def _cancel_order_safely(tc: TradingClient, oid: str, sym: str, why: str) -> Non
         tc.cancel_order_by_id(oid)
         LOG.info("canceled_order | sym=%s oid=%s why=%s", sym, oid, why)
     except Exception as e:
-        LOG.warning("cancel_failed | sym=%s oid=%s why=%s err=%s", sym, oid, why, e)
+        msg = str(e).lower()
+        if 'already in "filled" state' in msg or "already in 'filled' state" in msg or 'already in "canceled" state' in msg:
+            LOG.info("cancel_already_terminal | sym=%s oid=%s why=%s err=%s", sym, oid, why, e)
+        else:
+            LOG.warning("cancel_failed | sym=%s oid=%s why=%s err=%s", sym, oid, why, e)
 
 
 def _cleanup_orphan_exit_orders(tc: TradingClient, orders, active_symbols: Set[str], prefix: str) -> int:
@@ -229,8 +271,10 @@ def _place_sl(
 ) -> bool:
     sl = _round2(sl)
     if dry_run:
-        LOG.info("DRY_RUN place_sl | sym=%s qty=%s side=%s intent=%s sl=%s tif=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, sl, tif.value, cid)
+        LOG.info(
+            "DRY_RUN place_sl | sym=%s qty=%s side=%s intent=%s sl=%s tif=%s cid=%s",
+            sym, qty_abs, exit_side.value, intent.value, sl, tif.value, cid
+        )
         return True
     try:
         req = StopOrderRequest(
@@ -244,8 +288,10 @@ def _place_sl(
         )
         o = tc.submit_order(order_data=req)
         oid = str(getattr(o, "id", "") or "")
-        LOG.info("placed_sl | sym=%s qty=%s side=%s intent=%s sl=%s tif=%s oid=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, sl, tif.value, oid, cid)
+        LOG.info(
+            "placed_sl | sym=%s qty=%s side=%s intent=%s sl=%s tif=%s oid=%s cid=%s",
+            sym, qty_abs, exit_side.value, intent.value, sl, tif.value, oid, cid
+        )
         return True
     except Exception as e:
         LOG.error("place_sl failed sym=%s: %s", sym, e, exc_info=True)
@@ -262,8 +308,10 @@ def _close_market(
     dry_run: bool,
 ) -> bool:
     if dry_run:
-        LOG.info("DRY_RUN close_market | sym=%s qty=%s side=%s intent=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, cid)
+        LOG.info(
+            "DRY_RUN close_market | sym=%s qty=%s side=%s intent=%s cid=%s",
+            sym, qty_abs, exit_side.value, intent.value, cid
+        )
         return True
     try:
         req = MarketOrderRequest(
@@ -277,21 +325,65 @@ def _close_market(
         )
         o = tc.submit_order(order_data=req)
         oid = str(getattr(o, "id", "") or "")
-        LOG.info("submitted_close_market | sym=%s qty=%s side=%s intent=%s oid=%s cid=%s",
-                 sym, qty_abs, exit_side.value, intent.value, oid, cid)
+        LOG.info(
+            "submitted_close_market | sym=%s qty=%s side=%s intent=%s oid=%s cid=%s",
+            sym, qty_abs, exit_side.value, intent.value, oid, cid
+        )
         return True
     except Exception as e:
         LOG.error("close_market failed sym=%s: %s", sym, e, exc_info=True)
         return False
 
 
-def _last_filled_entry_ts(tc: TradingClient, sym: str, lookback_days: int = 14) -> Optional[datetime]:
+def _last_filled_entry_ts_from_db(db_engine, sym: str, pos_is_long: bool, lookback_days: int, prefix: str) -> Optional[datetime]:
+    if db_engine is None:
+        return None
+
+    symu = sym.upper()
+    side_like = "%buy" if pos_is_long else "%sell"
+
+    try:
+        with db_engine.connect() as con:
+            row = con.execute(
+                text(
+                    """
+                    SELECT recorded_at
+                    FROM alpaca_orders
+                    WHERE UPPER(symbol) = :sym
+                      AND recorded_at >= (NOW() AT TIME ZONE 'UTC') - (:lookback_days || ' days')::interval
+                      AND LOWER(CAST(status AS TEXT)) LIKE '%filled'
+                      AND LOWER(CAST(side AS TEXT)) LIKE :side_like
+                      AND COALESCE(client_order_id, '') NOT ILIKE :exit_prefix_like
+                    ORDER BY recorded_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "sym": symu,
+                    "lookback_days": int(lookback_days),
+                    "side_like": side_like,
+                    "exit_prefix_like": f"{prefix}%",
+                },
+            ).fetchone()
+
+        if not row:
+            return None
+        return _dt_utc(row[0])
+    except Exception as e:
+        LOG.warning("entry_ts lookup failed (db) | sym=%s err=%r", symu, e)
+        return None
+
+
+def _last_filled_entry_ts_from_api(tc: TradingClient, sym: str, pos_is_long: bool, lookback_days: int = 14) -> Optional[datetime]:
     """
     Find latest filled entry order timestamp:
     - long positions: last FILLED BUY for symbol
+    - short positions: last FILLED SELL for symbol
     """
     symu = sym.upper()
+    wanted_side = "buy" if pos_is_long else "sell"
     after = _utc_now() - timedelta(days=lookback_days)
+
     try:
         req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500, nested=True, after=after)
         orders = tc.get_orders(filter=req) or []
@@ -303,20 +395,53 @@ def _last_filled_entry_ts(tc: TradingClient, sym: str, lookback_days: int = 14) 
     for o in orders:
         if (getattr(o, "symbol", "") or "").upper() != symu:
             continue
-        side = str(getattr(o, "side", "") or "").lower()
-        status = str(getattr(o, "status", "") or "").lower()
-        if side != "buy":
+
+        side = _normalize_side_text(getattr(o, "side", ""))
+        status = _normalize_status_text(getattr(o, "status", ""))
+
+        if side != wanted_side:
             continue
-        if "filled" not in status:
+        if status != "filled":
             continue
 
-        ts = _dt_utc(getattr(o, "filled_at", None)) or _dt_utc(getattr(o, "submitted_at", None)) or _dt_utc(getattr(o, "updated_at", None))
+        ts = (
+            _dt_utc(getattr(o, "filled_at", None))
+            or _dt_utc(getattr(o, "submitted_at", None))
+            or _dt_utc(getattr(o, "updated_at", None))
+        )
         if not ts:
             continue
+
         if best is None or ts > best:
             best = ts
 
     return best
+
+
+def _recover_entry_ts(
+    tc: TradingClient,
+    db_engine,
+    sym: str,
+    pos_is_long: bool,
+    lookback_days: int,
+    prefix: str,
+) -> Optional[datetime]:
+    ts = _last_filled_entry_ts_from_db(
+        db_engine=db_engine,
+        sym=sym,
+        pos_is_long=pos_is_long,
+        lookback_days=lookback_days,
+        prefix=prefix,
+    )
+    if ts:
+        return ts
+
+    return _last_filled_entry_ts_from_api(
+        tc=tc,
+        sym=sym,
+        pos_is_long=pos_is_long,
+        lookback_days=lookback_days,
+    )
 
 
 def main():
@@ -342,8 +467,9 @@ def main():
     fractional_tp_market_close = _env_bool("FRACTIONAL_TP_MARKET_CLOSE", True)
     fractional_threshold = float(os.getenv("FRACTIONAL_QTY_THRESHOLD", "1.0"))
 
-    # NEW: TP min-hold (prevents daytrades on quick TP)
+    # TP min-hold (prevents daytrades on quick TP)
     tp_min_hold_minutes = int(os.getenv("TP_MIN_HOLD_MINUTES", os.getenv("MIN_HOLD_MINUTES", "0")))
+    entry_lookup_days = _env_int("ENTRY_LOOKBACK_DAYS", 14)
 
     prefix = (os.getenv("EXIT_PREFIX", "EXIT-OCO-") or "EXIT-OCO-").strip()
 
@@ -354,19 +480,24 @@ def main():
     LOG.info(
         "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | "
         "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | "
-        "fractional_threshold=%s | fractional_tp_market_close=%s | tp_min_hold_minutes=%s | dry_run=%s | prefix=%s | error_backoff=%ss",
+        "fractional_threshold=%s | fractional_tp_market_close=%s | tp_min_hold_minutes=%s | entry_lookup_days=%s | "
+        "dry_run=%s | prefix=%s | error_backoff=%ss",
         mode, paper, base, poll_seconds, heartbeat_seconds,
         use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct,
-        fractional_threshold, fractional_tp_market_close, tp_min_hold_minutes, dry_run, prefix, error_backoff_seconds
+        fractional_threshold, fractional_tp_market_close, tp_min_hold_minutes, entry_lookup_days,
+        dry_run, prefix, error_backoff_seconds
     )
 
     tc = get_trading_client()
     dc = get_data_client()
+    db_engine = get_engine()
 
     last_heartbeat = 0.0
     errors = 0
     last_fail_ts: Dict[str, float] = {}
     warned_fractional: Set[str] = set()
+    entry_ts_cache: Dict[str, datetime] = {}
+    tp_skip_log_ts: Dict[str, float] = {}
 
     while True:
         try:
@@ -379,6 +510,10 @@ def main():
                 qty = float(getattr(p, "qty", 0) or 0)
                 if qty != 0:
                     active_syms.add(sym)
+
+            for sym in list(entry_ts_cache.keys()):
+                if sym not in active_syms:
+                    entry_ts_cache.pop(sym, None)
 
             if cleanup_orphans:
                 _cleanup_orphan_exit_orders(tc, open_orders, active_syms, prefix)
@@ -404,6 +539,20 @@ def main():
                 exit_side = OrderSide.SELL if pos_is_long else OrderSide.BUY
                 intent = PositionIntent.SELL_TO_CLOSE if pos_is_long else PositionIntent.BUY_TO_CLOSE
 
+                if sym not in entry_ts_cache:
+                    recovered = _recover_entry_ts(
+                        tc=tc,
+                        db_engine=db_engine,
+                        sym=sym,
+                        pos_is_long=pos_is_long,
+                        lookback_days=entry_lookup_days,
+                        prefix=prefix,
+                    )
+                    if recovered:
+                        entry_ts_cache[sym] = recovered
+
+                entry_ts = entry_ts_cache.get(sym)
+
                 is_fractional = (qty_eff > 0 and qty_eff < fractional_threshold)
                 tif_eff = TimeInForce.DAY  # fractional always DAY
 
@@ -415,14 +564,26 @@ def main():
                 if use_atr:
                     atrp = _atr_pct(dc, sym, lookback=atr_lookback)
                     if atrp is None:
+                        if pos_is_long:
+                            tp = ref_price * (1.0 + tp_pct / 100.0)
+                            sl = ref_price * (1.0 - sl_pct / 100.0)
+                        else:
+                            tp = ref_price * (1.0 - tp_pct / 100.0)
+                            sl = ref_price * (1.0 + sl_pct / 100.0)
+                    else:
+                        if pos_is_long:
+                            tp = ref_price * (1.0 + atrp * atr_mult_tp)
+                            sl = ref_price * (1.0 - atrp * atr_mult_sl)
+                        else:
+                            tp = ref_price * (1.0 - atrp * atr_mult_tp)
+                            sl = ref_price * (1.0 + atrp * atr_mult_sl)
+                else:
+                    if pos_is_long:
                         tp = ref_price * (1.0 + tp_pct / 100.0)
                         sl = ref_price * (1.0 - sl_pct / 100.0)
                     else:
-                        tp = ref_price * (1.0 + atrp * atr_mult_tp)
-                        sl = ref_price * (1.0 - atrp * atr_mult_sl)
-                else:
-                    tp = ref_price * (1.0 + tp_pct / 100.0)
-                    sl = ref_price * (1.0 - sl_pct / 100.0)
+                        tp = ref_price * (1.0 - tp_pct / 100.0)
+                        sl = ref_price * (1.0 + sl_pct / 100.0)
 
                 tp, sl = _ensure_tp_sl(exit_side, tp, sl)
                 sl = _clamp_sl_away_from_market(exit_side, sl, cur_price, min_sl_gap_pct)
@@ -437,29 +598,31 @@ def main():
 
                 # TP hit handling for fractional (market close) with min-hold
                 if is_fractional and fractional_tp_market_close and _tp_hit(exit_side, cur_price, tp):
+                    sl_orders = _find_sl_orders(open_orders, sym, prefix)
+
                     if tp_min_hold_minutes > 0:
-                        entry_ts = _last_filled_entry_ts(tc, sym)
                         if entry_ts:
                             age_min = (_utc_now() - entry_ts).total_seconds() / 60.0
                             if age_min < tp_min_hold_minutes:
-                                LOG.info(
-                                    "tp_hit_but_min_hold_active | sym=%s age_min=%.1f < %s -> skip TPMKT",
-                                    sym, age_min, tp_min_hold_minutes
-                                )
-                                # keep SL only
-                                sl_orders = _find_sl_orders(open_orders, sym, prefix)
+                                if _should_log_throttled(tp_skip_log_ts, f"{sym}:min_hold", 60.0):
+                                    LOG.info(
+                                        "tp_hit_but_min_hold_active | sym=%s age_min=%.1f < %s -> skip TPMKT",
+                                        sym, age_min, tp_min_hold_minutes
+                                    )
                                 if sl_orders:
                                     protected += 1
                                 continue
                         else:
-                            LOG.warning("tp_hit_but_entry_ts_unknown | sym=%s -> skip TPMKT to avoid daytrade", sym)
-                            sl_orders = _find_sl_orders(open_orders, sym, prefix)
+                            if _should_log_throttled(tp_skip_log_ts, f"{sym}:entry_unknown", 60.0):
+                                LOG.warning(
+                                    "tp_hit_but_entry_ts_unknown | sym=%s -> skip TPMKT to avoid daytrade",
+                                    sym
+                                )
                             if sl_orders:
                                 protected += 1
                             continue
 
                     # cancel SL then market close
-                    sl_orders = _find_sl_orders(open_orders, sym, prefix)
                     for o in sl_orders:
                         oid = str(getattr(o, "id", "") or "")
                         if oid:
@@ -519,9 +682,10 @@ def main():
             if now - last_heartbeat >= heartbeat_seconds:
                 last_heartbeat = now
                 open_orders = _get_orders(tc, QueryOrderStatus.OPEN)
+                active_count = len(active_syms)
                 LOG.info(
                     "Heartbeat | positions=%s protected=%s placed=%s open_orders=%s errors=%s | unprotected=%s",
-                    len(positions), protected, placed, len(open_orders), errors, unprotected
+                    active_count, protected, placed, len(open_orders), errors, unprotected
                 )
 
         except Exception:
