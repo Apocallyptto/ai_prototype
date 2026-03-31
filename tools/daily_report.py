@@ -51,6 +51,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
+def _audit_episode_gap_seconds() -> int:
+    return max(60, _env_int("EXECUTION_AUDIT_EPISODE_GAP_SECONDS", 900))
+
+
 def _get_db_url() -> str:
     return (
         os.getenv("DB_URL")
@@ -689,13 +693,19 @@ def _fetch_execution_audit_block_summary(con) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "available": False,
         "reason_counts": [],
+        "episode_counts": [],
         "top_reason": None,
         "total_blocked": 0,
+        "total_blocked_episodes": 0,
         "source": "execution_audit",
         "state_reason_counts": [],
+        "state_episode_counts": [],
         "state_top_reason": None,
         "state_total": 0,
+        "state_total_episodes": 0,
         "raw_total_rows": 0,
+        "raw_total_episodes": 0,
+        "episode_gap_seconds": _audit_episode_gap_seconds(),
     }
 
     if not _table_exists(con, "execution_audit"):
@@ -703,14 +713,13 @@ def _fetch_execution_audit_block_summary(con) -> Dict[str, Any]:
 
     q = text("""
     SELECT
-      COALESCE(NULLIF(reason, ''), 'unknown') AS reason,
-      COUNT(*) AS cnt
+      ts,
+      COALESCE(NULLIF(reason, ''), 'unknown') AS reason
     FROM execution_audit
     WHERE event_type = 'blocked_signal'
       AND (ts AT TIME ZONE 'UTC') >= date_trunc('day', NOW() AT TIME ZONE 'UTC')
       AND (ts AT TIME ZONE 'UTC') <  date_trunc('day', NOW() AT TIME ZONE 'UTC') + interval '1 day'
-    GROUP BY COALESCE(NULLIF(reason, ''), 'unknown')
-    ORDER BY cnt DESC, reason ASC
+    ORDER BY ts ASC, id ASC
     """)
 
     rows = list(con.execute(q).fetchall())
@@ -718,30 +727,92 @@ def _fetch_execution_audit_block_summary(con) -> Dict[str, Any]:
     if not rows:
         return result
 
-    blocking_reason_counts: List[Tuple[str, int]] = []
-    state_reason_counts: List[Tuple[str, int]] = []
+    episode_gap_seconds = _audit_episode_gap_seconds()
+
+    blocking_row_counts: Dict[str, int] = defaultdict(int)
+    blocking_episode_counts: Dict[str, int] = defaultdict(int)
+    state_row_counts: Dict[str, int] = defaultdict(int)
+    state_episode_counts: Dict[str, int] = defaultdict(int)
+
     total_blocked = 0
+    total_blocked_episodes = 0
     state_total = 0
+    state_total_episodes = 0
     raw_total_rows = 0
+    raw_total_episodes = 0
+
+    prev_reason: Optional[str] = None
+    prev_ts: Optional[Any] = None
 
     for r in rows:
-        reason = str(r[0])
-        cnt = int(r[1] or 0)
-        raw_total_rows += cnt
-        if reason in NON_BLOCKING_AUDIT_REASONS:
-            state_reason_counts.append((reason, cnt))
-            state_total += cnt
-        else:
-            blocking_reason_counts.append((reason, cnt))
-            total_blocked += cnt
+        ts = r[0]
+        reason = str(r[1] or "unknown")
 
-    result["reason_counts"] = blocking_reason_counts
-    result["top_reason"] = blocking_reason_counts[0][0] if blocking_reason_counts else None
+        raw_total_rows += 1
+
+        is_state_reason = reason in NON_BLOCKING_AUDIT_REASONS
+        if is_state_reason:
+            state_row_counts[reason] += 1
+            state_total += 1
+        else:
+            blocking_row_counts[reason] += 1
+            total_blocked += 1
+
+        is_new_episode = False
+        if prev_reason != reason:
+            is_new_episode = True
+        elif prev_ts is None or ts is None:
+            is_new_episode = True
+        else:
+            try:
+                gap_seconds = (ts - prev_ts).total_seconds()
+            except Exception:
+                gap_seconds = None
+            if gap_seconds is None or gap_seconds > episode_gap_seconds:
+                is_new_episode = True
+
+        if is_new_episode:
+            raw_total_episodes += 1
+            if is_state_reason:
+                state_episode_counts[reason] += 1
+                state_total_episodes += 1
+            else:
+                blocking_episode_counts[reason] += 1
+                total_blocked_episodes += 1
+
+        prev_reason = reason
+        prev_ts = ts
+
+    reason_counts = sorted(blocking_row_counts.items(), key=lambda x: (-x[1], x[0]))
+    episode_counts = sorted(blocking_episode_counts.items(), key=lambda x: (-x[1], x[0]))
+    state_reason_counts = sorted(state_row_counts.items(), key=lambda x: (-x[1], x[0]))
+    state_episode_counts = sorted(state_episode_counts.items(), key=lambda x: (-x[1], x[0]))
+
+    top_reason = None
+    if episode_counts:
+        top_reason = episode_counts[0][0]
+    elif reason_counts:
+        top_reason = reason_counts[0][0]
+
+    state_top_reason = None
+    if state_episode_counts:
+        state_top_reason = state_episode_counts[0][0]
+    elif state_reason_counts:
+        state_top_reason = state_reason_counts[0][0]
+
+    result["reason_counts"] = reason_counts
+    result["episode_counts"] = episode_counts
+    result["top_reason"] = top_reason
     result["total_blocked"] = total_blocked
+    result["total_blocked_episodes"] = total_blocked_episodes
     result["state_reason_counts"] = state_reason_counts
-    result["state_top_reason"] = state_reason_counts[0][0] if state_reason_counts else None
+    result["state_episode_counts"] = state_episode_counts
+    result["state_top_reason"] = state_top_reason
     result["state_total"] = state_total
+    result["state_total_episodes"] = state_total_episodes
     result["raw_total_rows"] = raw_total_rows
+    result["raw_total_episodes"] = raw_total_episodes
+    result["episode_gap_seconds"] = episode_gap_seconds
     return result
 
 
@@ -751,31 +822,45 @@ def _merge_block_summaries(
 ) -> Dict[str, Any]:
     funnel = heuristic_summary["funnel"]
 
-    if audit_summary.get("available") and audit_summary.get("reason_counts"):
+    if audit_summary.get("available") and (
+        audit_summary.get("reason_counts") or audit_summary.get("episode_counts")
+    ):
         return {
             "funnel": funnel,
-            "reason_counts": audit_summary["reason_counts"],
-            "top_reason": audit_summary["top_reason"],
-            "total_blocked": audit_summary["total_blocked"],
+            "reason_counts": audit_summary.get("reason_counts", []),
+            "episode_counts": audit_summary.get("episode_counts", []),
+            "top_reason": audit_summary.get("top_reason"),
+            "total_blocked": audit_summary.get("total_blocked", 0),
+            "total_blocked_episodes": audit_summary.get("total_blocked_episodes", 0),
             "source": "execution_audit",
             "fallback_top_reason": heuristic_summary.get("top_reason"),
             "state_reason_counts": audit_summary.get("state_reason_counts", []),
+            "state_episode_counts": audit_summary.get("state_episode_counts", []),
             "state_top_reason": audit_summary.get("state_top_reason"),
             "state_total": audit_summary.get("state_total", 0),
+            "state_total_episodes": audit_summary.get("state_total_episodes", 0),
             "raw_total_rows": audit_summary.get("raw_total_rows", audit_summary.get("total_blocked", 0)),
+            "raw_total_episodes": audit_summary.get("raw_total_episodes", audit_summary.get("total_blocked_episodes", 0)),
+            "episode_gap_seconds": audit_summary.get("episode_gap_seconds", _audit_episode_gap_seconds()),
         }
 
     merged = {
         "funnel": funnel,
         "reason_counts": heuristic_summary.get("reason_counts", []),
+        "episode_counts": heuristic_summary.get("reason_counts", []),
         "top_reason": heuristic_summary.get("top_reason"),
         "total_blocked": heuristic_summary.get("total_blocked", 0),
+        "total_blocked_episodes": heuristic_summary.get("total_blocked", 0),
         "source": "heuristic",
         "fallback_top_reason": heuristic_summary.get("top_reason"),
         "state_reason_counts": audit_summary.get("state_reason_counts", []) if audit_summary.get("available") else [],
+        "state_episode_counts": audit_summary.get("state_episode_counts", []) if audit_summary.get("available") else [],
         "state_top_reason": audit_summary.get("state_top_reason") if audit_summary.get("available") else None,
         "state_total": audit_summary.get("state_total", 0) if audit_summary.get("available") else 0,
+        "state_total_episodes": audit_summary.get("state_total_episodes", 0) if audit_summary.get("available") else 0,
         "raw_total_rows": audit_summary.get("raw_total_rows", 0) if audit_summary.get("available") else 0,
+        "raw_total_episodes": audit_summary.get("raw_total_episodes", 0) if audit_summary.get("available") else 0,
+        "episode_gap_seconds": audit_summary.get("episode_gap_seconds", _audit_episode_gap_seconds()) if audit_summary.get("available") else _audit_episode_gap_seconds(),
     }
     return merged
 
@@ -1091,7 +1176,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc).isoformat()
 
     print("=" * 100)
-    print(f"DAILY REPORT V2.8 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print(f"DAILY REPORT V2.9 (UTC) | last {days} days | generated_at_utc={now_utc}")
     print("=" * 100)
 
     print("\n[0] OPERATOR SUMMARY")
@@ -1344,7 +1429,7 @@ def main() -> None:
     print("\nNotes:")
     print("  - Equity by day is based on equity_snapshots.")
     print("  - Today order summary uses Python-side normalization for OrderStatus.* / OrderSide.* values.")
-    print("  - BLOCK SUMMARY uses blocking audit reasons when available and keeps non-blocking executor state separately.")
+    print("  - BLOCK SUMMARY shows both raw audit rows and grouped reason episodes, while keeping non-blocking executor state separate.")
     print("  - In LONG_ONLY mode, entry funnel is based on eligible buy-entry signals, not sell signals.")
     print("  - Fresh signal counts use PICK_TTL_SECONDS to reflect what the picker could act on right now.")
     print("  - FINAL VERDICT treats market_closed as OK when there is no live exposure and no eligible entry action required.")
