@@ -77,6 +77,9 @@ class Cfg:
     notional_max: float
     confidence_full_strength: float
 
+    # PDT / daytrade entry gate
+    pause_on_daytrade_count_ge: int
+
 
 def _env_bool(key: str, default: bool) -> bool:
     v = os.getenv(key)
@@ -262,6 +265,7 @@ def _load_cfg() -> Cfg:
     cfg.notional_min = float(os.getenv("NOTIONAL_MIN", "5"))
     cfg.notional_max = float(os.getenv("NOTIONAL_MAX", str(cfg.max_notional)))
     cfg.confidence_full_strength = float(os.getenv("CONFIDENCE_FULL_STRENGTH", "1.0"))
+    cfg.pause_on_daytrade_count_ge = int(os.getenv("PAUSE_ON_DAYTRADE_COUNT_GE", "999"))
 
     if cfg.notional_min < 0:
         cfg.notional_min = 0.0
@@ -349,7 +353,7 @@ def _unprotected_symbols(positions: list, open_orders: list, exit_prefix: str) -
     return sorted(set(unprot))
 
 
-def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
+def _get_account_state(tc: TradingClient) -> Dict[str, Any]:
     try:
         a = tc.get_account()
         status = str(getattr(a, "status", "") or "")
@@ -360,28 +364,98 @@ def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
         dtbp = getattr(a, "daytrading_buying_power", None)
         dtc = getattr(a, "daytrade_count", None)
 
-        reason = f"status={status} trading_blocked={trading_blocked} account_blocked={account_blocked} pattern_day_trader={pdt}"
+        reason = (
+            f"status={status} trading_blocked={trading_blocked} "
+            f"account_blocked={account_blocked} pattern_day_trader={pdt}"
+        )
         if dtbp is not None:
             reason += f" daytrading_buying_power={dtbp}"
         if dtc is not None:
             reason += f" daytrade_count={dtc}"
 
-        pause_on_daytrade_ge = int(os.getenv("PAUSE_ON_DAYTRADE_COUNT_GE", "999"))
         try:
             dtc_int = int(dtc) if dtc is not None else None
         except Exception:
             dtc_int = None
 
-        if dtc_int is not None and dtc_int >= pause_on_daytrade_ge:
-            return True, reason + f" PAUSE_ON_DAYTRADE_COUNT_GE={pause_on_daytrade_ge}", "pdt_gate"
-
-        if trading_blocked or account_blocked:
-            return True, reason, "account_blocked"
-        if pause_on_pdt_flag and pdt:
-            return True, reason, "pdt_flag"
-        return False, reason, ""
+        return {
+            "ok": True,
+            "reason": reason,
+            "status": status,
+            "trading_blocked": trading_blocked,
+            "account_blocked": account_blocked,
+            "pattern_day_trader": pdt,
+            "daytrading_buying_power": dtbp,
+            "daytrade_count": dtc,
+            "daytrade_count_int": dtc_int,
+        }
     except Exception as e:
-        return False, f"account_check_failed err={e!r}", ""
+        return {
+            "ok": False,
+            "reason": f"account_check_failed err={e!r}",
+            "status": "",
+            "trading_blocked": False,
+            "account_blocked": False,
+            "pattern_day_trader": False,
+            "daytrading_buying_power": None,
+            "daytrade_count": None,
+            "daytrade_count_int": None,
+        }
+
+
+def _is_account_blocked(tc: TradingClient, pause_on_pdt_flag: bool):
+    state = _get_account_state(tc)
+    reason = str(state.get("reason", ""))
+
+    if not state.get("ok", False):
+        return False, reason, ""
+
+    if bool(state.get("trading_blocked", False)) or bool(state.get("account_blocked", False)):
+        return True, reason, "account_blocked"
+    if pause_on_pdt_flag and bool(state.get("pattern_day_trader", False)):
+        return True, reason, "pdt_flag"
+    return False, reason, ""
+
+
+def _is_entry_signal(cfg: Cfg, side: str, symbol: str, positions: list) -> bool:
+    side = str(side or "").lower()
+    symbol = str(symbol or "").upper()
+
+    if side == "buy":
+        return True
+    if side != "sell":
+        return False
+    if cfg.long_only or not cfg.allow_short:
+        return False
+
+    pos_qty = 0.0
+    for p in positions:
+        psym = str(getattr(p, "symbol", "") or "").upper()
+        if psym == symbol:
+            pos_qty = float(getattr(p, "qty", 0) or 0)
+            break
+
+    if pos_qty > 0:
+        return False
+    return True
+
+
+def _is_daytrade_count_gate_hit(tc: TradingClient, threshold: int):
+    if threshold <= 0:
+        return False, "", ""
+
+    state = _get_account_state(tc)
+    reason = str(state.get("reason", ""))
+    dtc_int = state.get("daytrade_count_int")
+
+    if not state.get("ok", False):
+        return False, reason, ""
+
+    if dtc_int is not None and int(dtc_int) >= int(threshold):
+        detail = f"{reason} PAUSE_ON_DAYTRADE_COUNT_GE={threshold}"
+        return True, detail, "pdt_gate"
+
+    return False, reason, ""
 
 
 def _dedupe_ok(engine, symbol: str, side: str, minutes: int) -> bool:
@@ -531,7 +605,6 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
         f"{symbol_col} IN :symbols",
         f"COALESCE({strength_col}, 0) >= :min_strength",
     ]
-
     params: Dict[str, Any] = {
         "symbols": cfg.symbols,
         "min_strength": cfg.min_strength,
@@ -546,7 +619,7 @@ def _pick_signal(engine, cfg: Cfg, seen_ids: Set[int]) -> Optional[Dict[str, Any
             f"""
             SELECT {", ".join(select_parts)}
             FROM signals
-            WHERE {" AND ".join(where_parts)}
+            WHERE {' AND '.join(where_parts)}
             ORDER BY {time_col} DESC
             LIMIT 25
             """
@@ -682,7 +755,7 @@ def main() -> None:
         "TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s | "
         "ALLOW_FRACTIONAL_MARKET=%s | EXIT_PREFIX=%s | PAUSE_ON_UNPROTECTED_POSITIONS=%s | PAUSE_ON_ACCOUNT_BLOCKED=%s | PAUSE_ON_PDT_FLAG=%s | "
         "EXIT_ON_SELL_SIGNAL=%s | MIN_HOLD_MINUTES=%s | CONFIDENCE_SIZING=%s | NOTIONAL_MIN=%.2f | NOTIONAL_MAX=%.2f | FULL_STRENGTH=%.2f | "
-        "DB_WARMUP_MAX_ATTEMPTS=%s | DB_WARMUP_SLEEP_SECONDS=%.1f",
+        "PAUSE_ON_DAYTRADE_COUNT_GE=%s | DB_WARMUP_MAX_ATTEMPTS=%s | DB_WARMUP_SLEEP_SECONDS=%.1f",
         mode, paper, base,
         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
         cfg.allow_short, cfg.long_only,
@@ -696,7 +769,7 @@ def main() -> None:
         cfg.exit_prefix, cfg.pause_on_unprotected_positions, cfg.pause_on_account_blocked, cfg.pause_on_pdt_flag,
         cfg.exit_on_sell_signal, cfg.min_hold_minutes,
         cfg.confidence_sizing, cfg.notional_min, cfg.notional_max, cfg.confidence_full_strength,
-        db_warmup_max_attempts, db_warmup_sleep_seconds,
+        cfg.pause_on_daytrade_count_ge, db_warmup_max_attempts, db_warmup_sleep_seconds,
     )
 
     _wait_for_db_ready(
@@ -891,6 +964,19 @@ def main() -> None:
                 seen_signal_ids.add(sig_id)
                 time.sleep(cfg.poll_seconds)
                 continue
+
+            is_entry_signal = _is_entry_signal(cfg, side, symbol, positions)
+            if is_entry_signal:
+                pdt_blocked, pdt_reason, pdt_reason_code = _is_daytrade_count_gate_hit(
+                    tc, cfg.pause_on_daytrade_count_ge
+                )
+                if pdt_blocked:
+                    detail = f"entry_symbol={symbol} side={side} {pdt_reason}"
+                    LOG.warning("gate_pdt_daytrade_count | %s | sleep=%ss", detail, cfg.poll_seconds)
+                    _safe_audit_block(sig, pdt_reason_code or "pdt_gate", detail)
+                    seen_signal_ids.add(sig_id)
+                    time.sleep(cfg.poll_seconds)
+                    continue
 
             if price <= 0:
                 LOG.info("skip no_price | %s", symbol)
