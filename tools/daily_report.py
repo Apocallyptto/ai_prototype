@@ -945,6 +945,19 @@ def _build_verdict(
     if daytrade_count is not None and int(daytrade_count or 0) >= 3:
         return "WARNING", f"PDT/daytrade guard threshold reached: daytrade_count={daytrade_count}"
 
+    blocking_reasons = [reason for reason, _count in (block_summary.get("reason_counts") or [])]
+    only_market_closed = bool(blocking_reasons) and set(blocking_reasons) == {"market_closed"}
+
+    no_live_exposure = (not live_positions) and (not live_open_orders)
+    no_entry_action_required = (
+        int(funnel.get("eligible_entry_signals_today", 0) or 0) == 0
+        and int(funnel.get("eligible_fresh_entry_signals_now", 0) or 0) == 0
+        and int(funnel.get("executed_entry_fills", 0) or 0) == 0
+    )
+
+    if only_market_closed and no_live_exposure and no_entry_action_required:
+        return "OK", "market closed; no eligible entry action required"
+
     if block_summary.get("top_reason"):
         return "WARNING", f"eligible entry signals blocked: {block_summary.get('top_reason')}"
 
@@ -1054,7 +1067,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc).isoformat()
 
     print("=" * 100)
-    print(f"DAILY REPORT V2.6 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print(f"DAILY REPORT V2.7 (UTC) | last {days} days | generated_at_utc={now_utc}")
     print("=" * 100)
 
     print("\n[0] OPERATOR SUMMARY")
@@ -1310,6 +1323,7 @@ def main() -> None:
     print("  - BLOCK SUMMARY uses blocking audit reasons when available and keeps non-blocking executor state separately.")
     print("  - In LONG_ONLY mode, entry funnel is based on eligible buy-entry signals, not sell signals.")
     print("  - Fresh signal counts use PICK_TTL_SECONDS to reflect what the picker could act on right now.")
+    print("  - FINAL VERDICT treats market_closed as OK when there is no live exposure and no eligible entry action required.")
     print("  - Realized trade summary is FIFO-based approximation from filled alpaca_orders rows.")
     print("  - Aggregate performance summary is computed from the same FIFO-matched closed trades.")
     print("  - Live positions/open orders come from Alpaca API when credentials are available.")
