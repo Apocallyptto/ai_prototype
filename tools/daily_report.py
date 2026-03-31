@@ -16,6 +16,7 @@ except Exception:
 
 
 NON_BLOCKING_AUDIT_REASONS = {"no_signal"}
+BENIGN_POST_TRADE_BLOCK_REASONS = {"market_closed", "max_open_positions"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -340,6 +341,15 @@ def _fetch_recent_order_rows(con, days: int, limit_rows: int = 20) -> List[Tuple
     return list(con.execute(q, {"days": days, "limit_rows": limit_rows}).fetchall())
 
 
+def _filled_row_sort_key(r: Tuple) -> Tuple[Any, int, str, str]:
+    ts = r[0]
+    side_s = _normalize_side(r[2])
+    side_rank = 0 if side_s == "buy" else 1 if side_s == "sell" else 2
+    cid = str(r[9] or "")
+    typ = str(r[4] or "")
+    return (ts, side_rank, cid, typ)
+
+
 def _fetch_filled_order_rows(con, days: int) -> List[Tuple]:
     q = text("""
     SELECT
@@ -358,7 +368,9 @@ def _fetch_filled_order_rows(con, days: int) -> List[Tuple]:
     ORDER BY recorded_at ASC
     """)
     rows = list(con.execute(q, {"days": days}).fetchall())
-    return [r for r in rows if _normalize_status(r[3]) == "filled"]
+    rows = [r for r in rows if _normalize_status(r[3]) == "filled"]
+    rows.sort(key=_filled_row_sort_key)
+    return rows
 
 
 def _fetch_system_flags(con) -> Dict[str, str]:
@@ -945,7 +957,7 @@ def _build_verdict(
     if daytrade_count is not None and int(daytrade_count or 0) >= 3:
         return "WARNING", f"PDT/daytrade guard threshold reached: daytrade_count={daytrade_count}"
 
-    blocking_reasons = [reason for reason, _count in (block_summary.get("reason_counts") or [])]
+    blocking_reasons = [reason for reason, _count in (block_summary.get("reason_counts") or []) if reason]
     only_market_closed = bool(blocking_reasons) and set(blocking_reasons) == {"market_closed"}
 
     no_live_exposure = (not live_positions) and (not live_open_orders)
@@ -954,6 +966,18 @@ def _build_verdict(
         and int(funnel.get("eligible_fresh_entry_signals_now", 0) or 0) == 0
         and int(funnel.get("executed_entry_fills", 0) or 0) == 0
     )
+
+    successful_flat_trade_day = (
+        no_live_exposure
+        and int(funnel.get("executed_entry_fills", 0) or 0) > 0
+        and int(funnel.get("executed_sell_fills", 0) or 0) > 0
+    )
+
+    if successful_flat_trade_day:
+        if not blocking_reasons:
+            return "OK", "trade executed and position closed successfully"
+        if set(blocking_reasons).issubset(BENIGN_POST_TRADE_BLOCK_REASONS):
+            return "OK", "trade executed and position closed; remaining block reasons are expected post-trade/market-state gates"
 
     if only_market_closed and no_live_exposure and no_entry_action_required:
         return "OK", "market closed; no eligible entry action required"
@@ -1067,7 +1091,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc).isoformat()
 
     print("=" * 100)
-    print(f"DAILY REPORT V2.7 (UTC) | last {days} days | generated_at_utc={now_utc}")
+    print(f"DAILY REPORT V2.8 (UTC) | last {days} days | generated_at_utc={now_utc}")
     print("=" * 100)
 
     print("\n[0] OPERATOR SUMMARY")
@@ -1324,6 +1348,8 @@ def main() -> None:
     print("  - In LONG_ONLY mode, entry funnel is based on eligible buy-entry signals, not sell signals.")
     print("  - Fresh signal counts use PICK_TTL_SECONDS to reflect what the picker could act on right now.")
     print("  - FINAL VERDICT treats market_closed as OK when there is no live exposure and no eligible entry action required.")
+    print("  - FINAL VERDICT also treats successful flat trade days as OK when remaining block reasons are only benign market-state/post-trade gates.")
+    print("  - Realized trade summary sorts same-timestamp filled rows deterministically so BUY lots are matched before SELL exits.")
     print("  - Realized trade summary is FIFO-based approximation from filled alpaca_orders rows.")
     print("  - Aggregate performance summary is computed from the same FIFO-matched closed trades.")
     print("  - Live positions/open orders come from Alpaca API when credentials are available.")
