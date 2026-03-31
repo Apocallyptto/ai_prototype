@@ -1,7 +1,11 @@
 import os
-from typing import Any, Dict, Optional
+from functools import lru_cache
+from typing import Any, Dict, Optional, Set
 
 from sqlalchemy import create_engine, text
+
+
+_TABLE_READY = False
 
 
 def _get_db_url() -> str:
@@ -12,11 +16,49 @@ def _get_db_url() -> str:
     )
 
 
+@lru_cache(maxsize=1)
 def _engine():
     return create_engine(_get_db_url())
 
 
-def ensure_table() -> None:
+def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+def _env_csv_set(key: str, default_csv: str) -> Set[str]:
+    raw = os.getenv(key, default_csv)
+    parts = [x.strip() for x in str(raw).split(",") if x.strip()]
+    return {x.lower() for x in parts}
+
+
+def _normalize_text(value: Optional[Any]) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _throttle_seconds() -> int:
+    return max(0, _env_int("EXECUTION_AUDIT_THROTTLE_SECONDS", 300))
+
+
+def _throttle_reasons() -> Set[str]:
+    return _env_csv_set(
+        "EXECUTION_AUDIT_THROTTLE_REASONS",
+        "pdt_gate,market_closed,no_signal,max_open_positions",
+    )
+
+
+def ensure_table(force: bool = False) -> None:
+    global _TABLE_READY
+    if _TABLE_READY and not force:
+        return
+
     sql = """
     CREATE TABLE IF NOT EXISTS execution_audit (
         id BIGSERIAL PRIMARY KEY,
@@ -49,6 +91,58 @@ def ensure_table() -> None:
         for stmt in [x.strip() for x in sql.split(";") if x.strip()]:
             con.execute(text(stmt))
 
+    _TABLE_READY = True
+
+
+def _should_throttle(
+    event_type: str,
+    symbol: Optional[str],
+    side: Optional[str],
+    reason: Optional[str],
+    detail: Optional[str],
+) -> bool:
+    if event_type != "blocked_signal":
+        return False
+
+    seconds = _throttle_seconds()
+    if seconds <= 0:
+        return False
+
+    reason_norm = _normalize_text(reason).strip().lower()
+    if not reason_norm:
+        return False
+
+    allowed = _throttle_reasons()
+    if "*" not in allowed and reason_norm not in allowed:
+        return False
+
+    q = text(
+        """
+        SELECT 1
+        FROM execution_audit
+        WHERE event_type = :event_type
+          AND COALESCE(symbol, '') = :symbol
+          AND COALESCE(side, '') = :side
+          AND COALESCE(reason, '') = :reason
+          AND COALESCE(detail, '') = :detail
+          AND ts >= NOW() - (:window_seconds || ' seconds')::interval
+        LIMIT 1
+        """
+    )
+
+    params = {
+        "event_type": _normalize_text(event_type),
+        "symbol": _normalize_text(symbol),
+        "side": _normalize_text(side),
+        "reason": _normalize_text(reason),
+        "detail": _normalize_text(detail),
+        "window_seconds": seconds,
+    }
+
+    with _engine().begin() as con:
+        row = con.execute(q, params).fetchone()
+        return row is not None
+
 
 def log_event(
     event_type: str,
@@ -62,6 +156,16 @@ def log_event(
     signal_ts: Optional[Any] = None,
 ) -> None:
     ensure_table()
+
+    if _should_throttle(
+        event_type=event_type,
+        symbol=symbol,
+        side=side,
+        reason=reason,
+        detail=detail,
+    ):
+        return
+
     q = text(
         """
         INSERT INTO execution_audit (
