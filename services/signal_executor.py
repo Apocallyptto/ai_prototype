@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Set, Tuple, Sequence
 
 from sqlalchemy import text, bindparam
+from sqlalchemy.exc import OperationalError
 
 from tools.db import get_engine
 from tools.system_flags import get_flag
@@ -84,6 +85,26 @@ def _env_bool(key: str, default: bool) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int_value(key: str, default: int) -> int:
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _env_float_value(key: str, default: float) -> float:
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
 def _resolve_mode_and_paper() -> Tuple[str, bool, str]:
     mode = (os.getenv("TRADING_MODE") or "").strip().lower()
     if mode in {"paper", "live"}:
@@ -119,6 +140,48 @@ def _to_utc_aware(dt: Any) -> Optional[datetime]:
 
 def _round_price(p: float) -> float:
     return float(f"{p:.2f}")
+
+
+def _db_ping(engine) -> None:
+    with engine.connect() as con:
+        con.execute(text("SELECT 1"))
+
+
+def _wait_for_db_ready(engine, max_attempts: int, sleep_seconds: float) -> None:
+    """
+    Wait until DB hostname resolves and a simple query succeeds.
+
+    max_attempts:
+      - 0 or negative => infinite retry
+      - positive => bounded retry
+    """
+    attempt = 0
+    last_err: Optional[Exception] = None
+    attempt_label = "∞" if max_attempts <= 0 else str(max_attempts)
+
+    while True:
+        attempt += 1
+        try:
+            _db_ping(engine)
+            LOG.info("db_ready | attempts=%s", attempt)
+            return
+        except Exception as e:
+            last_err = e
+            if attempt == 1 or attempt % 5 == 0:
+                LOG.warning(
+                    "db_wait_retry | attempt=%s/%s | sleep=%.1fs | err=%r",
+                    attempt,
+                    attempt_label,
+                    sleep_seconds,
+                    e,
+                )
+
+            if max_attempts > 0 and attempt >= max_attempts:
+                raise RuntimeError(
+                    f"DB not ready after {attempt} attempts; last_err={last_err!r}"
+                ) from last_err
+
+            time.sleep(max(0.1, float(sleep_seconds)))
 
 
 def _safe_audit_block(sig: Optional[Dict[str, Any]], reason: str, detail: str) -> None:
@@ -608,6 +671,9 @@ def main() -> None:
     engine = get_engine()
     tc, mode, paper, base = make_trading_client()
 
+    db_warmup_max_attempts = _env_int_value("DB_WARMUP_MAX_ATTEMPTS", 30)
+    db_warmup_sleep_seconds = _env_float_value("DB_WARMUP_SLEEP_SECONDS", 2.0)
+
     LOG.info(
         "signal_executor starting | MODE=%s | paper=%s | base=%s | MIN_STRENGTH=%.4f | SYMBOLS=%s | PORTFOLIO_ID=%s | POLL=%ss | "
         "ALLOW_SHORT=%s | LONG_ONLY=%s | MAX_NOTIONAL=%.2f | MAX_QTY=%.1f | MAX_POSITION_QTY=%.1f | ALLOW_ADD_TO_POSITION=%s | "
@@ -615,7 +681,8 @@ def main() -> None:
         "SYMBOL_COOLDOWN_SECONDS=%s | PICK_TTL_SECONDS=%s | "
         "TRADE_ONLY_WHEN_MARKET_OPEN=%s | PREOPEN_WINDOW_SECONDS=%s | ALLOW_TRADE_ON_CLOCK_ERROR=%s | TRADING_PAUSED=%s | DRY_RUN=%s | "
         "ALLOW_FRACTIONAL_MARKET=%s | EXIT_PREFIX=%s | PAUSE_ON_UNPROTECTED_POSITIONS=%s | PAUSE_ON_ACCOUNT_BLOCKED=%s | PAUSE_ON_PDT_FLAG=%s | "
-        "EXIT_ON_SELL_SIGNAL=%s | MIN_HOLD_MINUTES=%s | CONFIDENCE_SIZING=%s | NOTIONAL_MIN=%.2f | NOTIONAL_MAX=%.2f | FULL_STRENGTH=%.2f",
+        "EXIT_ON_SELL_SIGNAL=%s | MIN_HOLD_MINUTES=%s | CONFIDENCE_SIZING=%s | NOTIONAL_MIN=%.2f | NOTIONAL_MAX=%.2f | FULL_STRENGTH=%.2f | "
+        "DB_WARMUP_MAX_ATTEMPTS=%s | DB_WARMUP_SLEEP_SECONDS=%.1f",
         mode, paper, base,
         cfg.min_strength, cfg.symbols, cfg.portfolio_id, cfg.poll_seconds,
         cfg.allow_short, cfg.long_only,
@@ -629,6 +696,13 @@ def main() -> None:
         cfg.exit_prefix, cfg.pause_on_unprotected_positions, cfg.pause_on_account_blocked, cfg.pause_on_pdt_flag,
         cfg.exit_on_sell_signal, cfg.min_hold_minutes,
         cfg.confidence_sizing, cfg.notional_min, cfg.notional_max, cfg.confidence_full_strength,
+        db_warmup_max_attempts, db_warmup_sleep_seconds,
+    )
+
+    _wait_for_db_ready(
+        engine=engine,
+        max_attempts=db_warmup_max_attempts,
+        sleep_seconds=db_warmup_sleep_seconds,
     )
 
     seen_signal_ids: Set[int] = set()
@@ -917,6 +991,10 @@ def main() -> None:
             seen_signal_ids.add(sig_id)
             last_submit_ts_by_symbol[symbol] = now_ts
 
+        except OperationalError as e:
+            LOG.warning("loop_db_error | sleep=%ss | err=%r", cfg.poll_seconds, e)
+            time.sleep(cfg.poll_seconds)
+            continue
         except Exception as e:
             LOG.exception("loop_error: %r", e)
 
