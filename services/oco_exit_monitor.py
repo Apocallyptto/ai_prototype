@@ -21,7 +21,7 @@ from alpaca.trading.requests import (
 
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from sqlalchemy import text
 
@@ -139,10 +139,30 @@ def _should_log_throttled(bucket: Dict[str, float], key: str, min_interval_sec: 
     return False
 
 
-def _atr_pct(dc: StockHistoricalDataClient, sym: str, lookback: int = 50) -> Optional[float]:
-    """Return ATR/close (e.g. 0.0012 = 0.12%)."""
+def _bar_timeframe_from_minutes(minutes: int):
+    mins = max(1, int(minutes))
+    if mins == 1:
+        return TimeFrame.Minute
     try:
-        req = StockBarsRequest(symbol_or_symbols=sym, timeframe=TimeFrame.Minute, limit=lookback)
+        return TimeFrame(amount=mins, unit=TimeFrameUnit.Minute)
+    except Exception:
+        LOG.warning("invalid_atr_timeframe_minutes | minutes=%s -> fallback=1m", mins)
+        return TimeFrame.Minute
+
+
+def _atr_pct(
+    dc: StockHistoricalDataClient,
+    sym: str,
+    lookback: int = 50,
+    timeframe_minutes: int = 5,
+) -> Optional[float]:
+    """Return ATR/close (e.g. 0.012 = 1.2%) using configurable minute bars."""
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=sym,
+            timeframe=_bar_timeframe_from_minutes(timeframe_minutes),
+            limit=max(2, int(lookback)),
+        )
         bars = dc.get_stock_bars(req).data.get(sym, [])
         if not bars or len(bars) < 2:
             return None
@@ -250,6 +270,23 @@ def _tp_hit(exit_side: OrderSide, cur: float, tp: float) -> bool:
     if exit_side == OrderSide.SELL:
         return cur >= tp
     return cur <= tp
+
+
+def _effective_tp_sl_pcts(
+    atrp: Optional[float],
+    atr_mult_tp: float,
+    atr_mult_sl: float,
+    tp_pct_floor: float,
+    sl_pct_floor: float,
+) -> Tuple[float, float]:
+    tp_eff = max(0.0, float(tp_pct_floor))
+    sl_eff = max(0.0, float(sl_pct_floor))
+
+    if atrp is not None and atrp > 0:
+        tp_eff = max(tp_eff, float(atrp) * float(atr_mult_tp) * 100.0)
+        sl_eff = max(sl_eff, float(atrp) * float(atr_mult_sl) * 100.0)
+
+    return tp_eff, sl_eff
 
 
 def _find_sl_orders(open_orders, sym: str, prefix: str) -> list:
@@ -451,11 +488,14 @@ def main():
 
     use_atr = _env_bool("USE_ATR", True)
     atr_lookback = _env_int("ATR_LOOKBACK", 50)
+    atr_timeframe_minutes = _env_int("ATR_TIMEFRAME_MINUTES", 5)
     atr_mult_tp = _env_float("ATR_MULT_TP", 2.0)
     atr_mult_sl = _env_float("ATR_MULT_SL", 1.5)
 
     tp_pct = _env_float("TP_PCT", 5.0)
     sl_pct = _env_float("SL_PCT", 3.0)
+    tp_pct_floor = _env_float("TP_PCT_FLOOR", tp_pct)
+    sl_pct_floor = _env_float("SL_PCT_FLOOR", sl_pct)
 
     min_sl_gap_pct = _env_float("MIN_SL_GAP_PCT", 0.20)
 
@@ -479,11 +519,13 @@ def main():
 
     LOG.info(
         "oco_exit_monitor starting | mode=%s | paper=%s | base=%s | poll=%ss | heartbeat=%ss | "
-        "use_atr=%s | atr_lookback=%s | atr_mult_tp=%s | atr_mult_sl=%s | tp_pct=%s | sl_pct=%s | "
+        "use_atr=%s | atr_lookback=%s | atr_timeframe_minutes=%s | atr_mult_tp=%s | atr_mult_sl=%s | "
+        "tp_pct=%s | sl_pct=%s | tp_pct_floor=%s | sl_pct_floor=%s | "
         "fractional_threshold=%s | fractional_tp_market_close=%s | tp_min_hold_minutes=%s | entry_lookup_days=%s | "
         "dry_run=%s | prefix=%s | error_backoff=%ss",
         mode, paper, base, poll_seconds, heartbeat_seconds,
-        use_atr, atr_lookback, atr_mult_tp, atr_mult_sl, tp_pct, sl_pct,
+        use_atr, atr_lookback, atr_timeframe_minutes, atr_mult_tp, atr_mult_sl,
+        tp_pct, sl_pct, tp_pct_floor, sl_pct_floor,
         fractional_threshold, fractional_tp_market_close, tp_min_hold_minutes, entry_lookup_days,
         dry_run, prefix, error_backoff_seconds
     )
@@ -560,30 +602,31 @@ def main():
                 if ref_price <= 0 or cur_price <= 0:
                     continue
 
-                # compute tp/sl
+                # compute tp/sl in a swing-friendly way:
+                # ATR may widen exits further, but configured pct floors prevent ultra-tight minute-noise stops.
+                atrp = None
                 if use_atr:
-                    atrp = _atr_pct(dc, sym, lookback=atr_lookback)
-                    if atrp is None:
-                        if pos_is_long:
-                            tp = ref_price * (1.0 + tp_pct / 100.0)
-                            sl = ref_price * (1.0 - sl_pct / 100.0)
-                        else:
-                            tp = ref_price * (1.0 - tp_pct / 100.0)
-                            sl = ref_price * (1.0 + sl_pct / 100.0)
-                    else:
-                        if pos_is_long:
-                            tp = ref_price * (1.0 + atrp * atr_mult_tp)
-                            sl = ref_price * (1.0 - atrp * atr_mult_sl)
-                        else:
-                            tp = ref_price * (1.0 - atrp * atr_mult_tp)
-                            sl = ref_price * (1.0 + atrp * atr_mult_sl)
+                    atrp = _atr_pct(
+                        dc,
+                        sym,
+                        lookback=atr_lookback,
+                        timeframe_minutes=atr_timeframe_minutes,
+                    )
+
+                tp_pct_eff, sl_pct_eff = _effective_tp_sl_pcts(
+                    atrp=atrp,
+                    atr_mult_tp=atr_mult_tp,
+                    atr_mult_sl=atr_mult_sl,
+                    tp_pct_floor=tp_pct_floor,
+                    sl_pct_floor=sl_pct_floor,
+                )
+
+                if pos_is_long:
+                    tp = ref_price * (1.0 + tp_pct_eff / 100.0)
+                    sl = ref_price * (1.0 - sl_pct_eff / 100.0)
                 else:
-                    if pos_is_long:
-                        tp = ref_price * (1.0 + tp_pct / 100.0)
-                        sl = ref_price * (1.0 - sl_pct / 100.0)
-                    else:
-                        tp = ref_price * (1.0 - tp_pct / 100.0)
-                        sl = ref_price * (1.0 + sl_pct / 100.0)
+                    tp = ref_price * (1.0 - tp_pct_eff / 100.0)
+                    sl = ref_price * (1.0 + sl_pct_eff / 100.0)
 
                 tp, sl = _ensure_tp_sl(exit_side, tp, sl)
                 sl = _clamp_sl_away_from_market(exit_side, sl, cur_price, min_sl_gap_pct)
@@ -592,8 +635,8 @@ def main():
                     warned_fractional.add(sym)
                     LOG.warning(
                         "fractional_mode | sym=%s qty=%.6f -> keep SL only; TP will be market-close on hit (if enabled) "
-                        "AND only after tp_min_hold_minutes=%s",
-                        sym, qty_eff, tp_min_hold_minutes
+                        "AND only after tp_min_hold_minutes=%s | atr_tf_min=%s | tp_floor_pct=%s | sl_floor_pct=%s",
+                        sym, qty_eff, tp_min_hold_minutes, atr_timeframe_minutes, tp_pct_floor, sl_pct_floor
                     )
 
                 # TP hit handling for fractional (market close) with min-hold
