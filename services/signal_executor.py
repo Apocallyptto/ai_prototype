@@ -218,6 +218,117 @@ def _safe_audit_submit(sig: Optional[Dict[str, Any]], detail: str) -> None:
         LOG.warning("audit_submit_failed | err=%r", e)
 
 
+RUNTIME_PDT_PAUSE_REASON = "PDT_DAYTRADE_THRESHOLD"
+
+
+def _system_flag_schema(engine) -> Optional[Dict[str, Optional[str]]]:
+    if not _table_exists(engine, "system_flags"):
+        LOG.warning("system_flags table not found")
+        return None
+
+    cols = _table_columns(engine, "system_flags")
+    key_col = _pick_first(cols, ["key", "flag", "name"])
+    value_col = _pick_first(cols, ["value", "val", "flag_value"])
+    updated_col = _pick_first(cols, ["updated_at", "updated_ts", "modified_at", "ts"])
+
+    if not key_col or not value_col:
+        LOG.warning("system_flags schema missing key/value columns | cols=%s", cols)
+        return None
+
+    return {
+        "key_col": key_col,
+        "value_col": value_col,
+        "updated_col": updated_col,
+    }
+
+
+def _set_system_flag(engine, flag_key: str, flag_value: str) -> bool:
+    schema = _system_flag_schema(engine)
+    if not schema:
+        return False
+
+    key_col = str(schema["key_col"])
+    value_col = str(schema["value_col"])
+    updated_col = schema["updated_col"]
+
+    if updated_col:
+        update_sql = text(
+            f'''
+            UPDATE system_flags
+            SET {value_col} = :flag_value,
+                {updated_col} = NOW()
+            WHERE {key_col} = :flag_key
+            '''
+        )
+        insert_sql = text(
+            f'''
+            INSERT INTO system_flags ({key_col}, {value_col}, {updated_col})
+            VALUES (:flag_key, :flag_value, NOW())
+            '''
+        )
+    else:
+        update_sql = text(
+            f'''
+            UPDATE system_flags
+            SET {value_col} = :flag_value
+            WHERE {key_col} = :flag_key
+            '''
+        )
+        insert_sql = text(
+            f'''
+            INSERT INTO system_flags ({key_col}, {value_col})
+            VALUES (:flag_key, :flag_value)
+            '''
+        )
+
+    params = {"flag_key": str(flag_key), "flag_value": str(flag_value)}
+    try:
+        with engine.begin() as con:
+            res = con.execute(update_sql, params)
+            if int(getattr(res, "rowcount", 0) or 0) == 0:
+                con.execute(insert_sql, params)
+        return True
+    except Exception as e:
+        LOG.warning("set_system_flag_failed | key=%s value=%s err=%r", flag_key, flag_value, e)
+        return False
+
+
+def _is_runtime_pdt_pause_reason(reason: str) -> bool:
+    return str(reason or "").startswith(RUNTIME_PDT_PAUSE_REASON)
+
+
+def _sync_runtime_pdt_pause(engine, tc: TradingClient, threshold: int) -> Tuple[bool, str]:
+    blocked, detail, _ = _is_daytrade_count_gate_hit(tc, threshold)
+
+    db_paused = get_flag("TRADING_PAUSED", "0") == "1"
+    db_pause_reason = get_flag("TRADING_PAUSED_REASON", "")
+    owns_reason = _is_runtime_pdt_pause_reason(db_pause_reason)
+
+    if blocked:
+        desired_reason = f"{RUNTIME_PDT_PAUSE_REASON} | {detail}"
+        if (not db_paused) or owns_reason:
+            reason_changed = db_pause_reason != desired_reason
+            paused_changed = not db_paused
+            if paused_changed:
+                _set_system_flag(engine, "TRADING_PAUSED", "1")
+            if reason_changed:
+                _set_system_flag(engine, "TRADING_PAUSED_REASON", desired_reason)
+            if paused_changed or reason_changed:
+                LOG.warning("runtime_pdt_pause_set | reason=%s", desired_reason)
+        return True, desired_reason
+
+    if owns_reason:
+        changed = False
+        if db_paused:
+            changed = _set_system_flag(engine, "TRADING_PAUSED", "0") or changed
+        if db_pause_reason:
+            changed = _set_system_flag(engine, "TRADING_PAUSED_REASON", "") or changed
+        if changed:
+            LOG.info("runtime_pdt_pause_cleared")
+
+    return False, detail
+
+
 def _load_cfg() -> Cfg:
     cfg = Cfg()
     cfg.poll_seconds = int(os.getenv("EXECUTOR_POLL_SECONDS", os.getenv("POLL_SECONDS", "20")))
@@ -453,7 +564,7 @@ def _is_daytrade_count_gate_hit(tc: TradingClient, threshold: int):
 
     if dtc_int is not None and int(dtc_int) >= int(threshold):
         detail = f"{reason} PAUSE_ON_DAYTRADE_COUNT_GE={threshold}"
-        return True, detail, "pdt_gate"
+        return True, detail, "pdt_daytrade_threshold"
 
     return False, reason, ""
 
@@ -784,11 +895,25 @@ def main() -> None:
 
     while True:
         try:
+            runtime_pdt_paused, runtime_pdt_reason = _sync_runtime_pdt_pause(
+                engine, tc, cfg.pause_on_daytrade_count_ge
+            )
+
             db_paused = get_flag("TRADING_PAUSED", "0") == "1"
             db_pause_reason = get_flag("TRADING_PAUSED_REASON", "")
             if db_paused:
-                LOG.warning("trading_paused_by_db_flag | reason=%s", db_pause_reason)
-                _safe_audit_block(None, "trading_paused_db", f"reason={db_pause_reason}")
+                if _is_runtime_pdt_pause_reason(db_pause_reason):
+                    LOG.warning("gate_pdt_runtime_pause | %s | sleep=%ss", db_pause_reason, cfg.poll_seconds)
+                    _safe_audit_block(None, "pdt_daytrade_threshold", db_pause_reason)
+                else:
+                    LOG.warning("trading_paused_by_db_flag | reason=%s", db_pause_reason)
+                    _safe_audit_block(None, "trading_paused_db", f"reason={db_pause_reason}")
+                time.sleep(cfg.poll_seconds)
+                continue
+
+            if runtime_pdt_paused:
+                LOG.warning("gate_pdt_runtime_pause | %s | sleep=%ss", runtime_pdt_reason, cfg.poll_seconds)
+                _safe_audit_block(None, "pdt_daytrade_threshold", runtime_pdt_reason)
                 time.sleep(cfg.poll_seconds)
                 continue
 
