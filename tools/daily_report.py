@@ -1019,19 +1019,23 @@ def _build_verdict(
     guard_status = flags.get("GUARD_STATUS", "")
     trading_paused = flags.get("TRADING_PAUSED", "")
     paused_reason = flags.get("TRADING_PAUSED_REASON", "")
+    paused_reason_upper = str(paused_reason or "").upper()
     daytrade_count = None
     if latest_snapshot is not None:
         daytrade_count = latest_snapshot[7]
 
     funnel = block_summary["funnel"]
     fresh_window_seconds = int(signal_summary.get("fresh_window_seconds") or 0)
-
-    if trading_paused == "1":
-        return "ACTION NEEDED", f"TRADING_PAUSED=1 reason={paused_reason or '-'}"
+    no_live_exposure = (not live_positions) and (not live_open_orders)
 
     if live_positions and not live_open_orders:
         syms = ",".join(sorted({str(getattr(p, 'symbol', '?')) for p in live_positions}))
         return "ACTION NEEDED", f"open position(s) without open exit order(s): {syms}"
+
+    if trading_paused == "1":
+        if no_live_exposure and "PDT_DAYTRADE_THRESHOLD" in paused_reason_upper:
+            return "WARNING", f"bot paused by PDT/daytrade threshold while flat: {paused_reason or '-'}"
+        return "ACTION NEEDED", f"TRADING_PAUSED=1 reason={paused_reason or '-'}"
 
     if isinstance(guard_status, str) and guard_status.startswith("ERROR"):
         return "WARNING", f"guard reports ERROR: {guard_status}"
@@ -1045,7 +1049,6 @@ def _build_verdict(
     blocking_reasons = [reason for reason, _count in (block_summary.get("reason_counts") or []) if reason]
     only_market_closed = bool(blocking_reasons) and set(blocking_reasons) == {"market_closed"}
 
-    no_live_exposure = (not live_positions) and (not live_open_orders)
     no_entry_action_required = (
         int(funnel.get("eligible_entry_signals_today", 0) or 0) == 0
         and int(funnel.get("eligible_fresh_entry_signals_now", 0) or 0) == 0
@@ -1433,6 +1436,7 @@ def main() -> None:
     print("  - In LONG_ONLY mode, entry funnel is based on eligible buy-entry signals, not sell signals.")
     print("  - Fresh signal counts use PICK_TTL_SECONDS to reflect what the picker could act on right now.")
     print("  - FINAL VERDICT treats market_closed as OK when there is no live exposure and no eligible entry action required.")
+    print("  - FINAL VERDICT treats flat PDT/daytrade threshold pauses as WARNING, while paused states with live exposure remain ACTION NEEDED.")
     print("  - FINAL VERDICT also treats successful flat trade days as OK when remaining block reasons are only benign market-state/post-trade gates.")
     print("  - Realized trade summary sorts same-timestamp filled rows deterministically so BUY lots are matched before SELL exits.")
     print("  - Realized trade summary is FIFO-based approximation from filled alpaca_orders rows.")
