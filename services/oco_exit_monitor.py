@@ -295,6 +295,18 @@ def _find_sl_orders(open_orders, sym: str, prefix: str) -> list:
     return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
 
 
+def _find_prefixed_exit_orders(open_orders, sym: str, prefix: str) -> list:
+    symu = sym.upper()
+    pref = f"{prefix}{symu}-"
+    return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
+
+
+def _find_pending_tp_market_orders(open_orders, sym: str, prefix: str) -> list:
+    symu = sym.upper()
+    pref = f"{prefix}{symu}-TPMKT-"
+    return [o for o in open_orders if (getattr(o, "symbol", "") or "").upper() == symu and _cid(o).startswith(pref)]
+
+
 def _place_sl(
     tc: TradingClient,
     sym: str,
@@ -540,6 +552,7 @@ def main():
     warned_fractional: Set[str] = set()
     entry_ts_cache: Dict[str, datetime] = {}
     tp_skip_log_ts: Dict[str, float] = {}
+    pending_exit_log_ts: Dict[str, float] = {}
 
     while True:
         try:
@@ -641,6 +654,17 @@ def main():
 
                 # TP hit handling for fractional (market close) with min-hold
                 if is_fractional and fractional_tp_market_close and _tp_hit(exit_side, cur_price, tp):
+                    pending_tpmkt_orders = _find_pending_tp_market_orders(open_orders, sym, prefix)
+                    if pending_tpmkt_orders:
+                        if _should_log_throttled(pending_exit_log_ts, f"{sym}:tpmkt_pending", 60.0):
+                            LOG.info(
+                                "pending_tp_market_exit_exists | sym=%s count=%s -> skip duplicate TPMKT/SL actions",
+                                sym,
+                                len(pending_tpmkt_orders),
+                            )
+                        protected += 1
+                        continue
+
                     sl_orders = _find_sl_orders(open_orders, sym, prefix)
 
                     if tp_min_hold_minutes > 0:
@@ -693,9 +717,34 @@ def main():
                         last_fail_ts[sym] = time.time()
                     continue
 
+                # if any prefixed exit order is already pending for this symbol (for example TPMKT),
+                # do not try to add another SL or another exit order; Alpaca will reserve the qty.
+                pending_tpmkt_orders = _find_pending_tp_market_orders(open_orders, sym, prefix)
+                if pending_tpmkt_orders:
+                    if _should_log_throttled(pending_exit_log_ts, f"{sym}:tpmkt_pending", 60.0):
+                        LOG.info(
+                            "pending_tp_market_exit_exists | sym=%s count=%s -> treat as protected/pending-exit",
+                            sym,
+                            len(pending_tpmkt_orders),
+                        )
+                    protected += 1
+                    continue
+
                 # ensure SL exists
                 sl_orders = _find_sl_orders(open_orders, sym, prefix)
                 if sl_orders:
+                    protected += 1
+                    continue
+
+                # Any other prefixed exit order should also block re-repair attempts.
+                prefixed_exit_orders = _find_prefixed_exit_orders(open_orders, sym, prefix)
+                if prefixed_exit_orders:
+                    if _should_log_throttled(pending_exit_log_ts, f"{sym}:prefixed_exit_pending", 60.0):
+                        LOG.info(
+                            "pending_prefixed_exit_exists | sym=%s count=%s -> skip SL repair",
+                            sym,
+                            len(prefixed_exit_orders),
+                        )
                     protected += 1
                     continue
 
