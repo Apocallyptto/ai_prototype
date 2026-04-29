@@ -211,6 +211,15 @@ def _pos_info(tc: TradingClient, sym: str) -> tuple[float, float, float]:
     return 0.0, 0.0, 0.0
 
 
+def _market_is_open(tc: TradingClient) -> bool:
+    try:
+        clock = tc.get_clock()
+        return bool(getattr(clock, "is_open", False))
+    except Exception as e:
+        LOG.warning("market_clock_check_failed | err=%r", e)
+        return False
+
+
 def _cancel_order_safely(tc: TradingClient, oid: str, sym: str, why: str) -> None:
     try:
         tc.cancel_order_by_id(oid)
@@ -523,6 +532,10 @@ def main():
     tp_min_hold_minutes = int(os.getenv("TP_MIN_HOLD_MINUTES", os.getenv("MIN_HOLD_MINUTES", "0")))
     entry_lookup_days = _env_int("ENTRY_LOOKBACK_DAYS", 14)
 
+    # hard fallback: close stale positions after N full days
+    max_hold_days = _env_int("MAX_HOLD_DAYS", 0)
+    max_hold_exit_at_market = _env_bool("MAX_HOLD_EXIT_AT_MARKET", True)
+
     prefix = (os.getenv("EXIT_PREFIX", "EXIT-OCO-") or "EXIT-OCO-").strip()
 
     mode = _resolve_mode()
@@ -534,11 +547,13 @@ def main():
         "use_atr=%s | atr_lookback=%s | atr_timeframe_minutes=%s | atr_mult_tp=%s | atr_mult_sl=%s | "
         "tp_pct=%s | sl_pct=%s | tp_pct_floor=%s | sl_pct_floor=%s | "
         "fractional_threshold=%s | fractional_tp_market_close=%s | tp_min_hold_minutes=%s | entry_lookup_days=%s | "
+        "max_hold_days=%s | max_hold_exit_at_market=%s | "
         "dry_run=%s | prefix=%s | error_backoff=%ss",
         mode, paper, base, poll_seconds, heartbeat_seconds,
         use_atr, atr_lookback, atr_timeframe_minutes, atr_mult_tp, atr_mult_sl,
         tp_pct, sl_pct, tp_pct_floor, sl_pct_floor,
         fractional_threshold, fractional_tp_market_close, tp_min_hold_minutes, entry_lookup_days,
+        max_hold_days, max_hold_exit_at_market,
         dry_run, prefix, error_backoff_seconds
     )
 
@@ -553,6 +568,7 @@ def main():
     entry_ts_cache: Dict[str, datetime] = {}
     tp_skip_log_ts: Dict[str, float] = {}
     pending_exit_log_ts: Dict[str, float] = {}
+    max_hold_log_ts: Dict[str, float] = {}
 
     while True:
         try:
@@ -652,9 +668,71 @@ def main():
                         sym, qty_eff, tp_min_hold_minutes, atr_timeframe_minutes, tp_pct_floor, sl_pct_floor
                     )
 
+                sl_orders = _find_sl_orders(open_orders, sym, prefix)
+                prefixed_exit_orders = _find_prefixed_exit_orders(open_orders, sym, prefix)
+                pending_tpmkt_orders = _find_pending_tp_market_orders(open_orders, sym, prefix)
+
+                # hard fallback for stale positions
+                if max_hold_exit_at_market and max_hold_days > 0 and entry_ts is not None:
+                    age_minutes = (_utc_now() - entry_ts).total_seconds() / 60.0
+                    max_hold_minutes = float(max_hold_days) * 1440.0
+
+                    if age_minutes >= max_hold_minutes:
+                        if pending_tpmkt_orders:
+                            if _should_log_throttled(max_hold_log_ts, f"{sym}:max_hold_pending_tpmkt", 60.0):
+                                LOG.info(
+                                    "max_hold_pending_tp_market_exists | sym=%s age_min=%.1f limit_min=%.1f count=%s",
+                                    sym, age_minutes, max_hold_minutes, len(pending_tpmkt_orders)
+                                )
+                            protected += 1
+                            continue
+
+                        if not _market_is_open(tc):
+                            if _should_log_throttled(max_hold_log_ts, f"{sym}:max_hold_market_closed", 60.0):
+                                LOG.info(
+                                    "max_hold_reached_but_market_closed | sym=%s age_min=%.1f limit_min=%.1f",
+                                    sym, age_minutes, max_hold_minutes
+                                )
+                            if sl_orders or prefixed_exit_orders:
+                                protected += 1
+                            continue
+
+                        if _should_log_throttled(max_hold_log_ts, f"{sym}:max_hold_trigger", 60.0):
+                            LOG.warning(
+                                "max_hold_trigger | sym=%s age_min=%.1f >= %.1f -> cancel exits and close market",
+                                sym, age_minutes, max_hold_minutes
+                            )
+
+                        for o in prefixed_exit_orders:
+                            oid = str(getattr(o, "id", "") or "")
+                            if oid:
+                                _cancel_order_safely(tc, oid, sym, "max_hold_cancel_existing_exit")
+
+                        time.sleep(0.4)
+
+                        qty2, _, _ = _pos_info(tc, sym)
+                        if abs(qty2) < 1e-9:
+                            protected += 1
+                            continue
+
+                        ok = _close_market(
+                            tc=tc,
+                            sym=sym,
+                            qty_abs=abs(qty2),
+                            exit_side=exit_side,
+                            intent=intent,
+                            cid=f"{prefix}{sym}-MAXHOLD-{int(time.time())}",
+                            dry_run=dry_run,
+                        )
+                        if ok:
+                            placed += 1
+                        else:
+                            errors += 1
+                            last_fail_ts[sym] = time.time()
+                        continue
+
                 # TP hit handling for fractional (market close) with min-hold
                 if is_fractional and fractional_tp_market_close and _tp_hit(exit_side, cur_price, tp):
-                    pending_tpmkt_orders = _find_pending_tp_market_orders(open_orders, sym, prefix)
                     if pending_tpmkt_orders:
                         if _should_log_throttled(pending_exit_log_ts, f"{sym}:tpmkt_pending", 60.0):
                             LOG.info(
@@ -664,8 +742,6 @@ def main():
                             )
                         protected += 1
                         continue
-
-                    sl_orders = _find_sl_orders(open_orders, sym, prefix)
 
                     if tp_min_hold_minutes > 0:
                         if entry_ts:
@@ -719,7 +795,6 @@ def main():
 
                 # if any prefixed exit order is already pending for this symbol (for example TPMKT),
                 # do not try to add another SL or another exit order; Alpaca will reserve the qty.
-                pending_tpmkt_orders = _find_pending_tp_market_orders(open_orders, sym, prefix)
                 if pending_tpmkt_orders:
                     if _should_log_throttled(pending_exit_log_ts, f"{sym}:tpmkt_pending", 60.0):
                         LOG.info(
@@ -731,13 +806,11 @@ def main():
                     continue
 
                 # ensure SL exists
-                sl_orders = _find_sl_orders(open_orders, sym, prefix)
                 if sl_orders:
                     protected += 1
                     continue
 
                 # Any other prefixed exit order should also block re-repair attempts.
-                prefixed_exit_orders = _find_prefixed_exit_orders(open_orders, sym, prefix)
                 if prefixed_exit_orders:
                     if _should_log_throttled(pending_exit_log_ts, f"{sym}:prefixed_exit_pending", 60.0):
                         LOG.info(
