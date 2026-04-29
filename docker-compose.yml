@@ -68,16 +68,19 @@
     restart: unless-stopped
 
   oco_exit_monitor:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: trader_oco_exit_monitor
+    command: python -u -m services.oco_exit_monitor
     depends_on:
       postgres:
         condition: service_healthy
     env_file:
-      - .env.live
-    command: ["python", "-u", "-m", "services.oco_exit_monitor"]
+      - ${ENV_FILE:-.env}
+    environment:
+      MAX_HOLD_DAYS: ${MAX_HOLD_DAYS:-0}
+      MAX_HOLD_EXIT_AT_MARKET: ${MAX_HOLD_EXIT_AT_MARKET:-1}
+      TP_MIN_HOLD_MINUTES: ${TP_MIN_HOLD_MINUTES:-1440}
+      FRACTIONAL_TP_MARKET_CLOSE: ${FRACTIONAL_TP_MARKET_CLOSE:-1}
     restart: unless-stopped
 
   reprice_stale:
