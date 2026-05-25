@@ -23,7 +23,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - .env.live
+      - ${ENV_FILE:-.env.live}
     command: >
       sh -lc "
         echo 'waiting postgres...' &&
@@ -50,7 +50,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - .env.live
+      - ${ENV_FILE:-.env.live}
     command: ["python", "-u", "jobs/make_signals_ml.py"]
     restart: unless-stopped
 
@@ -63,24 +63,26 @@
       postgres:
         condition: service_healthy
     env_file:
-      - .env.live
+      - ${ENV_FILE:-.env.live}
     command: ["python", "-u", "-m", "services.signal_executor"]
     restart: unless-stopped
 
   oco_exit_monitor:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: trader_oco_exit_monitor
-    command: python -u -m services.oco_exit_monitor
     depends_on:
       postgres:
         condition: service_healthy
     env_file:
-      - ${ENV_FILE:-.env}
+      - ${ENV_FILE:-.env.live}
     environment:
       MAX_HOLD_DAYS: ${MAX_HOLD_DAYS:-0}
       MAX_HOLD_EXIT_AT_MARKET: ${MAX_HOLD_EXIT_AT_MARKET:-1}
       TP_MIN_HOLD_MINUTES: ${TP_MIN_HOLD_MINUTES:-1440}
       FRACTIONAL_TP_MARKET_CLOSE: ${FRACTIONAL_TP_MARKET_CLOSE:-1}
+    command: ["python", "-u", "-m", "services.oco_exit_monitor"]
     restart: unless-stopped
 
   reprice_stale:
@@ -92,7 +94,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - .env.live
+      - ${ENV_FILE:-.env.live}
     command: ["python", "-u", "-m", "services.reprice_stale"]
     restart: unless-stopped
 
@@ -105,7 +107,7 @@
       postgres:
         condition: service_healthy
     env_file:
-      - .env.live
+      - ${ENV_FILE:-.env.live}
     command: ["python", "-u", "-m", "tools.sync_orders"]
     restart: unless-stopped
 
@@ -118,19 +120,24 @@
       postgres:
         condition: service_healthy
     env_file:
-      - .env.live
+      - ${ENV_FILE:-.env.live}
     command: ["python", "-u", "-m", "services.record_pnl"]
     restart: unless-stopped
 
   auto_pause_guard:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: trader_auto_pause_guard
-    env_file:
-      - .env.live
     depends_on:
       postgres:
         condition: service_healthy
-    command: python -m services.auto_pause_guard
+    env_file:
+      - ${ENV_FILE:-.env.live}
+    environment:
+      DB_WARMUP_MAX_ATTEMPTS: ${DB_WARMUP_MAX_ATTEMPTS:-30}
+      DB_WARMUP_SLEEP_SECONDS: ${DB_WARMUP_SLEEP_SECONDS:-2}
+    command: ["python", "-m", "services.auto_pause_guard"]
     restart: unless-stopped
 
 volumes:
