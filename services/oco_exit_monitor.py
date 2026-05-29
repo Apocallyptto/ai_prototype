@@ -743,6 +743,8 @@ def main():
                         protected += 1
                         continue
 
+                    skip_tpmkt_and_repair_sl = False
+
                     if tp_min_hold_minutes > 0:
                         if entry_ts:
                             age_min = (_utc_now() - entry_ts).total_seconds() / 60.0
@@ -754,7 +756,13 @@ def main():
                                     )
                                 if sl_orders:
                                     protected += 1
-                                continue
+                                    continue
+                                if _should_log_throttled(tp_skip_log_ts, f"{sym}:min_hold_no_sl", 60.0):
+                                    LOG.warning(
+                                        "tp_hit_but_min_hold_active_and_no_sl | sym=%s -> fall through to SL repair",
+                                        sym
+                                    )
+                                skip_tpmkt_and_repair_sl = True
                         else:
                             if _should_log_throttled(tp_skip_log_ts, f"{sym}:entry_unknown", 60.0):
                                 LOG.warning(
@@ -763,35 +771,42 @@ def main():
                                 )
                             if sl_orders:
                                 protected += 1
+                                continue
+                            if _should_log_throttled(tp_skip_log_ts, f"{sym}:entry_unknown_no_sl", 60.0):
+                                LOG.warning(
+                                    "tp_hit_but_entry_ts_unknown_and_no_sl | sym=%s -> fall through to SL repair",
+                                    sym
+                                )
+                            skip_tpmkt_and_repair_sl = True
+
+                    if not skip_tpmkt_and_repair_sl:
+                        # cancel SL then market close
+                        for o in sl_orders:
+                            oid = str(getattr(o, "id", "") or "")
+                            if oid:
+                                _cancel_order_safely(tc, oid, sym, "tp_trigger_cancel_sl")
+                        time.sleep(0.4)
+
+                        qty2, _, _ = _pos_info(tc, sym)
+                        if abs(qty2) < 1e-9:
+                            protected += 1
                             continue
 
-                    # cancel SL then market close
-                    for o in sl_orders:
-                        oid = str(getattr(o, "id", "") or "")
-                        if oid:
-                            _cancel_order_safely(tc, oid, sym, "tp_trigger_cancel_sl")
-                    time.sleep(0.4)
-
-                    qty2, _, _ = _pos_info(tc, sym)
-                    if abs(qty2) < 1e-9:
-                        protected += 1
+                        ok = _close_market(
+                            tc=tc,
+                            sym=sym,
+                            qty_abs=abs(qty2),
+                            exit_side=exit_side,
+                            intent=intent,
+                            cid=f"{prefix}{sym}-TPMKT-{int(time.time())}",
+                            dry_run=dry_run,
+                        )
+                        if ok:
+                            placed += 1
+                        else:
+                            errors += 1
+                            last_fail_ts[sym] = time.time()
                         continue
-
-                    ok = _close_market(
-                        tc=tc,
-                        sym=sym,
-                        qty_abs=abs(qty2),
-                        exit_side=exit_side,
-                        intent=intent,
-                        cid=f"{prefix}{sym}-TPMKT-{int(time.time())}",
-                        dry_run=dry_run,
-                    )
-                    if ok:
-                        placed += 1
-                    else:
-                        errors += 1
-                        last_fail_ts[sym] = time.time()
-                    continue
 
                 # if any prefixed exit order is already pending for this symbol (for example TPMKT),
                 # do not try to add another SL or another exit order; Alpaca will reserve the qty.
